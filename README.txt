@@ -20,8 +20,69 @@
 
 ```bash
 # Клонирование репозитория
-git clone https://github.com/yourusername/gui-file-processor.git
+git clone https://github.com/yankoval/xTrek.git
 cd gui-file-processor
 
 # Установка зависимостей (опционально, для автоопределения кодировок)
 pip install chardet
+
+## Использование
+# Базовый синтаксис
+bash
+python gui_processor.py <file1> <file2> <output> [options]
+Основные примеры
+bash
+# Базовое использование
+python gui_processor.py patterns.txt data.txt result.txt
+
+# С JSON-сериализацией
+python gui_processor.py patterns.txt data.txt result.txt --json-serialize
+
+# С Unicode-escape
+python gui_processor.py patterns.txt data.txt result.txt --unicode-escape
+
+# Подробный вывод
+python gui_processor.py patterns.txt data.txt result.txt --verbose
+⚙️ Параметры
+Параметр	Описание
+file1	Файл с паттернами для поиска
+file2	Файл для обработки
+output	Выходной файл
+-s, --separator	Символ разделения (по умолчанию: "93")
+--encoding1	Кодировка первого файла
+--encoding2	Кодировка второго файла
+--output-encoding	Кодировка выходного файла
+-u, --unicode-escape	Unicode-escape кодирование вывода
+-j, --json-serialize	JSON-сериализация паттернов
+-v, --verbose	Подробный вывод
+--help	Показать справку
+📖 Примеры файлов
+patterns.txt:
+
+text
+user:admin
+password:1234
+error
+warning]
+data.txt:
+
+text
+login successful
+user:admin logged in
+error: connection failed
+operation completed
+result.txt:
+
+text
+login successful
+operation completed
+🛠 Требования
+Python 3.6+
+
+Опционально: chardet для автоопределения кодировок
+
+📄 Лицензия
+MIT License
+
+🤝 Поддержка
+Сообщения об ошибках и предложения приветствуются через Issues.
