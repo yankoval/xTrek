@@ -15,7 +15,7 @@ import coloredlogs
 import requests
 from requests import HTTPError
 #import pyperclip
-#import json
+import json
 from typing import List, Dict, Any, Generator
 
 # logging
@@ -49,6 +49,31 @@ class SUZ:
                                 headers=self.headers)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
+    def order_status(self,orderId:str, gtin:str):
+
+        response = requests.get(self.base_url + f'api/v3/order/status?omsId={self.omsId}'
+                                                f'&orderId={orderId}'
+                                                f'&gtin={gtin}',
+                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+        response.raise_for_status()
+        return response.json()
+    def codes(self,orderId:str, quantity:int, gtin:str):
+
+        response = requests.get(self.base_url + f'api/v3/codes?omsId={self.omsId}'
+                                                f'&orderId={orderId}'
+                                                f'&quantity={quantity}'
+                                                f'&gtin={gtin}',
+                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+        response.raise_for_status()
+        return response.json()
+    def order_codes_blocks(self,orderId:str, gtin:str):
+
+        response = requests.get(self.base_url + f'api/v3/order/codes/blocks?omsId={self.omsId}'
+                                                f'&orderId={orderId}'
+                                                f'&gtin={gtin}',
+                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+        response.raise_for_status()
+        return response.json()
 
     def providers(self):
         response = requests.get(self.base_url + f'api/v3/providers?omsId={self.omsId}',
@@ -58,32 +83,18 @@ class SUZ:
 
 
 # Использование
-def main(*args: Any, **kwargs: Any) -> None:
-    try:
-        api = SUZ()
-        res = api.order_list()
-        print(res)
-        for r in res.get('orderInfos', {}):
-            if r.get('orderStatus') == 'READY':
-                print(r.get('buffers'))
-    except HTTPError as e:
-        print(e.response.text)
-
 if __name__ == "__main__":
     # cProfile.run('main()'#, 'profile_output.txt'
     #              )
     parser = argparse.ArgumentParser(description='Process some parameters.',
                                      epilog=textwrap.dedent('''   additional information:
-             If you vont to use .ini file put __CONSTANTS__=DEFAULT env variable 
-             and create programm_name.ini file with content: 
-             [DEFAULT] 
-             something = a_default_value
-             [a_section]
-             something = a_section_value
+ You have to specify parameters: omsId, token, client_token. 
+ Or set up environment variables: OMSID, TOKEN, CLIENT_TOKEN.
+ 
          '''))
 
     # Add arguments for input file, output file, and model
-    parser.add_argument('-input_filename', type=str, dest='input_filename', default='input_filename.txt',
+    parser.add_argument('-input_filename', type=str, dest='input_filename',
                         help='Input file name')
     parser.add_argument('-o', '--output_filename', dest='output_filename', default='output_filename.txt', type=str,
                         help='Output file name')
@@ -96,7 +107,8 @@ if __name__ == "__main__":
 
     # Parse command line arguments
     args = parser.parse_args()
-    logger.debug("Procesing:" + args.input_filename)
+    if args.input_filename:
+        logger.debug("Procesing:" + args.input_filename)
 
     # Call the main function with the parsed arguments
     # main(args.input_filename, args.output_filename, logger)
@@ -115,7 +127,19 @@ if __name__ == "__main__":
         res = api.order_list()
         print(res)
         for r in res.get('orderInfos', {}):
+            logger.info(f'orderId: {r.get('orderId')}, productionOrderId: {r.get('productionOrderId')}, orderStatus: {r.get("orderStatus")}.')
             if r.get('orderStatus') == 'READY':
-                print(r.get('buffers'))
+                logger.info(f'buffers: {len(r.get("buffers"))}')
+                for buffer in r.get('buffers', []):
+                    order_statuses = api.order_status(r['orderId'], buffer['gtin'])
+                    for i, order_status in enumerate(order_statuses):
+                        logger.info(f'status:{order_status['productionOrderId']+'_'+str(i)}, {order_status}')
+                        bloks = api.order_codes_blocks(orderId=r['orderId'], gtin=buffer['gtin'])
+                        if not bloks['blocks']:
+                            codes = api.codes(orderId=r['orderId'], quantity=1, gtin=buffer['gtin'])
+                            json.dump(codes, open(r['orderId']+'_', 'a',encoding='UTF8'), indent=4)
+
+            else:
+                logger.info(f'orderId: {r.get("orderId")}, productionOrderId: {r.get('')}, status: {r.get("orderStatus")}')
     except HTTPError as e:
         print(e.response.text)
