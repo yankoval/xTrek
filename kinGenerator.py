@@ -206,18 +206,8 @@ class KinReportGenerator:
         logger.warning(f"Не найден файл для GTIN {gtin}")
         return None
 
-    def generate_kin_report(self, file_names, num_kits=None):
-        """
-        Основная процедура для генерации КИН отчета
-        """
-        logger.info("Запуск генерации КИН отчета...")
-
-        # Загружаем файлы
-        if not self.load_files(file_names):
-            logger.error("Не удалось загрузить файлы")
-            return None
-
-        # Ищем основной файл с Hierarchy
+    def find_main_data_and_gtins(self):
+        """Поиск основного файла и извлечение GTIN"""
         main_data = None
         kigu_gtin = None
         kit_gtins = []
@@ -236,6 +226,22 @@ class KinReportGenerator:
                             kit_gtin = pack['GTIN']
                             kit_gtins.append(kit_gtin)
                 break
+
+        return main_data, kigu_gtin, kit_gtins
+
+    def generate_kin_report(self, file_names, num_kits=None):
+        """
+        Основная процедура для генерации КИН отчета
+        """
+        logger.info("Запуск генерации КИН отчета...")
+
+        # Загружаем файлы
+        if not self.load_files(file_names):
+            logger.error("Не удалось загрузить файлы")
+            return None
+
+        # Ищем основной файл с Hierarchy
+        main_data, kigu_gtin, kit_gtins = self.find_main_data_and_gtins()
 
         if not main_data:
             logger.error("Не найден основной файл с описанием набора")
@@ -328,7 +334,8 @@ class KinReportGenerator:
 
             logger.info(f"КИН отчет успешно создан: {output_filename}")
             logger.info(f"Сгенерировано наборов: {num_kits}")
-            logger.info(f"Всего продуктов в отчете: {sum(len(box['productNumbers']) for box in kin_report['readyBox'])}")
+            total_products = sum(len(box['productNumbers']) for box in kin_report['readyBox'])
+            logger.info(f"Всего продуктов в отчете: {total_products}")
             return output_filename
 
         except Exception as e:
@@ -361,6 +368,16 @@ class KinReportGenerator:
         if not kigu_codes or any(not codes for codes in all_kit_codes):
             logger.error("Отсутствуют коды для создания данных отчета")
             return None
+
+        # Проверяем, что достаточно кодов для запрошенного количества наборов
+        if num_kits > len(kigu_codes):
+            logger.error(f"Недостаточно кодов Kigu: запрошено {num_kits}, доступно {len(kigu_codes)}")
+            return None
+
+        for i, kit_codes in enumerate(all_kit_codes):
+            if num_kits > len(kit_codes):
+                logger.error(f"Недостаточно кодов Kit {kit_gtins[i]}: запрошено {num_kits}, доступно {len(kit_codes)}")
+                return None
 
         # Создание отчета
         start_time = datetime.now()
@@ -417,10 +434,21 @@ class KinReportGenerator:
 def generate_kin_report_from_files(file_names, num_kits=None):
     """
     Генерирует КИН отчет из указанных файлов
+    
+    Args:
+        file_names: список путей к JSON файлам
+        num_kits: количество наборов (None - максимальное доступное)
+    
+    Returns:
+        str: путь к созданному файлу отчета или None при ошибке
     """
-    logger.info("Вызов generate_kin_report_from_files")
-    generator = KinReportGenerator()
-    return generator.generate_kin_report(file_names, num_kits)
+    try:
+        logger.info("Вызов generate_kin_report_from_files")
+        generator = KinReportGenerator()
+        return generator.generate_kin_report(file_names, num_kits)
+    except Exception as e:
+        logger.error(f"Критическая ошибка при генерации отчета: {e}")
+        return None
 
 # Функция для использования в Google Colab
 def upload_and_process_files_colab():
