@@ -5,16 +5,7 @@ import random
 import os
 import logging
 
-# Проверка наличия google.colab
-try:
-    from google.colab import files
-    IN_COLAB = True
-    logger.info("Работаем в Google Colab")
-except ImportError:
-    IN_COLAB = False
-    logger.info("Работаем вне Google Colab")
-
-# Настройка логгера
+# Настройка логгера ДО проверки google.colab
 def setup_logger():
     """Настройка логгера для минимального вывода информации"""
     logger = logging.getLogger('KinReportGenerator')
@@ -32,8 +23,17 @@ def setup_logger():
     
     return logger
 
-# Инициализация логгера
+# Инициализация логгера ПЕРВОЙ
 logger = setup_logger()
+
+# Теперь проверка наличия google.colab
+try:
+    from google.colab import files
+    IN_COLAB = True
+    logger.info("Работаем в Google Colab")
+except ImportError:
+    IN_COLAB = False
+    logger.info("Работаем вне Google Colab")
 
 class KinReportGenerator:
     def __init__(self):
