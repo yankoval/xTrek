@@ -2,22 +2,47 @@ import json
 from datetime import datetime, timedelta
 import uuid
 import random
-# from google.colab import files
+from google.colab import files
 import os
+import logging
+
+# Настройка логгера
+def setup_logger():
+    """Настройка логгера для минимального вывода информации"""
+    logger = logging.getLogger('KinReportGenerator')
+    logger.setLevel(logging.INFO)
+    
+    # Если логгер уже имеет обработчики, не добавляем новые
+    if not logger.handlers:
+        # Форматировщик с минимальной информацией
+        formatter = logging.Formatter('%(message)s')
+        
+        # Обработчик для вывода в консоль
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    
+    return logger
+
+# Инициализация логгера
+logger = setup_logger()
 
 class KinReportGenerator:
     def __init__(self):
         self.uploaded_files = {}
+        logger.info("Инициализация KinReportGenerator")
 
     def extract_short_code(self, full_code):
         """Извлечение короткого кода из полного кода маркировки"""
         try:
             if not full_code or not isinstance(full_code, str):
+                logger.warning("Передан пустой или некорректный полный код маркировки")
                 return None
 
             # Разделяем код по разделителю GS (\u001D)
             parts = full_code.split('\u001D')
             if not parts:
+                logger.warning("Не удалось разделить полный код по разделителю GS")
                 return None
 
             # Первая часть содержит GTIN и короткий код
@@ -26,6 +51,7 @@ class KinReportGenerator:
             # Ищем позицию идентификатора 21 (код товара)
             pos_21 = main_part.find('21')
             if pos_21 == -1:
+                logger.warning("В полной маркировке не найден идентификатор '21'")
                 return None
 
             # Извлекаем 6 символов после '21'
@@ -33,35 +59,129 @@ class KinReportGenerator:
             short_code_end = short_code_start + 6
 
             if short_code_end <= len(main_part):
-                return main_part[short_code_start:short_code_end]
+                short_code = main_part[short_code_start:short_code_end]
+                return short_code
             else:
+                logger.warning("Не удалось извлечь 6 символов после '21'. Код слишком короткий")
                 return None
 
         except Exception as e:
-            print(f"Ошибка при извлечении короткого кода: {e}")
+            logger.error(f"Ошибка при извлечении короткого кода: {e}")
+            return None
+
+    def load_json_file(self, file_path):
+        """
+        Загрузка JSON файла с поддержкой utf-8-sig для обработки BOM
+        """
+        try:
+            # Пытаемся загрузить с utf-8-sig (для файлов с BOM)
+            with open(file_path, 'r', encoding='utf-8-sig') as f:
+                return json.load(f)
+        except UnicodeDecodeError:
+            # Если не сработало, пробуем обычный utf-8
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке с utf-8 файла {file_path}: {e}")
+                return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка парсинга JSON в файле {file_path}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при загрузке {file_path}: {e}")
             return None
 
     def load_files(self, file_names):
-        """Загрузка файлов по списку имен"""
-        print("Загрузка файлов...")
+        """Загрузка файлов по списку имен с поддержкой utf-8-sig"""
+        logger.info("Загрузка файлов...")
 
+        successful_loads = 0
         for file_name in file_names:
             if os.path.exists(file_name):
-                try:
-                    with open(file_name, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
+                data = self.load_json_file(file_name)
+                if data is not None:
                     self.uploaded_files[file_name] = data
-                    print(f"✓ Загружен файл: {file_name}")
-                except Exception as e:
-                    print(f"✗ Ошибка загрузки {file_name}: {e}")
+                    logger.info(f"Загружен файл: {file_name}")
+                    successful_loads += 1
+                else:
+                    logger.error(f"Ошибка загрузки {file_name}")
+                    return False
             else:
-                print(f"✗ Файл не найден: {file_name}")
+                logger.error(f"Файл не найден: {file_name}")
+                return False
 
-        return len(self.uploaded_files) > 0
+        logger.info(f"Успешно загружено файлов: {successful_loads}/{len(file_names)}")
+        return successful_loads > 0
+
+    def validate_files_completeness(self, main_data, kigu_gtin, kit_gtins):
+        """
+        Проверка, что загружены все необходимые файлы с кодами
+        согласно описанию набора
+        """
+        logger.info("Проверка комплектности файлов...")
+
+        missing_files = []
+
+        # Проверяем наличие файла для Kigu
+        kigu_found = False
+        for filename, data in self.uploaded_files.items():
+            if 'codes' in data and data.get('codes'):
+                if data['codes'] and kigu_gtin in data['codes'][0]:
+                    kigu_found = True
+                    logger.info(f"Найден файл для Kigu GTIN: {kigu_gtin}")
+                    break
+
+        if not kigu_found:
+            missing_files.append(f"Kigu GTIN: {kigu_gtin}")
+
+        # Проверяем наличие файлов для всех Kit GTIN
+        found_kit_gtins = []
+        for kit_gtin in kit_gtins:
+            kit_found = False
+            for filename, data in self.uploaded_files.items():
+                if 'codes' in data and data.get('codes'):
+                    if data['codes'] and kit_gtin in data['codes'][0]:
+                        kit_found = True
+                        found_kit_gtins.append(kit_gtin)
+                        logger.info(f"Найден файл для Kit GTIN: {kit_gtin}")
+                        break
+
+            if not kit_found:
+                missing_files.append(f"Kit GTIN: {kit_gtin}")
+
+        # Выводим отчет о проверке
+        if missing_files:
+            logger.error("Отсутствуют файлы для следующих GTIN:")
+            for missing in missing_files:
+                logger.error(f"   - {missing}")
+
+            # Показываем какие файлы вообще загружены
+            logger.info("Загруженные файлы с кодами:")
+            code_files = [f for f, d in self.uploaded_files.items() if 'codes' in d and d.get('codes')]
+            for code_file in code_files:
+                if self.uploaded_files[code_file]['codes']:
+                    first_code = self.uploaded_files[code_file]['codes'][0]
+                    # Извлекаем GTIN из первого кода (01{GTIN}21...)
+                    gtin_start = first_code.find('01') + 2
+                    gtin_end = first_code.find('21', gtin_start)
+                    if gtin_start > 1 and gtin_end > gtin_start:
+                        file_gtin = first_code[gtin_start:gtin_end]
+                        logger.info(f"   - {code_file} -> GTIN: {file_gtin}")
+
+            return False
+
+        logger.info("Все необходимые файлы найдены:")
+        logger.info(f"   - Kigu: {kigu_gtin}")
+        for kit_gtin in kit_gtins:
+            logger.info(f"   - Kit: {kit_gtin}")
+
+        return True
 
     def calculate_max_kits(self, kigu_codes, all_kit_codes):
         """Подсчет максимального количества наборов"""
         if not kigu_codes or not all_kit_codes:
+            logger.warning("Отсутствуют коды Kigu или Kit для подсчета наборов")
             return 0
 
         max_from_kigu = len(kigu_codes)
@@ -69,88 +189,126 @@ class KinReportGenerator:
 
         return min(max_from_kigu, max_from_kits)
 
+    def get_file_for_gtin(self, gtin):
+        """Поиск файла с кодами для указанного GTIN"""
+        for filename, data in self.uploaded_files.items():
+            if 'codes' in data and data.get('codes'):
+                if data['codes'] and gtin in data['codes'][0]:
+                    return data
+        logger.warning(f"Не найден файл для GTIN {gtin}")
+        return None
+
     def generate_kin_report(self, file_names, num_kits=None):
         """
         Основная процедура для генерации КИН отчета
-
-        Args:
-            file_names: список имен файлов для обработки
-            num_kits: количество наборов для генерации (None - максимальное)
-
-        Returns:
-            str: имя созданного файла отчета или None при ошибке
         """
+        logger.info("Запуск генерации КИН отчета...")
 
         # Загружаем файлы
         if not self.load_files(file_names):
-            print("❌ Не удалось загрузить файлы")
+            logger.error("Не удалось загрузить файлы")
             return None
 
         # Ищем основной файл с Hierarchy
         main_data = None
         kigu_gtin = None
+        kit_gtins = []
 
         for filename, data in self.uploaded_files.items():
             if 'Hierarchy' in data:
                 main_data = data
-                # Извлекаем GTIN Kigu
+                logger.info(f"Найден основной файл с Hierarchy: {filename}")
+                # Извлекаем GTIN Kigu и Kit
                 for level in data.get('Hierarchy', []):
                     if level['LevelType'] == 'Kigu':
                         for pack in level['Packs']:
                             kigu_gtin = pack['GTIN']
+                    elif level['LevelType'] == 'Kit':
+                        for pack in level['Packs']:
+                            kit_gtin = pack['GTIN']
+                            kit_gtins.append(kit_gtin)
                 break
 
-        if not main_data or not kigu_gtin:
-            print("❌ Не найден основной файл с описанием набора")
+        if not main_data:
+            logger.error("Не найден основной файл с описанием набора")
             return None
 
-        print(f"Найден Kigu GTIN: {kigu_gtin}")
+        if not kigu_gtin:
+            logger.error("В основном файле не найден GTIN для Kigu")
+            return None
 
-        # Предварительный расчет максимального количества наборов
-        print("🔍 Подсчет доступных наборов...")
+        if not kit_gtins:
+            logger.error("В основном файле не найдены GTIN для Kit")
+            return None
 
-        # Находим файлы для расчета
-        kigu_codes = []
-        all_kit_codes = []
+        logger.info("Описание набора:")
+        logger.info(f"   - Kigu GTIN: {kigu_gtin}")
+        logger.info(f"   - Kit GTIN: {', '.join(kit_gtins)}")
 
-        # Ищем Kigu файл
-        for filename, data in self.uploaded_files.items():
-            if 'codes' in data and data.get('codes') and kigu_gtin in data['codes'][0]:
-                kigu_codes = data['codes']
-                break
+        # Проверяем наличие всех необходимых файлов
+        if not self.validate_files_completeness(main_data, kigu_gtin, kit_gtins):
+            logger.error("Не все необходимые файлы с кодами загружены")
+            return None
 
-        # Ищем Kit файлы
-        kit_gtins = []
-        for level in main_data.get('Hierarchy', []):
-            if level['LevelType'] == 'Kit':
-                for pack in level['Packs']:
-                    kit_gtins.append(pack['GTIN'])
+        # Получаем данные из файлов
+        kigu_data = self.get_file_for_gtin(kigu_gtin)
+        if not kigu_data:
+            logger.error(f"Не удалось получить данные для Kigu GTIN: {kigu_gtin}")
+            return None
 
+        kit_data_list = []
         for kit_gtin in kit_gtins:
-            for filename, data in self.uploaded_files.items():
-                if 'codes' in data and data.get('codes') and kit_gtin in data['codes'][0]:
-                    all_kit_codes.append(data['codes'])
-                    break
+            kit_data = self.get_file_for_gtin(kit_gtin)
+            if kit_data:
+                kit_data_list.append(kit_data)
+            else:
+                logger.error(f"Не удалось получить данные для Kit GTIN: {kit_gtin}")
+                return None
 
+        # Получаем коды
+        kigu_codes = kigu_data.get('codes', [])
+        if not kigu_codes:
+            logger.error("В файле Kigu нет кодов коробок")
+            return None
+
+        all_kit_codes = [kit_data.get('codes', []) for kit_data in kit_data_list]
+
+        # Проверяем, что во всех файлах есть коды
+        for i, kit_codes in enumerate(all_kit_codes):
+            if not kit_codes:
+                logger.error(f"В файле для Kit GTIN {kit_gtins[i]} нет кодов")
+                return None
+
+        # Подсчет максимального количества наборов
         max_kits = self.calculate_max_kits(kigu_codes, all_kit_codes)
 
         if max_kits == 0:
-            print("❌ Недостаточно кодов для создания наборов")
+            logger.error("Недостаточно кодов для создания наборов")
+            logger.error(f"   Коды Kigu: {len(kigu_codes)}")
+            for i, kit_codes in enumerate(all_kit_codes):
+                logger.error(f"   Коды Kit {kit_gtins[i]}: {len(kit_codes)}")
             return None
+
+        logger.info("Доступно кодов:")
+        logger.info(f"   - Kigu ({kigu_gtin}): {len(kigu_codes)} коробок")
+        for i, kit_codes in enumerate(all_kit_codes):
+            logger.info(f"   - Kit ({kit_gtins[i]}): {len(kit_codes)} продуктов")
+        logger.info(f"Максимально можно создать: {max_kits} наборов")
 
         # Определяем количество наборов для генерации
         if num_kits is None:
             num_kits = max_kits
         elif num_kits > max_kits:
-            print(f"❌ Нельзя сгенерировать больше {max_kits} наборов")
-            return None
+            logger.warning(f"Запрошено {num_kits} наборов, но доступно только {max_kits}")
+            num_kits = max_kits
 
-        print(f"Генерация {num_kits} наборов...")
+        logger.info(f"Генерация {num_kits} наборов...")
 
         # Создаем отчет
-        kin_report = self._create_report_data(kigu_gtin, num_kits)
+        kin_report = self._create_report_data(kigu_gtin, kit_gtins, num_kits)
 
         if not kin_report:
+            logger.error("Не удалось создать данные отчета")
             return None
 
         # Сохраняем отчет
@@ -160,65 +318,40 @@ class KinReportGenerator:
             with open(output_filename, 'w', encoding='utf-8') as f:
                 json.dump(kin_report, f, ensure_ascii=False, indent=2)
 
-            print(f"✅ КИН отчет успешно создан: {output_filename}")
+            logger.info(f"КИН отчет успешно создан: {output_filename}")
+            logger.info(f"Сгенерировано наборов: {num_kits}")
+            logger.info(f"Всего продуктов в отчете: {sum(len(box['productNumbers']) for box in kin_report['readyBox'])}")
             return output_filename
 
         except Exception as e:
-            print(f"❌ Ошибка при сохранении отчета: {e}")
+            logger.error(f"Ошибка при сохранении отчета: {e}")
             return None
 
-    def _create_report_data(self, kigu_gtin, num_kits):
+    def _create_report_data(self, kigu_gtin, kit_gtins, num_kits):
         """Создание данных отчета"""
+        logger.info(f"Создание данных отчета для {num_kits} наборов...")
 
-        # Поиск файла для Kigu
-        kigu_data = None
-
-        for filename, data in self.uploaded_files.items():
-            if 'codes' in data and data.get('codes'):
-                if data['codes'] and kigu_gtin in data['codes'][0]:
-                    kigu_data = data
-                    break
-
+        # Получаем данные из файлов
+        kigu_data = self.get_file_for_gtin(kigu_gtin)
         if not kigu_data:
-            print(f"❌ Не найден файл с кодами для Kigu GTIN: {kigu_gtin}")
+            logger.error("Не удалось получить данные Kigu для создания отчета")
             return None
 
-        # Извлечение GTIN для Kit из основного файла
-        kit_gtins = []
-        for filename, data in self.uploaded_files.items():
-            if 'Hierarchy' in data:
-                for level in data.get('Hierarchy', []):
-                    if level['LevelType'] == 'Kit':
-                        for pack in level['Packs']:
-                            kit_gtins.append(pack['GTIN'])
-
-        # Поиск файлов для Kit
         kit_data_list = []
-
         for kit_gtin in kit_gtins:
-            for filename, data in self.uploaded_files.items():
-                if 'codes' in data and data.get('codes'):
-                    if data['codes'] and kit_gtin in data['codes'][0]:
-                        kit_data_list.append(data)
-                        break
-
-        if not kit_data_list:
-            print("❌ Не найдены файлы для Kit продуктов")
-            return None
+            kit_data = self.get_file_for_gtin(kit_gtin)
+            if kit_data:
+                kit_data_list.append(kit_data)
+            else:
+                logger.error(f"Не удалось получить данные Kit ({kit_gtin}) для создания отчета")
+                return None
 
         # Получаем коды
         kigu_codes = kigu_data.get('codes', [])
-        if not kigu_codes:
-            print("❌ В данных Kigu нет кодов коробок")
-            return None
-
-        # Собираем коды продуктов
         all_kit_codes = [kit_data.get('codes', []) for kit_data in kit_data_list]
 
-        # Проверяем достаточно ли кодов
-        max_available = self.calculate_max_kits(kigu_codes, all_kit_codes)
-        if num_kits > max_available:
-            print(f"❌ Недостаточно кодов для {num_kits} наборов")
+        if not kigu_codes or any(not codes for codes in all_kit_codes):
+            logger.error("Отсутствуют коды для создания данных отчета")
             return None
 
         # Создание отчета
@@ -240,7 +373,11 @@ class KinReportGenerator:
                         product_numbers_full.append(full_code)
 
             # Номер коробки из Kigu
-            box_number = kigu_codes[i]
+            if i < len(kigu_codes):
+                box_number = kigu_codes[i]
+            else:
+                logger.error(f"Недостаточно кодов Kigu для создания набора {i}")
+                break
 
             box = {
                 "Number": i,
@@ -253,13 +390,12 @@ class KinReportGenerator:
 
             ready_boxes.append(box)
 
-        # Финальный отчет
-        end_time = datetime.now()
+        logger.info(f"Создание данных отчета завершено. Сгенерировано {len(ready_boxes)} наборов")
 
         return {
             "id": str(uuid.uuid4()),
             "startTime": start_time.isoformat(),
-            "endTime": end_time.isoformat(),
+            "endTime": datetime.now().isoformat(),
             "operators": [],
             "readyBox": ready_boxes,
             "sampleNumbers": [],
@@ -273,69 +409,42 @@ class KinReportGenerator:
 def generate_kin_report_from_files(file_names, num_kits=None):
     """
     Генерирует КИН отчет из указанных файлов
-
-    Args:
-        file_names: список путей к JSON файлам
-        num_kits: количество наборов (None - максимальное доступное)
-
-    Returns:
-        str: путь к созданному файлу отчета или None при ошибке
     """
+    logger.info("Вызов generate_kin_report_from_files")
     generator = KinReportGenerator()
     return generator.generate_kin_report(file_names, num_kits)
 
-# Пример использования в Google Colab
-def main_colab():
-    """Основная функция для использования в Colab"""
-    print("=== Генератор КИН отчета ===")
+# Функция для использования в Google Colab
+def upload_and_process_files_colab():
+    """Функция для загрузки файлов в Colab и обработки"""
+    logger.info("=== Генератор КИН отчета ===")
 
     # Загрузка файлов через интерфейс Colab
-    print("Загрузите файлы через интерфейс...")
+    logger.info("Загрузите файлы через интерфейс...")
     uploaded = files.upload()
 
     file_names = []
     for filename, content in uploaded.items():
         if filename.endswith('.json'):
-            # Сохраняем файл на диск
             with open(filename, 'wb') as f:
                 f.write(content)
             file_names.append(filename)
-            print(f"✓ Загружен: {filename}")
+            logger.info(f"Загружен: {filename}")
 
     if not file_names:
-        print("❌ Не загружено ни одного JSON файла")
-        return
+        logger.warning("Не загружено ни одного JSON файла")
+        return None
 
     # Генерация отчета
     report_file = generate_kin_report_from_files(file_names)
 
     if report_file:
-        # Сохраняем результат
-        try:
-            with open(report_file, 'w', encoding='utf-8') as f:
-                data = json.dumps(f)
-            print(f"✓ Сохранен файл: {report_file}")
-        except Exception as e:
-            print(f"✗ Ошибка загрузки {report_file}: {e}")
-        # Скачиваем результат
         files.download(report_file)
-        print(f"✅ Отчет готов: {report_file}")
+        logger.info(f"Отчет готов: {report_file}")
+        return report_file
+    else:
+        logger.error("Не удалось создать отчет")
+        return None
 
-# Пример использования из другого модуля
 if __name__ == "__main__":
-    # Вариант 1: Использование в Colab
-    # main_colab()
-
-    # Вариант 2: Использование как модуля
-    files_list = [
-        "набор_04640286990808.json",          # Основной файл с Hierarchy
-        "04630234043762.json", # Файл с кодами Kigu
-        "04640286990808.json", # Файл с кодами Kit 1
-        "04751042821837.json"  # Файл с кодами Kit 2
-    ]
-
-    # Генерация максимального количества наборов
-    report_filename = generate_kin_report_from_files(files_list)
-
-    # Или указать конкретное количество
-    # report_filename = generate_kin_report_from_files(files_list, 50)
+    upload_and_process_files_colab()
