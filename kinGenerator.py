@@ -241,7 +241,12 @@ class KinReportGenerator:
             return None
 
         # Ищем основной файл с Hierarchy
-        main_data, kigu_gtin, kit_gtins = self.find_main_data_and_gtins()
+        result = self.find_main_data_and_gtins()
+        if result is None:
+            logger.error("Не удалось найти основной файл")
+            return None
+            
+        main_data, kigu_gtin, kit_gtins = result
 
         if not main_data:
             logger.error("Не найден основной файл с описанием набора")
