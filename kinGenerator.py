@@ -2,9 +2,17 @@ import json
 from datetime import datetime, timedelta
 import uuid
 import random
-from google.colab import files
 import os
 import logging
+
+# Проверка наличия google.colab
+try:
+    from google.colab import files
+    IN_COLAB = True
+    logger.info("Работаем в Google Colab")
+except ImportError:
+    IN_COLAB = False
+    logger.info("Работаем вне Google Colab")
 
 # Настройка логгера
 def setup_logger():
@@ -417,6 +425,11 @@ def generate_kin_report_from_files(file_names, num_kits=None):
 # Функция для использования в Google Colab
 def upload_and_process_files_colab():
     """Функция для загрузки файлов в Colab и обработки"""
+    if not IN_COLAB:
+        logger.error("Функция upload_and_process_files_colab доступна только в Google Colab")
+        logger.info("Используйте generate_kin_report_from_files с указанием путей к файлам")
+        return None
+
     logger.info("=== Генератор КИН отчета ===")
 
     # Загрузка файлов через интерфейс Colab
@@ -446,5 +459,47 @@ def upload_and_process_files_colab():
         logger.error("Не удалось создать отчет")
         return None
 
+# Функция для ручной загрузки файлов вне Colab
+def manual_file_processing():
+    """Функция для обработки файлов вне Google Colab"""
+    logger.info("=== Генератор КИН отчета (вне Colab) ===")
+    logger.info("Укажите пути к файлам вручную:")
+    
+    file_names = []
+    while True:
+        file_path = input("Введите путь к файлу (или 'готово' для завершения): ").strip()
+        if file_path.lower() == 'готово':
+            break
+        if os.path.exists(file_path):
+            file_names.append(file_path)
+            logger.info(f"Добавлен файл: {file_path}")
+        else:
+            logger.warning(f"Файл не найден: {file_path}")
+    
+    if not file_names:
+        logger.warning("Не указано ни одного файла")
+        return None
+    
+    # Запрос количества наборов
+    try:
+        num_kits_input = input("Сколько наборов сгенерировать (Enter для максимального): ").strip()
+        num_kits = int(num_kits_input) if num_kits_input else None
+    except ValueError:
+        logger.warning("Некорректный ввод, будет использовано максимальное количество")
+        num_kits = None
+    
+    # Генерация отчета
+    report_file = generate_kin_report_from_files(file_names, num_kits)
+    
+    if report_file:
+        logger.info(f"Отчет готов: {report_file}")
+        return report_file
+    else:
+        logger.error("Не удалось создать отчет")
+        return None
+
 if __name__ == "__main__":
-    upload_and_process_files_colab()
+    if IN_COLAB:
+        upload_and_process_files_colab()
+    else:
+        manual_file_processing()
