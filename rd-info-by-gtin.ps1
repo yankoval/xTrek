@@ -1,8 +1,8 @@
 # Script parameters
-$csvFilePath = "C:\Users\project\Documents\gtins.csv"  # Path to CSV file with GTINs
-$inn = "7703270067"  # INN parameter
-$tokenFilePath = "C:\Users\project\Documents\headers_11000034841_fito.txt"
-$outputDirectory = "C:\Users\project\Documents\"  # Directory for results
+$csvFilePath = $env:USERPROFILE + "\Documents\" +"gtins.csv"  # Path to CSV file with GTINs
+$inn = "7733154124"  # INN parameter
+$tokenFilePath = $env:USERPROFILE + "\Documents\" +"headers_11000034841_fito.txt"
+$outputDirectory = $env:USERPROFILE + "\Documents"   # Directory for results
 
 # Create output directory if not exists
 if (!(Test-Path $outputDirectory)) {
