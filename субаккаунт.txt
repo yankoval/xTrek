@@ -1,8 +1,23 @@
+Выполняет запрос через Invoke-RestMethod
+Метод .Trim() удаляет лишние пробелы и переводы строк из файла
+
+Параметр -Raw читает весь файл как одну строку
+
+Убедитесь, что файл содержит только токен без лишних символов
+
+Для безопасности храните файл токена в защищенном месте
+
+Преобразует результат в JSON формат с помощью ConvertTo-Json
+
+Сохраняет результат в файл result.json с кодировкой UTF-8
+
+
+
 $headers = @{
-    'Accept' = 'application/json'
-    'Authorization' = 'Bearer d08b7e5f-ab6c-44cb-9d5c-5f3ec365d5ce'
+    'Authorization' = "Bearer $((Get-Content -Path "C:\Users\project\Documents\headers_11000034841_fito.txt" -Raw).Trim())"
+    'Content-Type' = 'application/json'
 }
 
-$response = Invoke-RestMethod -Uri "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai:443/v3/linked-gtins" -Headers  @{'Authorization'= 'Bearer d08b7e5f-ab6c-44cb-9d5c-5f3ec365d5ce'} -Method GET
-Write-Output "Тест"
-Write-Output $response
+Invoke-RestMethod -Uri "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai:443/v3/linked-gtins" -Headers $headers -Method GET
+
+Invoke-RestMethod -Uri "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai:443/v3/linked-gtins" -Headers $headers -Method GET | ConvertTo-Json | Out-File -FilePath "result.json" -Encoding UTF8
