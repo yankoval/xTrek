@@ -1,0 +1,20 @@
+# Выполняет запрос через Invoke-RestMethod
+
+# Данные для запроса
+$gtin = "4690363530236"
+$inn = "7703270067"
+
+# Формирование тела запроса
+$body = @{
+    gtin = $gtin
+    inn = $inn
+} | ConvertTo-Json
+
+
+
+$headers = @{
+    'Authorization' = "Bearer $((Get-Content -Path "C:\Users\project\Documents\headers_11000034841_fito.txt" -Raw).Trim())"
+    'Content-Type' = 'application/json'
+}
+
+Invoke-RestMethod -Uri "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai:443/v4/rd-info-by-gtin" -Method "POST" -Headers $headers -Body $body | ConvertTo-Json | Out-File -FilePath "result_RD.json" -Encoding UTF8
