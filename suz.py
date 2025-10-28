@@ -57,7 +57,8 @@ class SUZ:
                                 headers=self.headers)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
-    def codes(self,orderId:str, quantity:int, gtin:str):
+
+    def codes(self, orderId: str, quantity: int, gtin: str):
 
         response = requests.get(self.base_url + f'api/v3/codes?omsId={self.omsId}'
                                                 f'&orderId={orderId}'
@@ -66,6 +67,15 @@ class SUZ:
                                 headers=self.headers)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
+
+    def order_codes_retry(self, blockId: str):
+
+        response = requests.get(self.base_url + f'api/v3//order/codes/retry?omsId={self.omsId}'
+                                                f'&blockId={blockId}',
+                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+        response.raise_for_status()
+        return response.json()
+
     def order_codes_blocks(self,orderId:str, gtin:str):
 
         response = requests.get(self.base_url + f'api/v3/order/codes/blocks?omsId={self.omsId}'
@@ -120,7 +130,7 @@ if __name__ == "__main__":
         raise ValueError("omsId не найден")
     clientToken = args.client_token or os.getenv('CLIENT_TOKEN')
     if not clientToken:
-        raise ValueError("omsId не найден")
+        raise ValueError("CLIENT_TOKEN не найден")
 
     try:
         api = SUZ(token, omsId, clientToken)
@@ -137,7 +147,14 @@ if __name__ == "__main__":
                         bloks = api.order_codes_blocks(orderId=r['orderId'], gtin=buffer['gtin'])
                         if not bloks['blocks']:
                             codes = api.codes(orderId=r['orderId'], quantity=1, gtin=buffer['gtin'])
-                            json.dump(codes, open(r['orderId']+'_', 'a',encoding='UTF8'), indent=4)
+                            json.dump(codes, open(codes['blockId'],'w',encoding='UTF8'), indent=4)
+                        else:
+                            for blok in bloks['blocks']:
+                                logger.debug(f'block:{blok['quantity']}')
+                                codes = api.order_codes_retry(blok['blockId'])
+                                logger.debug(f'Successfully got:{len(codes.ged('codes'))}')
+                                json.dump(codes, open(codes['blockId'],'w',encoding='UTF8'), indent=4)
+                                logger.debug(f'Write {codes['blockId']}:{len(codes.ged('codes'))}')
 
             else:
                 logger.info(f'orderId: {r.get("orderId")}, productionOrderId: {r.get('')}, status: {r.get("orderStatus")}')
