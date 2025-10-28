@@ -1,0 +1,8 @@
+$headers = @{
+    'Accept' = 'application/json'
+    'clientToken' = '4bfdb4a7-4ed3-4ad3-8a65-3835a2a3a7d4'
+}
+
+$response = Invoke-RestMethod -Uri "https://suzgrid.crpt.ru:443/api/v3/ping?omsId=3b1ed9ae-a5d9-4458-9f02-596781bd1e41" -Headers $headers -Method GET
+Write-Output "Тест"
+Write-Output $response

@@ -1,0 +1,8 @@
+$headers = @{
+    'Accept' = 'application/json'
+    'Authorization' = 'Bearer d08b7e5f-ab6c-44cb-9d5c-5f3ec365d5ce'
+}
+
+$response = Invoke-RestMethod -Uri "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai:443/v3/linked-gtins" -Headers  @{'Authorization'= 'Bearer d08b7e5f-ab6c-44cb-9d5c-5f3ec365d5ce'} -Method GET
+Write-Output "Тест"
+Write-Output $response
