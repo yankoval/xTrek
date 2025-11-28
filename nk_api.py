@@ -385,15 +385,15 @@ def save_linked_gtins_to_csv(linked_gtins: list, output_file: str = None):
     
     try:
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['producer_inn', 'producer_name', 'gtin']
+            fieldnames = ['gtin', 'producer_inn', 'producer_name']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             
             for item in linked_gtins:
                 writer.writerow({
+                    'gtin': item.get('gtin', ''),
                     'producer_inn': item.get('producer_inn', ''),
-                    'producer_name': item.get('producer_name', ''),
-                    'gtin': item.get('gtin', '')
+                    'producer_name': item.get('producer_name', '')
                 })
         
         logger.info(f"Результаты сохранены в файл: {output_file}")
@@ -574,12 +574,15 @@ if __name__ == "__main__":
             if args.inn:
                 docs = nk.get_permit_document_by_gtin(gtin, args.inn)
                 if not docs:
-                    logger.warning("Разрешительные документы не найдены.")
+                    logger.warning(f"gtin:{gtin} Разрешительные документы не найдены.")
                 else:
                     for d in docs:
-                        logger.info(f"Документ № {d['number']} от {d['from_date']} до {d['to_date']}")
+                        logger.info(f"gtin:{gtin} Документ № {d['number']} от {d['from_date']} до {d['to_date']}")
                         if d["days_left"] is not None:
-                            logger.info(f"  Осталось {d['days_left']} дней до окончания")
+                            if d['days_left'] < 30:
+                                logger.error(f"  Осталось {d['days_left']} дней до окончания")
+                            else:
+                                logger.info(f"  Осталось {d['days_left']} дней до окончания")
                         logger.info(f"  Заявитель: {d['applicant']}")
                         logger.info(f"  Изготовитель: {d['manufacturer']}")
 
