@@ -122,9 +122,9 @@ if __name__ == "__main__":
 
     # Call the main function with the parsed arguments
     # main(args.input_filename, args.output_filename, logger)
-    token = args.token or os.getenv('HONEST_SIGN_TOKEN')
-    if not token:
-        raise ValueError("Токен не найден")
+    # token = args.token or os.getenv('HONEST_SIGN_TOKEN')
+    # if not token:
+    #     raise ValueError("Токен не найден")
     omsId = args.omsId or os.getenv('OMSID')
     if not omsId:
         raise ValueError("omsId не найден")
