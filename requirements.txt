@@ -3,3 +3,4 @@
 # Основные требования: Python 3.6+ с tkinter
 coloredlogs>=15.0.0
 openpyxl
+python-slugify
