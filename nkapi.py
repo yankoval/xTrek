@@ -121,6 +121,8 @@ class NK:
         try:
             result = data.get("result", {})
             docs = result.get("documents", [])
+            errors = result.get("errors", [])
+            logger.info(f'Gtin:{gtin} error:{errors}')
             for d in docs:
                 number = d.get("number")
                 from_date = d.get("from_date")

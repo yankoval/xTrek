@@ -26,7 +26,7 @@ class HonestSignAPI:
     def get_single_cis_info(self, code: str) -> Dict[str, Any]:
         """Получить информацию об одном коде маркировки"""
         try:
-            response = requests.post(self.base_url, json=[code], headers=self.headers)
+            response = requests.post(self.base_url, json=[code], headers=self.headers, verify=False)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:

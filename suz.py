@@ -46,7 +46,7 @@ class SUZ:
 
     def order_list(self):
         response = requests.get(self.base_url + f'api/v3/order/list?omsId={self.omsId}',
-                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+                                headers=self.headers, verify=False )  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
     def order_status(self,orderId:str, gtin:str):
@@ -54,7 +54,7 @@ class SUZ:
         response = requests.get(self.base_url + f'api/v3/order/status?omsId={self.omsId}'
                                                 f'&orderId={orderId}'
                                                 f'&gtin={gtin}',
-                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
 
@@ -64,7 +64,7 @@ class SUZ:
                                                 f'&orderId={orderId}'
                                                 f'&quantity={quantity}'
                                                 f'&gtin={gtin}',
-                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
 
@@ -72,11 +72,11 @@ class SUZ:
 
         response = requests.get(self.base_url + f'api/v3//order/codes/retry?omsId={self.omsId}'
                                                 f'&blockId={blockId}',
-                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
 
-    def order_codes_blocks(self,orderId:str, gtin:str):
+    def order_codes_blocks(self,orderId:str, gtin:str, verify=False):
 
         response = requests.get(self.base_url + f'api/v3/order/codes/blocks?omsId={self.omsId}'
                                                 f'&orderId={orderId}'
@@ -87,7 +87,7 @@ class SUZ:
 
     def providers(self):
         response = requests.get(self.base_url + f'api/v3/providers?omsId={self.omsId}',
-                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
 
@@ -122,9 +122,9 @@ if __name__ == "__main__":
 
     # Call the main function with the parsed arguments
     # main(args.input_filename, args.output_filename, logger)
-    # token = args.token or os.getenv('HONEST_SIGN_TOKEN')
-    # if not token:
-    #     raise ValueError("Токен не найден")
+    token = args.token or os.getenv('HONEST_SIGN_TOKEN')
+    if not token:
+        raise ValueError("Токен не найден")
     omsId = args.omsId or os.getenv('OMSID')
     if not omsId:
         raise ValueError("omsId не найден")
@@ -136,27 +136,29 @@ if __name__ == "__main__":
         api = SUZ(token, omsId, clientToken)
         res = api.order_list()
         print(res)
-        for r in res.get('orderInfos', {}):
-            logger.info(f'orderId: {r.get('orderId')}, productionOrderId: {r.get('productionOrderId')}, orderStatus: {r.get("orderStatus")}.')
+        for orderNum, r in enumerate(res.get('orderInfos', {})):
+            logger.info(f'orderId: {r.get("orderId")}, productionOrderId: {r.get("productionOrderId")}, orderStatus: {r.get("orderStatus")}.')
             if r.get('orderStatus') == 'READY':
                 logger.info(f'buffers: {len(r.get("buffers"))}')
                 for buffer in r.get('buffers', []):
                     order_statuses = api.order_status(r['orderId'], buffer['gtin'])
                     for i, order_status in enumerate(order_statuses):
-                        logger.info(f'status:{order_status['productionOrderId']+'_'+str(i)}, {order_status}')
+                        logger.info(f'status:{order_status["productionOrderId"]+"_"+str(i)}, {order_status}')
                         bloks = api.order_codes_blocks(orderId=r['orderId'], gtin=buffer['gtin'])
                         if not bloks['blocks']:
                             codes = api.codes(orderId=r['orderId'], quantity=1, gtin=buffer['gtin'])
                             json.dump(codes, open(codes['blockId'],'w',encoding='UTF8'), indent=4)
                         else:
                             for blok in bloks['blocks']:
-                                logger.debug(f'block:{blok['quantity']}')
+                                logger.debug(f'block:{blok["quantity"]}')
                                 codes = api.order_codes_retry(blok['blockId'])
-                                logger.debug(f'Successfully got:{len(codes.ged('codes'))}')
+                                logger.debug(f'Successfully got:{len(codes.get("codes"))}')
                                 json.dump(codes, open(codes['blockId'],'w',encoding='UTF8'), indent=4)
-                                logger.debug(f'Write {codes['blockId']}:{len(codes.ged('codes'))}')
-
+                                logger.debug(f'Write {codes["blockId"]}:{len(codes.get("codes"))}')
             else:
-                logger.info(f'orderId: {r.get("orderId")}, productionOrderId: {r.get('')}, status: {r.get("orderStatus")}')
+                logger.info(f'orderId: {r.get("orderId")}, productionOrderId: {r.get("")}, status: {r.get("orderStatus")}')
+            if orderNum > 10:
+                logger.debug(f'OrderNum:{orderNum}. Exiting')
+                break
     except HTTPError as e:
         print(e.response.text)

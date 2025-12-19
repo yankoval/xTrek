@@ -1,5 +1,9 @@
 import os
 import sys
+
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import argparse
 import logging
 import csv
@@ -7,6 +11,7 @@ from datetime import datetime
 from openpyxl import load_workbook, Workbook
 from slugify import slugify
 from nkapi import NK
+from tokens import TokenProcessor
 
 
 # ---------------------------
@@ -228,6 +233,7 @@ if __name__ == "__main__":
     parser.add_argument("--linked-output", help="Файл для сохранения результатов linked-gtins (по умолчанию: linked_gtins_<timestamp>.csv)")
     parser.add_argument("--log-file", help=f"Файл для сохранения логов (по умолчанию: {default_log_file})")
     parser.add_argument("--owngtins", action="store_true", help="получить ВЕСЬ список собственных GTIN (постранично)")
+    parser.add_argument("--find-token-by-inn", help="Найти токен по ИНН ")
 
     args = parser.parse_args()
 
@@ -236,7 +242,12 @@ if __name__ == "__main__":
     setup_logging(log_file)
 
     try:
-        nk = NK(sandbox=args.sandbox)
+        tokenInn  = args.find_token_by_inn if args.find_token_by_inn else os.getenv("FIND_TOKEN_BY_INN")
+        tokens = TokenProcessor()
+        token = tokens.get_token_by_inn(tokenInn)
+        if token:
+            logger.info(' '.join([str(token.get(k)) for k in [ 'user_status', 'full_name', 'scope', 'inn', 'pid', 'id', 'exp']]))
+        nk = NK(sandbox=args.sandbox,token=token['Токен']if token else None)
         if args.owngtins:
             goods = nk.get_gtins()
 
@@ -253,7 +264,7 @@ if __name__ == "__main__":
 
                     # Set up file name
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    output_file = f"owned_gtins_{timestamp}.xlsx"
+                    output_file = f"owned_gtins_{token.get('inn')}_{timestamp}.xlsx"
                     wb.save(output_file)
                     logger.info(f'found {len(goods)} records, saved to {output_file}')
                 except Exception as e:
@@ -278,7 +289,12 @@ if __name__ == "__main__":
                 logger.info(f"Всего найдено {len(all_linked_gtins)} доступных GTIN:")
 
                 # Сохраняем результаты в CSV
-                output_file = save_linked_gtins_to_csv(all_linked_gtins, args.linked_output)
+                if not args.linked_output:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    output_file = f"linked_gtins_{token.get('inn')}_{timestamp}.csv"
+                else:
+                    output_file = args.linked_output
+                output_file_name = save_linked_gtins_to_csv(all_linked_gtins, output_file)
 
                 # Выводим краткую статистику
                 producers = {}
@@ -295,8 +311,8 @@ if __name__ == "__main__":
                 for inn, info in producers.items():
                     logger.info(f"  - {info['name']} (ИНН: {inn}): {info['count']} GTIN")
 
-                if output_file:
-                    logger.info(f"Полные результаты сохранены в: {output_file}")
+                if output_file_name:
+                    logger.info(f"Полные результаты сохранены в: {output_file_name}")
 
             sys.exit(0)
 

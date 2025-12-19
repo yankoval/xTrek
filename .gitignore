@@ -3,3 +3,5 @@
 *.log
 *.csv
 __pycache__/
+/xTrek.egg-info
+/dist
