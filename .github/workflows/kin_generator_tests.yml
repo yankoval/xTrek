@@ -4,9 +4,11 @@ on:
   push:
     paths:
       - 'kinGenerator.py'
+      - '.github/workflows/kin_generator_tests.yml'
   pull_request:
     paths:
       - 'kinGenerator.py'
+      - '.github/workflows/kin_generator_tests.yml'
   workflow_dispatch:
 
 jobs:
