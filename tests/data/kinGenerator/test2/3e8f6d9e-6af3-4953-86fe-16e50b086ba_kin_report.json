@@ -1,0 +1,69 @@
+{
+  "id": "85a3866f-f910-11f0-8010-dcf401e5df3f",
+  "startTime": "2026-01-24T13:40:33.6916718+03:00",
+  "endTime": "2026-01-24T13:47:56.9569405+03:00",
+  "operators": [],
+  "readyBox": [
+    {
+      "Number": 0,
+      "boxNumber": "0104640286990563215CrRhy\u001d93BU8V",
+      "boxAgregate": true,
+      "boxTime": "2026-01-24T13:42:52.9946332+03:00",
+      "productNumbers": [
+        "5;p-MU",
+        "5XsI3Q"
+      ],
+      "productNumbersFull": [
+        "0104660205471904215;p-MU\u001d93WlZu",
+        "0104660205471904215XsI3Q\u001d93LDMP"
+      ]
+    },
+    {
+      "Number": 1,
+      "boxNumber": "0104640286990563215fJX_g\u001d93je7p",
+      "boxAgregate": true,
+      "boxTime": "2026-01-24T13:44:56.667975+03:00",
+      "productNumbers": [
+        "5<PZki",
+        "5vxlcN"
+      ],
+      "productNumbersFull": [
+        "0104660205471904215<PZki\u001d93e7aO",
+        "0104660205471904215vxlcN\u001d93rkQs"
+      ]
+    },
+    {
+      "Number": 2,
+      "boxNumber": "0104640286990563215GaIi2\u001d93PGb1",
+      "boxAgregate": true,
+      "boxTime": "2026-01-24T13:46:18.9303809+03:00",
+      "productNumbers": [
+        "5aS.L2",
+        "5umMMm"
+      ],
+      "productNumbersFull": [
+        "0104660205471904215aS.L2\u001d93d0ly",
+        "0104660205471904215umMMm\u001d93rRdO"
+      ]
+    },
+    {
+      "Number": 3,
+      "boxNumber": "0104640286990563215gi?df\u001d93LEN6",
+      "boxAgregate": true,
+      "boxTime": "2026-01-24T13:47:30.7759089+03:00",
+      "productNumbers": [
+        "5UERes",
+        "5BntR!"
+      ],
+      "productNumbersFull": [
+        "0104660205471904215UERes\u001d93SEuF",
+        "0104660205471904215BntR!\u001d93mNj5"
+      ]
+    }
+  ],
+  "sampleNumbers": [],
+  "sampleNumbersFull": null,
+  "defectiveCodes": null,
+  "defectiveCodesFull": null,
+  "emptyNumbers": null
+}

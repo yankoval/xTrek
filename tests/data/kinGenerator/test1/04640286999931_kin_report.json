@@ -1,0 +1,83 @@
+{
+  "id": "804d3eb4-21cc-4921-bfdc-23bb7ff83f6a",
+  "startTime": "2025-10-31T08:43:03.173878",
+  "endTime": "2025-10-31T08:43:03.176336",
+  "operators": [],
+  "readyBox": [
+    {
+      "Number": 0,
+      "boxNumber": "0104640286999931215N5Ubb\u001d93/pm2",
+      "boxAgregate": true,
+      "boxTime": "2025-10-31T09:13:03.173878",
+      "productNumbers": [
+        "5U0fln",
+        "5?P'TL"
+      ],
+      "productNumbersFull": [
+        "0104630234040808215U0fln\u001d93BmyY",
+        "0104640286995001215?P'TL\u001d93rT2N"
+      ]
+    },
+    {
+      "Number": 1,
+      "boxNumber": "0104640286999931215AceNf\u001d93hW1q",
+      "boxAgregate": true,
+      "boxTime": "2025-10-31T08:45:03.173878",
+      "productNumbers": [
+        "5T<=,y",
+        "5tbDMI"
+      ],
+      "productNumbersFull": [
+        "0104630234040808215T<=,y\u001d93Ph5C",
+        "0104640286995001215tbDMI\u001d93cmed"
+      ]
+    },
+    {
+      "Number": 2,
+      "boxNumber": "0104640286999931215aeKhM\u001d93Wara",
+      "boxAgregate": true,
+      "boxTime": "2025-10-31T09:00:03.173878",
+      "productNumbers": [
+        "5y0d&E",
+        "5FlFbQ"
+      ],
+      "productNumbersFull": [
+        "0104630234040808215y0d&E\u001d93Mhdt",
+        "0104640286995001215FlFbQ\u001d93qEl3"
+      ]
+    },
+    {
+      "Number": 3,
+      "boxNumber": "0104640286999931215JC/m6\u001d93DpZJ",
+      "boxAgregate": true,
+      "boxTime": "2025-10-31T09:09:03.173878",
+      "productNumbers": [
+        "51LWFQ",
+        "5C)_vF"
+      ],
+      "productNumbersFull": [
+        "01046302340408082151LWFQ\u001d93D6DL",
+        "0104640286995001215C)_vF\u001d936HM7"
+      ]
+    },
+    {
+      "Number": 4,
+      "boxNumber": "0104640286999931215fjfpD\u001d93JHQo",
+      "boxAgregate": true,
+      "boxTime": "2025-10-31T08:55:03.173878",
+      "productNumbers": [
+        "5FpBzg",
+        "5CrIsh"
+      ],
+      "productNumbersFull": [
+        "0104630234040808215FpBzg\u001d93TKRK",
+        "0104640286995001215CrIsh\u001d93W9ZX"
+      ]
+    }
+  ],
+  "sampleNumbers": [],
+  "sampleNumbersFull": null,
+  "defectiveCodes": null,
+  "defectiveCodesFull": null,
+  "emptyNumbers": null
+}
