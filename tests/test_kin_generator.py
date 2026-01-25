@@ -1,7 +1,7 @@
 import json
 import os
 import pytest
-from kinGenerator import generate_kin_report_from_files
+from kinGenerator import generate_kin_report_from_files, KinReportGenerator
 
 def test_generate_kin_report_logic_and_format(tmp_path, monkeypatch):
     # Setup paths
@@ -44,6 +44,11 @@ def test_generate_kin_report_logic_and_format(tmp_path, monkeypatch):
         assert gen_box['boxAgregate'] == ref_box['boxAgregate']
         assert gen_box['productNumbers'] == ref_box['productNumbers']
         assert gen_box['productNumbersFull'] == ref_box['productNumbersFull']
+
+        # Logic check: verify that productNumbers match productNumbersFull
+        generator = KinReportGenerator()
+        for short, full in zip(gen_box['productNumbers'], gen_box['productNumbersFull']):
+            assert short == generator.extract_short_code(full)
 
         # Ensure boxTime is present and is a string (ISO format)
         assert isinstance(gen_box['boxTime'], str)
