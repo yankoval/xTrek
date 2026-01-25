@@ -1,0 +1,30 @@
+{
+	"id": "490d46d6-b631-11f0-bffd-dcf401e5df3f",
+	"SerialNumber": "01.08.2025",
+	"Hierarchy": [
+		{
+			"LevelType": "Kit",
+			"Packs": [
+				{
+					"PackName": "GB Гель для душа Miss Organic 290мл/5шт Увлажняющий VANILLA EXTASY",
+					"GTIN": "04630234040808"
+				},
+				{
+					"PackName": "GB Бомбочка для ванны с предсказаниями Miss Organic 100г/16шт грейпфрутовая с розой, сердце  (стикер выиграй айфон)",
+					"GTIN": "04640286995001"
+				}
+			]
+		},
+		{
+			"LevelType": "Kigu",
+			"Packs": [
+				{
+					"PackName": "GB Набор косметический №153 Miss Organic Love is in the air (ГДД VANILLA EXTASY + Бомбочка д/ванны Beauty desserts Клубничная)",
+					"GTIN": "04640286999931",
+					"CountPacksInside": 2,
+					"CountLayers": 0
+				}
+			]
+		}
+	]
+}
