@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import pyperclip
 import logging
@@ -6,10 +7,16 @@ import urllib3
 import argparse
 from typing import List, Dict, Any, Generator
 
-# Отключаем предупреждения SSL
+# Настройка путей
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from tokens import TokenProcessor
+except ImportError:
+    TokenProcessor = None
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Настройка логгера
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -17,11 +24,25 @@ logging.basicConfig(
 logger = logging.getLogger("HonestSign")
 
 class HonestSignAPI:
-    def __init__(self, token: str = None):
+    def __init__(self, token: str = None, omsId: str = None, clientToken: str = None):
+        """
+        Инициализация True API.
+        Обязателен только основной токен. omsId и clientToken — опционально.
+        """
+        # Токен - единственный обязательный параметр
         self.token = token or os.getenv('HONEST_SIGN_TOKEN')
         if not self.token:
-            logger.error("Токен не найден. Установите переменную окружения HONEST_SIGN_TOKEN.")
-            raise ValueError("Токен не найден")
+            raise ValueError("Токен не найден (установите HONEST_SIGN_TOKEN или передайте параметром)")
+
+        # omsId - необязателен
+        self.omsId = omsId or os.getenv('OMSID')
+        if not self.omsId:
+            logger.debug("omsId не задан")
+
+        # clientToken - необязателен
+        self.clientToken = clientToken or os.getenv('CLIENT_TOKEN')
+        if not self.clientToken:
+            logger.debug("clientToken не задан")
 
         self.host = "https://markirovka.crpt.ru"
         self.headers = {
@@ -34,7 +55,7 @@ class HonestSignAPI:
         """Получить баланс по всем товарным группам"""
         url = f"{self.host}/api/v3/true-api/elk/product-groups/balance/all"
         try:
-            logger.info(f"Запрос баланса по всем ТГ...")
+            logger.info("Запрос баланса по всем ТГ...")
             response = requests.get(url, headers=self.headers, verify=False)
             logger.debug(f"RAW GET | Status: {response.status_code} | Body: {response.text}")
             response.raise_for_status()
@@ -44,7 +65,7 @@ class HonestSignAPI:
             return []
 
     def get_single_cis_info(self, code: str) -> Dict[str, Any]:
-        """Получить информацию об одном коде маркировки"""
+        """Получить информацию о коде маркировки"""
         url = f"{self.host}/api/v3/true-api/cises/info"
         try:
             response = requests.post(url, json=[code], headers=self.headers, verify=False)
@@ -52,66 +73,65 @@ class HonestSignAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.warning(f"Ошибка кода {code}: {e}")
+            logger.warning(f"Ошибка запроса кода {code}: {e}")
             return {"code": code, "error": str(e)}
 
     def get_codes_from_clipboard(self) -> List[str]:
         clipboard_text = pyperclip.paste()
-        codes = [line.strip() for line in clipboard_text.split('\n') if line.strip()]
-        logger.info(f"Извлечено кодов из буфера: {len(codes)}")
-        return codes
+        return [line.strip() for line in clipboard_text.split('\n') if line.strip()]
 
     def process_codes_iteratively(self) -> Generator[Dict[str, Any], None, None]:
-        codes = self.get_codes_from_clipboard()
-        for code in codes:
+        for code in self.get_codes_from_clipboard():
             yield self.get_single_cis_info(code)
 
 def main():
-    parser = argparse.ArgumentParser(description="Утилита для работы с Честным Знаком (True API)")
-    parser.add_argument('--balance', action='store_true', help='Вывести баланс по всем товарным группам')
-    parser.add_argument('--cises', action='store_true', help='Обработать коды маркировки из буфера обмена')
-    parser.add_argument('--debug', action='store_true', help='Включить вывод сырых ответов API (DEBUG)')
+    parser = argparse.ArgumentParser(description="True API Честный Знак")
+    parser.add_argument('-t', '--token', dest='token', type=str, help='Bearer токен')
+    parser.add_argument('-ct', '--client_token', dest='client_token', type=str, help='Client Token (опц.)')
+    parser.add_argument('-oid', '--omsid', dest='omsId', type=str, help='OMS ID (опц.)')
+    parser.add_argument('--find-token-by-inn', type=str, help='Поиск по ИНН')
+    parser.add_argument('--balance', action='store_true', help='Вывести баланс')
+    parser.add_argument('--cises', action='store_true', help='Инфо о кодах из буфера')
+    parser.add_argument('--debug', action='store_true', help='Включить DEBUG')
 
     args = parser.parse_args()
-
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
     try:
-        api = HonestSignAPI()
+        token, omsId, client_token = args.token, args.omsId, args.client_token
+        
+        # Автопоиск токена по ИНН
+        token_inn = args.find_token_by_inn or os.getenv("FIND_TOKEN_BY_INN")
+        if token_inn and TokenProcessor:
+            tp = TokenProcessor()
+            token_data = tp.get_token_by_inn(token_inn)
+            if token_data:
+                meta = ['user_status', 'full_name', 'scope', 'inn', 'pid', 'id', 'exp']
+                logger.info('Токен: ' + ' '.join([str(token_data.get(k, '-')) for k in meta]))
+                token = token_data.get('Токен')
+                # Подтягиваем доп. параметры из БД, если они там есть
+                omsId = omsId or token_data.get('omsId')
+                client_token = client_token or token_data.get('clientToken')
 
-        if not (args.balance or args.cises):
-            parser.print_help()
-            return
+        # Создание API
+        api = HonestSignAPI(token=token, omsId=omsId, clientToken=client_token)
 
         if args.balance:
-            balances = api.get_balance_all()
-            if not balances:
-                logger.info("Данные о балансе отсутствуют.")
-            
-            logger.info(f"{'ORG ID':<15} | {'ТГ':<5} | {'Баланс (руб.)':>12}")
-            logger.info("-" * 40)
-            
-            for item in balances:
-                org_id = item.get('organisationId', 'N/A')
-                pg_id = item.get('productGroupId', '??')
-                raw_val = item.get('balance')
-                
-                if raw_val is not None:
-                    balance_str = f"{raw_val / 100:>12.2f}"
-                else:
-                    balance_str = f"{'[Нет данных]':>12}"
-                
-                logger.info(f"{org_id:<15} | {pg_id:<5} | {balance_str}")
+            res = api.get_balance_all()
+            logger.info(f"{'ORG ID':<15} | {'ТГ':<4} | {'БАЛАНС':>12}")
+            for item in res:
+                b = item.get('balance', 0) / 100
+                logger.info(f"{item.get('organisationId', 'N/A'):<15} | {item.get('productGroupId'):<4} | {b:>12.2f}")
 
         if args.cises:
             for results in api.process_codes_iteratively():
-                for res in results:
-                    c_info = res.get('cisInfo', {})
-                    logger.info(f"CIS: {c_info.get('cis')} | Статус: {c_info.get('status')} | Агрегат: {c_info.get('parent', 'Нет')}")
+                for r in results:
+                    c = r.get('cisInfo', {})
+                    logger.info(f"CIS: {c.get('cis')} | Статус: {c.get('status')}")
 
     except Exception as e:
-        logger.error(f"Произошла ошибка: {e}")
+        logger.error(f"Ошибка выполнения: {e}")
 
 if __name__ == "__main__":
     main()
