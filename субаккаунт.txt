@@ -14,7 +14,7 @@
 
 
 $headers = @{
-    'Authorization' = "Bearer $((Get-Content -Path "C:\Users\project\Documents\headers_11000034841_fito.txt" -Raw).Trim())"
+    'Authorization' = "Bearer $((Get-Content -Path "token.txt" -Raw).Trim())"
     'Content-Type' = 'application/json'
 }
 

@@ -1,0 +1,5 @@
+{
+  "uuid": "YOUR_UUID_HERE",
+  "data": "YOUR_BASE64_SIGNED_DATA_HERE",
+  "inn": "1234567890"
+}
