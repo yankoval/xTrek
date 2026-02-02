@@ -197,14 +197,20 @@ class KinReportGenerator:
 
         return min(max_from_kigu, max_from_kits)
 
-    def get_file_for_gtin(self, gtin):
-        """Поиск файла с кодами для указанного GTIN"""
-        for filename, data in self.uploaded_files.items():
+    def get_all_codes_for_gtin(self, gtin):
+        """Получение всех кодов для указанного GTIN из всех загруженных файлов"""
+        all_codes = []
+        # Сортируем имена файлов для детерминированного порядка
+        for filename in sorted(self.uploaded_files.keys()):
+            data = self.uploaded_files[filename]
             if 'codes' in data and data.get('codes'):
                 if data['codes'] and gtin in data['codes'][0]:
-                    return data
-        logger.warning(f"Не найден файл для GTIN {gtin}")
-        return None
+                    all_codes.extend(data['codes'])
+
+        if not all_codes:
+            logger.warning(f"Не найдены коды для GTIN {gtin}")
+
+        return all_codes
 
     def find_main_data_and_gtins(self):
         """Поиск основного файла и извлечение GTIN"""
@@ -269,37 +275,35 @@ class KinReportGenerator:
             logger.error("Не все необходимые файлы с кодами загружены")
             return None
 
-        # Получаем данные из файлов
-        kigu_data = self.get_file_for_gtin(kigu_gtin)
-        if not kigu_data:
-            logger.error(f"Не удалось получить данные для Kigu GTIN: {kigu_gtin}")
-            return None
-
-        kit_data_list = []
-        for kit_gtin in kit_gtins:
-            kit_data = self.get_file_for_gtin(kit_gtin)
-            if kit_data:
-                kit_data_list.append(kit_data)
-            else:
-                logger.error(f"Не удалось получить данные для Kit GTIN: {kit_gtin}")
-                return None
-
-        # Получаем коды
-        kigu_codes = kigu_data.get('codes', [])
+        # Группируем коды по GTIN
+        kigu_codes = self.get_all_codes_for_gtin(kigu_gtin)
         if not kigu_codes:
-            logger.error("В файле Kigu нет кодов коробок")
+            logger.error(f"Не удалось получить коды для Kigu GTIN: {kigu_gtin}")
             return None
 
-        all_kit_codes = [kit_data.get('codes', []) for kit_data in kit_data_list]
-
-        # Проверяем, что во всех файлах есть коды
-        for i, kit_codes in enumerate(all_kit_codes):
-            if not kit_codes:
-                logger.error(f"В файле для Kit GTIN {kit_gtins[i]} нет кодов")
+        # Собираем уникальные GTIN наборов и их коды
+        kit_codes_by_gtin = {}
+        for gtin in set(kit_gtins):
+            codes = self.get_all_codes_for_gtin(gtin)
+            if not codes:
+                logger.error(f"Не удалось получить коды для Kit GTIN: {gtin}")
                 return None
+            kit_codes_by_gtin[gtin] = codes
 
         # Подсчет максимального количества наборов
-        max_kits = self.calculate_max_kits(kigu_codes, all_kit_codes)
+        # Для каждого GTIN набора нужно посчитать, сколько раз он встречается в описании набора
+        gtin_counts = {}
+        for gtin in kit_gtins:
+            gtin_counts[gtin] = gtin_counts.get(gtin, 0) + 1
+
+        max_from_kigu = len(kigu_codes)
+        max_from_kits = float('inf')
+        for gtin, count in gtin_counts.items():
+            max_for_this_gtin = len(kit_codes_by_gtin[gtin]) // count
+            if max_for_this_gtin < max_from_kits:
+                max_from_kits = max_for_this_gtin
+
+        max_kits = int(min(max_from_kigu, max_from_kits))
 
         if max_kits == 0:
             logger.error("Недостаточно кодов для создания наборов")
@@ -310,8 +314,8 @@ class KinReportGenerator:
 
         logger.info("Доступно кодов:")
         logger.info(f"   - Kigu ({kigu_gtin}): {len(kigu_codes)} коробок")
-        for i, kit_codes in enumerate(all_kit_codes):
-            logger.info(f"   - Kit ({kit_gtins[i]}): {len(kit_codes)} продуктов")
+        for gtin, codes in kit_codes_by_gtin.items():
+            logger.info(f"   - Kit ({gtin}): {len(codes)} продуктов")
         logger.info(f"Максимально можно создать: {max_kits} наборов")
 
         # Определяем количество наборов для генерации
@@ -351,38 +355,30 @@ class KinReportGenerator:
         """Создание данных отчета"""
         logger.info(f"Создание данных отчета для {num_kits} наборов...")
 
-        # Получаем данные из файлов
-        kigu_data = self.get_file_for_gtin(kigu_gtin)
-        if not kigu_data:
-            logger.error("Не удалось получить данные Kigu для создания отчета")
+        # Группируем коды по GTIN
+        kigu_pool = list(self.get_all_codes_for_gtin(kigu_gtin))
+
+        kit_pools = {}
+        for gtin in set(kit_gtins):
+            kit_pools[gtin] = list(self.get_all_codes_for_gtin(gtin))
+
+        # Проверяем, что достаточно кодов
+        if len(kigu_pool) < num_kits:
+            logger.error(f"Недостаточно кодов Kigu: доступно {len(kigu_pool)}, нужно {num_kits}")
             return None
 
-        kit_data_list = []
-        for kit_gtin in kit_gtins:
-            kit_data = self.get_file_for_gtin(kit_gtin)
-            if kit_data:
-                kit_data_list.append(kit_data)
-            else:
-                logger.error(f"Не удалось получить данные Kit ({kit_gtin}) для создания отчета")
+        for gtin in set(kit_gtins):
+            needed = kit_gtins.count(gtin) * num_kits
+            if len(kit_pools[gtin]) < needed:
+                logger.error(f"Недостаточно кодов для Kit GTIN {gtin}: доступно {len(kit_pools[gtin])}, нужно {needed}")
                 return None
 
-        # Получаем коды
-        kigu_codes = kigu_data.get('codes', [])
-        all_kit_codes = [kit_data.get('codes', []) for kit_data in kit_data_list]
-
-        if not kigu_codes or any(not codes for codes in all_kit_codes):
-            logger.error("Отсутствуют коды для создания данных отчета")
-            return None
-
-        # Проверяем, что достаточно кодов для запрошенного количества наборов
-        if num_kits > len(kigu_codes):
-            logger.error(f"Недостаточно кодов Kigu: запрошено {num_kits}, доступно {len(kigu_codes)}")
-            return None
-
-        for i, kit_codes in enumerate(all_kit_codes):
-            if num_kits > len(kit_codes):
-                logger.error(f"Недостаточно кодов Kit {kit_gtins[i]}: запрошено {num_kits}, доступно {len(kit_codes)}")
-                return None
+        # Поиск ID из основного файла для использования в отчете
+        report_id = str(uuid.uuid4())
+        for data in self.uploaded_files.values():
+            if 'Hierarchy' in data and 'id' in data:
+                report_id = data['id']
+                break
 
         # Создание отчета
         start_time = datetime.now()
@@ -392,21 +388,20 @@ class KinReportGenerator:
             product_numbers = []
             product_numbers_full = []
 
-            # Берем коды из каждого Kit
-            for kit_codes in all_kit_codes:
-                if i < len(kit_codes):
-                    full_code = kit_codes[i]
+            # Берем коды для каждого компонента набора
+            for kit_gtin in kit_gtins:
+                if kit_pools[kit_gtin]:
+                    full_code = kit_pools[kit_gtin].pop(0)
                     short_code = self.extract_short_code(full_code)
 
                     if short_code:
                         product_numbers.append(short_code)
                         product_numbers_full.append(full_code)
 
-            # Номер коробки из Kigu
-            if i < len(kigu_codes):
-                box_number = kigu_codes[i]
+            # Номер коробки из Kigu pool
+            if kigu_pool:
+                box_number = kigu_pool.pop(0)
             else:
-                logger.error(f"Недостаточно кодов Kigu для создания набора {i}")
                 break
 
             box = {
@@ -423,7 +418,7 @@ class KinReportGenerator:
         logger.info(f"Создание данных отчета завершено. Сгенерировано {len(ready_boxes)} наборов")
 
         return {
-            "id": str(uuid.uuid4()),
+            "id": report_id,
             "startTime": start_time.isoformat(),
             "endTime": datetime.now().isoformat(),
             "operators": [],
