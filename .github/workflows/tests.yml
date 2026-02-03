@@ -1,14 +1,10 @@
-name: Kin Generator Tests
+name: Tests
 
 on:
   push:
-    paths:
-      - 'kinGenerator.py'
-      - '.github/workflows/kin_generator_tests.yml'
+    branches: [ main, '*' ]
   pull_request:
-    paths:
-      - 'kinGenerator.py'
-      - '.github/workflows/kin_generator_tests.yml'
+    branches: [ main, '*' ]
   workflow_dispatch:
 
 jobs:
@@ -33,4 +29,4 @@ jobs:
       env:
         PYTHONPATH: .
       run: |
-        pytest tests/test_kin_generator.py
+        pytest tests/

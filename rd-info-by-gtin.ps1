@@ -1,8 +1,8 @@
 # Script parameters
-$csvFilePath = $env:USERPROFILE + "\Documents\" +"gtins.csv"  # Path to CSV file with GTINs
-$inn = "7733154124"  # INN parameter
-$tokenFilePath = $env:USERPROFILE + "\Documents\" +"headers_11000034841_fito.txt"
-$outputDirectory = $env:USERPROFILE + "\Documents"   # Directory for results
+$csvFilePath = "gtins.csv"  # Path to CSV file with GTINs
+$inn = "YOUR_INN"  # INN parameter
+$tokenFilePath = "token.txt"
+$outputDirectory = "results"   # Directory for results
 
 # Create output directory if not exists
 if (!(Test-Path $outputDirectory)) {
@@ -28,7 +28,7 @@ function Invoke-RDInfoRequest {
         [hashtable]$headers,
         [string]$baseUri
     )
-    
+
     $body = @{
         gtin = $gtin
         inn = $inn
@@ -36,9 +36,9 @@ function Invoke-RDInfoRequest {
 
     try {
         Write-Host "Request for GTIN: $gtin" -ForegroundColor Yellow
-        
+
         $response = Invoke-RestMethod -Uri $baseUri -Method "POST" -Headers $headers -Body $body
-        
+
         return @{
             Success = $true
             Data = $response
@@ -47,7 +47,7 @@ function Invoke-RDInfoRequest {
     }
     catch {
         Write-Host "Error for GTIN: $gtin - $($_.Exception.Message)" -ForegroundColor Red
-        
+
         return @{
             Success = $false
             Data = $null
@@ -64,12 +64,12 @@ function Save-RDInfoResult {
         [object]$result,
         [string]$outputDirectory
     )
-    
+
     # Create filename with GTIN and INN
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $fileName = "RD_Info_${gtin}_${inn}_${timestamp}.json"
     $fullPath = Join-Path $outputDirectory $fileName
-    
+
     try {
         $outputData = @{
             Metadata = @{
@@ -81,9 +81,9 @@ function Save-RDInfoResult {
             Result = $result.Data
             Error = $result.Error
         }
-        
+
         $outputData | ConvertTo-Json -Depth 10 | Out-File -FilePath $fullPath -Encoding UTF8
-        
+
         Write-Host "Result saved: $fullPath" -ForegroundColor Green
         return $fullPath
     }
@@ -118,15 +118,15 @@ $counter = 0
 foreach ($item in $gtinData) {
     $counter++
     $gtin = $item.GTIN.Trim()
-    
+
     Write-Host "Processing $counter of $($gtinData.Count): GTIN $gtin" -ForegroundColor Magenta
-    
+
     # Execute request
     $result = Invoke-RDInfoRequest -gtin $gtin -inn $inn -headers $headers -baseUri $baseUri
-    
+
     # Save result
     $filePath = Save-RDInfoResult -gtin $gtin -inn $inn -result $result -outputDirectory $outputDirectory
-    
+
     # Store processing info
     $processedResults += [PSCustomObject]@{
         GTIN = $gtin
@@ -136,7 +136,7 @@ foreach ($item in $gtinData) {
         FilePath = $filePath
         Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     }
-    
+
     # Pause between requests (1 second)
     if ($counter -lt $gtinData.Count) {
         Write-Host "Pause 1 second..." -ForegroundColor Gray
@@ -168,13 +168,13 @@ function Show-RDResults {
     param(
         [string]$searchPath = $outputDirectory
     )
-    
+
     $files = Get-ChildItem -Path $searchPath -Filter "RD_Info_*_${inn}_*.json" | Sort-Object LastWriteTime -Descending
-    
+
     foreach ($file in $files) {
         Write-Host "`nFile: $($file.Name)" -ForegroundColor Yellow
         $content = Get-Content $file.FullName -Encoding UTF8 | ConvertFrom-Json
-        
+
         if ($content.Metadata.Success) {
             Write-Host "Status: Success" -ForegroundColor Green
             if ($content.Result.result.documents) {
