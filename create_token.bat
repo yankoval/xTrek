@@ -2,10 +2,11 @@ ECHO OFF
 REM Шаг 1 Создаем токены 
 REM Шаг 1.0 Получаем случайные данные
 curl -X GET "https://markirovka.crpt.ru/api/v3/true-api/auth/key" -H "accept: application/json" > %USERPROFILE%\sign_data.json
+REM ответ: {"uuid":"f4463cb4-3ff4-41a1-af72-deb2dce91596","data":"VRHZTEQSJUCOEBJRVELQQUWBOASNUC"}
+
 REM Выделяем случайные данные для подписи в файл %USERPROFILE%\dataToSign.txt
 @echo off
 powershell -Command "(Get-Content '%USERPROFILE%\sign_data.json' | ConvertFrom-Json).data" > "%USERPROFILE%\dataToSign.txt"
-REM ответ: {"uuid":"f4463cb4-3ff4-41a1-af72-deb2dce91596","data":"VRHZTEQSJUCOEBJRVELQQUWBOASNUC"}
 REM Шаг 1.1 Подписываем  случайные данные файл %USERPROFILE%\dataToSign.txt с помощью плагина кипто про 
 REM https://cryptopro.ru/sites/default/files/products/cades/demopage/cades_bes_file.html
 REM Тип подписи CAdES-BES  Вложить серт. конечный Отделенная подпись ВЫКЛ
