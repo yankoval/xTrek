@@ -69,7 +69,17 @@ class SUZ:
         return response.json()
 
     def order_codes_retry(self, blockId: str):
-
+        """ Метод «Получить повторно коды маркировки из заказа КМ»
+        Этот метод используется для повторного получения массива эмитированных КМ из 
+        заказа кодов маркировки в случае, если коды маркировки не были получены в результате 
+        коммуникационных ошибок или ошибок на стороне Системы, взаимодействующей с СУЗ. 
+        Метод использует следующие параметры: идентификатор СУЗ, идентификатор 
+        пакета кодов маркировки.
+        . Ограничения (Restrictions)
+        Повторно коды маркировки могут быть запрошены только в том случае, если:
+        1) они были ранее запрошены через API;
+        2) заказ кодов маркировки не был закрыт.
+        """
         response = requests.get(self.base_url + f'api/v3/order/codes/retry?omsId={self.omsId}'
                                                 f'&blockId={blockId}',
                                 headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
@@ -293,6 +303,7 @@ if __name__ == "__main__":
 
             result = api.order_create(args.body_file, args.signature_file, args.max_retries)
             print(json.dumps(result, indent=4, ensure_ascii=False))
+            exit()
         if args.eorder=='test':
             res = api.order_list()
             for orderNum, r in enumerate(res.get('orderInfos', {})):
@@ -304,7 +315,7 @@ if __name__ == "__main__":
                     logger.info(f'buffers: {len(r.get("buffers"))}')
                 else:
                     logger.error(f'Заказ {args.orderNum} orderStatus {r.get("orderStatus")}')
-                    exit()
+            exit()
 
         else:
             # Оригинальная логика для получения списка заказов
@@ -334,9 +345,9 @@ if __name__ == "__main__":
                                     if args.qty == 0:
                                         quantity = leftInBuffer
                                     else:
-                                        quantity = arg.qty if arg.qty <= leftInBuffer else leftInBuffer
-                                codes = api.codes(orderId=r['orderId'], quantity=quantity, gtin=buffer['gtin'])
-                                json.dump(codes, open(codes['blockId'],'w',encoding='UTF8'), indent=4)
+                                        quantity = args.qty if args.qty <= leftInBuffer else leftInBuffer
+                                #codes = api.codes(orderId=r['orderId'], quantity=quantity, gtin=buffer['gtin'])
+                                #json.dump(codes, open(codes['blockId'],'w',encoding='UTF8'), indent=4)
                             else:
                                 for blok in bloks['blocks']:
                                     logger.debug(f'block:{blok["quantity"]}')
