@@ -27,7 +27,7 @@ coloredlogs.install(level=logging.DEBUG, logger=logger, isatty=True,
 
 
 class SUZ:
-    RELEASE_METHODS = {"PRODUCTION", "IMPORT", "REMAINS", "REMARK", "COMMISSION", "REAPPLY"}
+    releaseMethodTypeSet = {"PRODUCTION", "IMPORT", "REMAINS", "REMARK", "COMMISSION", "REAPPLY"}
 
     def __init__(self, token: str = None, omsId: str = None, clientToken: str = None):
         self.token = token or os.getenv('HONEST_SIGN_TOKEN')
