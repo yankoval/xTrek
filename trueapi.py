@@ -97,14 +97,25 @@ class HonestSignAPI:
         except Exception as e:
             logger.warning(f"Ошибка кода {code}: {e}")
             return {"code": code, "error": str(e)}
+    def get_list_cis_info(self, code: List) -> Dict[str, Any]:
+        url = f"{self.host}/api/v3/true-api/cises/info"
+        try:
+            logger.debug(f'get_list_cis_info code:{code}')
+            response = requests.post(url, json=code, headers=self.headers, verify=False)
+            logger.debug(f"RAW POST |  | Body: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.warning(f"Ошибка кода {code}: {e}")
+            return {"code": code, "error": str(e)}
 
     def get_codes_from_clipboard(self) -> List[str]:
         clipboard_text = pyperclip.paste()
         return [line.strip() for line in clipboard_text.split('\n') if line.strip()]
 
-    def process_codes_iteratively(self) -> Generator[Dict[str, Any], None, None]:
-        for code in self.get_codes_from_clipboard():
-            yield self.get_single_cis_info(code)
+    def process_codes_iteratively(self)-> Generator[Dict[str, Any], None, None]:
+            for code in self.get_list_cis_info(self.get_codes_from_clipboard()):
+                yield code
 
 def main():
     parser = argparse.ArgumentParser(description="True API Честный Знак")
@@ -152,9 +163,12 @@ def main():
 
         if args.cises:
             for results in api.process_codes_iteratively():
-                for r in results:
-                    c = r.get('cisInfo', {})
-                    logger.info(f"CIS: {c.get('cis')} | Статус: {c.get('status')}")
+                #for r in results:
+                    try:
+                        c = results.get('cisInfo', {})
+                        logger.info(f"CIS: {c.get('cis')} | Статус: {c.get('status')}")
+                    except Exception as e:
+                        print(e)
 
     except Exception as e:
         logger.error(f"Ошибка выполнения: {e}")
