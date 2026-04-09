@@ -2,6 +2,7 @@ import os
 import json
 import time
 import argparse
+import uuid
 import requests
 import urllib3
 from pathlib import Path
@@ -23,71 +24,86 @@ def main():
     work_dir = Path(user_profile) / "tst"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    data_to_sign_path = work_dir / f"{args.inn}_dataToSign.txt"
-    signature_path = work_dir / f"{args.inn}_dataToSign.txt.sig"
-    get_token_json_path = Path(user_profile) / "get_token.json"
+    unique_id = uuid.uuid4()
+    data_to_sign_path = work_dir / f"{args.inn}_{unique_id}_dataToSign.txt"
+    signature_path = work_dir / f"{args.inn}_{unique_id}_dataToSign.txt.sig"
 
+    # Ensure no stale signature exists (though UUID should prevent this)
     if signature_path.exists():
         signature_path.unlink()
 
-    # --- Шаг 1: Получаем случайные данные ---
-    print(f"[*] Requesting auth key from CRPT (SSL Verify: Disabled)...")
     try:
-        # verify=False игнорирует ошибку самоподписанного сертификата
-        resp = requests.get("https://markirovka.crpt.ru/api/v3/true-api/auth/key", verify=False)
-        resp.raise_for_status()
-        auth_data = resp.json()
-    except Exception as e:
-        print(f"[!] Error getting auth key: {e}")
-        return
-
-    with open(data_to_sign_path, "w", encoding="utf-8") as f:
-        f.write(auth_data['data'])
-    
-    print(f"[*] Data saved to: {data_to_sign_path}. Waiting for daemon...")
-
-    # --- Шаг 2: Ожидание подписи ---
-    start_time = time.time()
-    while not signature_path.exists():
-        if time.time() - start_time > args.timeout:
-            print("[!] Timeout: Signature file not found.")
+        # --- Шаг 1: Получаем случайные данные ---
+        print(f"[*] Requesting auth key from CRPT (SSL Verify: Disabled)...")
+        try:
+            # verify=False игнорирует ошибку самоподписанного сертификата
+            resp = requests.get("https://markirovka.crpt.ru/api/v3/true-api/auth/key", verify=False)
+            resp.raise_for_status()
+            auth_data = resp.json()
+        except Exception as e:
+            print(f"[!] Error getting auth key: {e}")
             return
-        time.sleep(2)
 
-    time.sleep(0.5) 
-    print("[+] Signature detected!")
+        with open(data_to_sign_path, "w", encoding="utf-8") as f:
+            f.write(auth_data['data'])
 
-    # --- Шаг 3: Сборка JSON ---
-    with open(signature_path, "r", encoding="utf-8") as f:
-        signature_body = f.read().strip()
+        print(f"[*] Data saved to: {data_to_sign_path}. Waiting for daemon...")
 
-    payload = {
-        "uuid": auth_data['uuid'],
-        "data": signature_body,
-        "inn": args.inn
-    }
+        # --- Шаг 2: Ожидание подписи ---
+        start_time = time.time()
+        while not signature_path.exists():
+            if time.time() - start_time > args.timeout:
+                print("[!] Timeout: Signature file not found.")
+                return
+            time.sleep(2)
 
-    # --- Шаг 4: Отправка ---
-    if args.mode == 'jwt':
-        url = "https://markirovka.crpt.ru/api/v3/true-api/auth/simpleSignIn"
-        output_file = Path(user_profile) / "token_jwt.json"
-    else:
-        if not args.conid:
-            print("[!] Error: --conid required for 'auth' mode.")
-            return
-        url = f"https://markirovka.crpt.ru/api/v3/true-api/auth/simpleSignIn/{args.conid}"
-        output_file = Path(user_profile) / f"token_{args.conid}.json"
+        time.sleep(0.5)
+        print("[+] Signature detected!")
 
-    try:
-        final_resp = requests.post(url, json=payload, verify=False)
-        final_resp.raise_for_status()
-        
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(final_resp.json(), f, indent=4)
-        
-        print(f"[+++] Success! Result: {output_file}")
-    except Exception as e:
-        print(f"[!] Final request error: {e}")
+        # --- Шаг 3: Сборка JSON ---
+        with open(signature_path, "r", encoding="utf-8") as f:
+            signature_body = f.read().strip()
+
+        payload = {
+            "uuid": auth_data['uuid'],
+            "data": signature_body,
+            "inn": args.inn
+        }
+
+        # --- Шаг 4: Отправка ---
+        if args.mode == 'jwt':
+            url = "https://markirovka.crpt.ru/api/v3/true-api/auth/simpleSignIn"
+            output_file = Path(user_profile) / "token_jwt.json"
+        else:
+            if not args.conid:
+                print("[!] Error: --conid required for 'auth' mode.")
+                return
+            url = f"https://markirovka.crpt.ru/api/v3/true-api/auth/simpleSignIn/{args.conid}"
+            output_file = Path(user_profile) / f"token_{args.conid}.json"
+
+        try:
+            final_resp = requests.post(url, json=payload, verify=False)
+            final_resp.raise_for_status()
+
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(final_resp.json(), f, indent=4)
+
+            print(f"[+++] Success! Result: {output_file}")
+        except Exception as e:
+            print(f"[!] Final request error: {e}")
+
+    finally:
+        # Cleanup temporary files
+        if data_to_sign_path.exists():
+            try:
+                data_to_sign_path.unlink()
+            except Exception as e:
+                print(f"[!] Error deleting data file: {e}")
+        if signature_path.exists():
+            try:
+                signature_path.unlink()
+            except Exception as e:
+                print(f"[!] Error deleting signature file: {e}")
 
 if __name__ == "__main__":
     main()
