@@ -6,6 +6,7 @@ import uuid
 import requests
 import urllib3
 from pathlib import Path
+from tokens import TokenProcessor
 
 # Отключаем лишние предупреждения в консоли
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -85,10 +86,23 @@ def main():
             final_resp = requests.post(url, json=payload, verify=False)
             final_resp.raise_for_status()
 
+            token_data = final_resp.json()
             with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(final_resp.json(), f, indent=4)
+                json.dump(token_data, f, indent=4)
 
             print(f"[+++] Success! Result: {output_file}")
+
+            # Сохранение в общую базу tokens.json
+            try:
+                token_value = token_data.get('token')
+                if token_value:
+                    processor = TokenProcessor()
+                    processor.save_token(token_value, conid=args.conid)
+                else:
+                    print("[!] Не удалось найти 'token' в ответе сервера для сохранения в базу.")
+            except Exception as e:
+                print(f"[!] Ошибка при сохранении токена в базу: {e}")
+
         except Exception as e:
             print(f"[!] Final request error: {e}")
 
