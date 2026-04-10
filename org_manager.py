@@ -28,13 +28,14 @@ STRUCTURE OF DATABASE (DB):
             "person": "str",
             "inn": "str|None",
             "partner_id": "str|None",
-            "connection_id": "str|None"
+            "connection_id": "str|None",
+            "oms_id": "str|None"
         }
     }
 """
 
 class Organization:
-    def __init__(self, name, phone, person, inn=None, partner_id=None, connection_id=None, org_id=None):
+    def __init__(self, name, phone, person, inn=None, partner_id=None, connection_id=None, org_id=None, oms_id=None):
         self.org_id = org_id or str(uuid.uuid4())
         self.name = name
         self.phone = phone
@@ -42,6 +43,7 @@ class Organization:
         self.inn = inn
         self.partner_id = partner_id
         self.connection_id = connection_id
+        self.oms_id = oms_id
 
     def to_dict(self):
         return self.__dict__
