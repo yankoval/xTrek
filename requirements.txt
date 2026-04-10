@@ -6,3 +6,4 @@ openpyxl
 python-slugify
 requests
 pyperclip
+boto3
