@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import re
 from pathlib import Path
+from org_manager import OrganizationManager
 
 home_dir = Path.home()
 
@@ -14,27 +15,67 @@ class TokenProcessor:
     Класс для обработки токенов из JSON файла
     """
 
-    def __init__(self, file_path: str = ''):
+    def __init__(self, file_path: str = '', orgs_dir: str = 'my_orgs'):
         """
         Инициализация процессора токенов
 
         Args:
             file_path (str): Путь к JSON файлу с токенами
+            orgs_dir (str): Путь к директории с организациями
         """
         self.file_path = file_path if file_path else Path(home_dir,'tokens.json')
+        self.org_manager = OrganizationManager(orgs_dir)
         self.tokens = []
         self.processed_tokens = []
         self.read_tokens_file()
         self.process_tokens()
-    def get_token_value_by_inn(self, inn: str) -> Optional[str]:
+
+    def get_jwt_token_value_by_inn(self, inn: str) -> Optional[str]:
+        """Обертка для получения JWT токена по ИНН"""
+        return self.get_token_value_by_inn(inn, token_type='JWT')
+
+    def get_uuid_token_value_by_inn(self, inn: str) -> Optional[str]:
+        """Обертка для получения UUID токена по ИНН"""
+        return self.get_token_value_by_inn(inn, token_type='UUID')
+
+    def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT') -> Optional[str]:
         """Возвращает только строку токена, если он найден и активен"""
-        token_data = self.get_token_by_inn(inn)
-        if token_data:
-            # Проверяем активность через метод, который у вас уже есть
-            active_tokens = self.get_active_tokens()
-            if any(t.get('Токен') == token_data.get('Токен') for t in active_tokens):
-                return token_data.get('Токен')
-        return None
+        # Синонимы для UUID
+        if token_type in ['auth', 'uuid']:
+            token_type = 'UUID'
+
+        # Получаем все токены для данного ИНН
+        tokens = self.get_tokens_by_inn_list([inn])
+        if not tokens:
+            return None
+
+        # Фильтруем по типу
+        tokens_of_type = [t for t in tokens if t.get('ТипТокена') == token_type]
+        if not tokens_of_type:
+            return None
+
+        # Фильтруем активные токены
+        active_tokens_list = self.get_active_tokens()
+        # Создаем набор (set) токенов (значений) для быстрого поиска
+        active_values = {t.get('Токен') for t in active_tokens_list}
+
+        active_tokens_of_type = [t for t in tokens_of_type if t.get('Токен') in active_values]
+
+        if not active_tokens_of_type:
+            return None
+
+        # Если нашли активные токены, выбираем самый свежий по 'ДействуетДо'
+        if len(active_tokens_of_type) > 1:
+            try:
+                active_tokens_of_type.sort(
+                    key=lambda x: datetime.fromisoformat(x.get('ДействуетДо', '0001-01-01T00:00:00').replace('Z', '+00:00')),
+                    reverse=True
+                )
+            except Exception:
+                # В случае ошибки сортировки просто берем первый
+                pass
+
+        return active_tokens_of_type[0].get('Токен')
         
     def read_tokens_file(self) -> List[Dict[str, Any]]:
         """
@@ -224,6 +265,14 @@ class TokenProcessor:
             elif self._is_uuid_token(token_value):
                 token_type = 'UUID'
                 processed_token['ТипТокена'] = token_type
+
+                # Если ИНН нет, пробуем найти через OrganizationManager по Идентификатору (connection_id)
+                if not processed_token.get('inn'):
+                    identifier = processed_token.get('Идентификатор')
+                    if identifier:
+                        org = self.org_manager.find(connection_id=str(identifier))
+                        if org and org.inn:
+                            processed_token['inn'] = org.inn
 
             else:
                 token_type = 'НЕИЗВЕСТНО'
@@ -532,12 +581,12 @@ def main():
         found_token = processor.get_token_by_inn(inn_to_find)
 
         if found_token:
-            print(f"\nНайден токен для INN {inn_to_find}:")
+            print(f"\nНайден токен для ИНН {inn_to_find}:")
             print(f"  Идентификатор: {found_token.get('Идентификатор')}")
             print(f"  Имя: {found_token.get('full_name')}")
             print(f"  Активен: {'Да' if found_token in active_tokens else 'Нет'}")
         else:
-            print(f"\nТокен для INN {inn_to_find} не найден")
+            print(f"\nТокен для ИНН {inn_to_find} не найден")
 
         # 5. Поиск по нескольким INN
         print("\n" + "="*60)
@@ -547,7 +596,7 @@ def main():
         inn_list = ["9723161905", "9718180660", "несуществующий_инн"]
         tokens_by_inn = processor.get_tokens_by_inn_list(inn_list)
 
-        print(f"\nНайдено токенов для списка INN: {len(tokens_by_inn)}")
+        print(f"\nНайдено токенов для списка ИНН: {len(tokens_by_inn)}")
         for token in tokens_by_inn:
             print(f"  - INN: {token.get('inn')}, ID: {token.get('Идентификатор')}")
 
