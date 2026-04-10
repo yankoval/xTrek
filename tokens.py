@@ -1,6 +1,6 @@
 import json
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import re
 from pathlib import Path
@@ -29,29 +29,35 @@ class TokenProcessor:
 
     def read_tokens_file(self) -> List[Dict[str, Any]]:
         """
-        Читает JSON файл с токенами
+        Читает JSON файл с токенами. Если файл не найден или пуст, инициализирует пустой список.
 
         Returns:
             List[Dict[str, Any]]: Список токенов из файла
-
-        Raises:
-            FileNotFoundError: Если файл не найден
-            json.JSONDecodeError: Если некорректный JSON формат
         """
         try:
-            with open(self.file_path, 'r', encoding='utf-8-sig') as file:
-                data = json.load(file)
+            # Преобразуем в Path если это строка
+            p = Path(self.file_path)
+            if not p.exists():
+                self.tokens = []
+                return self.tokens
+
+            with open(p, 'r', encoding='utf-8-sig') as file:
+                content = file.read().strip()
+                if not content:
+                    self.tokens = []
+                    return self.tokens
+                data = json.loads(content)
 
             if not isinstance(data, list):
-                raise ValueError("JSON файл должен содержать массив объектов")
+                self.tokens = []
+                return self.tokens
 
             self.tokens = data
             return self.tokens
 
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Файл не найден: {self.file_path}")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Некорректный JSON формат: {e}")
+        except Exception:
+            self.tokens = []
+            return self.tokens
 
     def _is_jwt_token(self, token: str) -> bool:
         """
@@ -361,6 +367,64 @@ class TokenProcessor:
         print(f"Истекших токенов: {expired_tokens}")
 
         print("\n" + "=" * 60)
+
+    def save_token(self, token_value: str, conid: Optional[str] = None):
+        """
+        Сохраняет или обновляет токен в базе tokens.json
+        """
+        now = datetime.now()
+        # Формат 2026-04-07T17:07:12
+        start_time = now.strftime("%Y-%m-%dT%H:%M:%S")
+        end_time = (now + timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%S")
+
+        identifier = None
+        if self._is_jwt_token(token_value):
+            try:
+                payload = self._decode_jwt_payload(token_value)
+                fields = self._extract_jwt_fields(payload)
+                pid = fields.get('pid')
+                if pid:
+                    identifier = str(pid)
+            except Exception as e:
+                print(f"Ошибка при извлечении pid из JWT: {e}")
+        else:
+            identifier = conid
+
+        if not identifier:
+             print("[!] Не удалось определить идентификатор для сохранения токена.")
+             return
+
+        new_entry = {
+            "Идентификатор": identifier,
+            "Токен": token_value,
+            "ДействуетС": start_time,
+            "ДействуетДо": end_time,
+            "ТокенОбновления": ""
+        }
+
+        # Обновляем существующий или добавляем новый
+        updated = False
+        for i, token_data in enumerate(self.tokens):
+            if str(token_data.get("Идентификатор")) == str(identifier):
+                self.tokens[i] = new_entry
+                updated = True
+                break
+
+        if not updated:
+            self.tokens.append(new_entry)
+
+        try:
+            p = Path(self.file_path)
+            # Создаем родительские директории если нужно
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(self.tokens, f, indent=4, ensure_ascii=False)
+            print(f"[+] Токен сохранен в базу с идентификатором: {identifier}")
+        except Exception as e:
+            print(f"[!] Ошибка записи в файл {self.file_path}: {e}")
+
+        # Обновляем внутреннее состояние
+        self.process_tokens()
 
     def print_detailed_info(self, max_tokens: int = None) -> None:
         """
