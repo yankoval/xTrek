@@ -26,7 +26,16 @@ class TokenProcessor:
         self.processed_tokens = []
         self.read_tokens_file()
         self.process_tokens()
-
+    def get_token_value_by_inn(self, inn: str) -> Optional[str]:
+        """Возвращает только строку токена, если он найден и активен"""
+        token_data = self.get_token_by_inn(inn)
+        if token_data:
+            # Проверяем активность через метод, который у вас уже есть
+            active_tokens = self.get_active_tokens()
+            if any(t.get('Токен') == token_data.get('Токен') for t in active_tokens):
+                return token_data.get('Токен')
+        return None
+        
     def read_tokens_file(self) -> List[Dict[str, Any]]:
         """
         Читает JSON файл с токенами. Если файл не найден или пуст, инициализирует пустой список.
