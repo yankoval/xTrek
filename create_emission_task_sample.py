@@ -50,6 +50,7 @@ def sign_and_send(order: EmissionOrder, inn: str, signing_dir: str, timeout: int
             found_org = org_manager.find(inn=inn)
 
         if found_org:
+            logger.info(f"[*] Используется профиль организации: {found_org.name}")
             final_oms_id = final_oms_id or found_org.oms_id
             final_client_token = final_client_token or found_org.connection_id
 

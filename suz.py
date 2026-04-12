@@ -40,6 +40,7 @@ class SUZ:
 
         self.base_url = f"https://suzgrid.crpt.ru/"  # order/list?omsId={omsId}
         self.headers = {
+            "Authorization": f"Bearer {self.token}",
             "clientToken": f"{self.clientToken}",
             "Accept": "application/json"  # Accept: application/json
         }
