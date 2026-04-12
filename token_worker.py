@@ -7,6 +7,7 @@ from pathlib import Path
 # Импорты ваших модулей
 from tokens import TokenProcessor
 from org_manager import OrganizationManager
+from config_loader import load_config
 
 # Импортируем ваш метод получения токена
 try:
@@ -24,22 +25,12 @@ logger = logging.getLogger("TokenWorker")
 
 class TokenRefreshWorker:
     def __init__(self):
+        self.config = load_config()
         # Путь к базе организаций
         org_storage = Path(__file__).parent / "my_orgs"
         self.org_manager = OrganizationManager(str(org_storage))
         self.tp = TokenProcessor(org_manager=self.org_manager)
-        self.interval = self._load_interval()
-
-    def _load_interval(self) -> int:
-        config_path = os.environ.get('TOKENS_CONFIG') or 'config.json'
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    return config.get('tokens_update_interval', 600)
-            except Exception as e:
-                logger.error(f"Ошибка загрузки интервала из {config_path}: {e}")
-        return 600
+        self.interval = self.config.get('tokens_update_interval', 600)
 
     def check_and_refresh(self):
         logger.info("--- Запуск цикла проверки токенов (JWT + Auth/СУЗ) ---")

@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Any
 from botocore.exceptions import ClientError
 from pathlib import Path
 from storage import get_storage
+from config_loader import load_config
 
 # Настройка логирования
 logger = logging.getLogger("OrganizationManager")
@@ -62,27 +63,19 @@ class OrganizationManager:
         if not os.path.exists(self.storage_dir):
             os.makedirs(self.storage_dir)
             
-        self.config = self._load_config()
+        self.config = load_config()
         self.s3_config = self.config.get('s3_config')
         self.orgs_path = self.config.get('orgs_path')
 
         if self.orgs_path and self.orgs_path.startswith('s3://'):
             self.storage = get_storage(self.orgs_path, self.s3_config)
+            logger.info(f"Инициализирован S3 storage для организаций: {self.orgs_path}")
             self._sync_from_s3()
         else:
             self.storage = None
+            logger.info(f"Используется локальное хранилище для организаций: {self.storage_dir}")
 
         self.sync_from_disk()
-
-    def _load_config(self) -> Dict[str, Any]:
-        config_path = os.environ.get('TOKENS_CONFIG') or 'config.json'
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Ошибка загрузки конфигурации из {config_path}: {e}")
-        return {}
 
     def _sync_from_s3(self):
         if self.storage and self.orgs_path:
@@ -181,21 +174,8 @@ class OrganizationManager:
 
 # --- ПРИМЕР ИСПОЛЬЗОВАНИЯ ---
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     manager = OrganizationManager("./my_orgs")
     
-    # Добавим Елену Александровну из лога, если её ещё нет
-    # if not manager.find(inn="9718180660"):
-        # lesnyak = Organization(
-            # name="Лесняк Елена Александровна",
-            # phone="+70000000000",
-            # person="Лесняк Е.А.",
-            # inn="9718180660",
-            # partner_id="11003862499",
-            # connection_id="14000943012"
-        # )
-        # manager.save_local(lesnyak)
     for org in manager.list():
         print(org.name)
-
-    # Синхронизация с облаком (пример для Selectel или AWS)
-    # manager.sync_to_s3(bucket_name='my-project-data', s3_key='backups/orgs_db.json')

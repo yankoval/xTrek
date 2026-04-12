@@ -8,8 +8,9 @@ import logging
 from pathlib import Path
 from org_manager import OrganizationManager
 from storage import get_storage
+from config_loader import load_config
 
-# Настройка логирования (без basicConfig)
+# Настройка логирования
 logger = logging.getLogger("TokenProcessor")
 
 home_dir = Path.home()
@@ -30,17 +31,19 @@ class TokenProcessor:
             orgs_dir (str): Путь к директории с организациями
             org_manager (OrganizationManager, optional): Существующий менеджер организаций
         """
-        self.config = self._load_config()
+        self.config = load_config()
         self.s3_config = self.config.get('s3_config')
         self.tokens_path = self.config.get('tokens_path')
 
         if self.tokens_path and self.tokens_path.startswith('s3://'):
             self.storage = get_storage(self.tokens_path, self.s3_config)
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
+            logger.info(f"Инициализирован S3 storage для токенов: {self.tokens_path}")
             self._sync_from_s3()
         else:
             self.storage = None
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
+            logger.info(f"Используется локальное хранилище для токенов: {self.file_path}")
 
         if org_manager:
             self.org_manager = org_manager
@@ -51,16 +54,6 @@ class TokenProcessor:
         self.processed_tokens = []
         self.read_tokens_file()
         self.process_tokens()
-
-    def _load_config(self) -> Dict[str, Any]:
-        config_path = os.environ.get('TOKENS_CONFIG') or 'config.json'
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Ошибка загрузки конфигурации из {config_path}: {e}")
-        return {}
 
     def _sync_from_s3(self):
         if self.storage and self.tokens_path:
