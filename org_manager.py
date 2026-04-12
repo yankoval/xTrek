@@ -2,8 +2,14 @@ import json
 import os
 import uuid
 import boto3  # Необходима установка: pip install boto3
-from typing import Dict, List, Optional
+import logging
+from typing import Dict, List, Optional, Any
 from botocore.exceptions import ClientError
+from pathlib import Path
+from storage import get_storage
+
+# Настройка логирования
+logger = logging.getLogger("OrganizationManager")
 
 """
 API DESCRIPTION:
@@ -56,7 +62,50 @@ class OrganizationManager:
         if not os.path.exists(self.storage_dir):
             os.makedirs(self.storage_dir)
             
-        self.sync_from_disk() # Теперь вызываем этот метод
+        self.config = self._load_config()
+        self.s3_config = self.config.get('s3_config')
+        self.orgs_path = self.config.get('orgs_path')
+
+        if self.orgs_path and self.orgs_path.startswith('s3://'):
+            self.storage = get_storage(self.orgs_path, self.s3_config)
+            self._sync_from_s3()
+        else:
+            self.storage = None
+
+        self.sync_from_disk()
+
+    def _load_config(self) -> Dict[str, Any]:
+        config_path = os.environ.get('TOKENS_CONFIG') or 'config.json'
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Ошибка загрузки конфигурации из {config_path}: {e}")
+        return {}
+
+    def _sync_from_s3(self):
+        if self.storage and self.orgs_path:
+            try:
+                logger.info(f"Синхронизация организаций из {self.orgs_path}...")
+                remote_files = self.storage.list_files(self.orgs_path, "*.json")
+                for remote_file in remote_files:
+                    filename = os.path.basename(remote_file)
+                    local_path = os.path.join(self.storage_dir, filename)
+                    self.storage.download(remote_file, local_path)
+                logger.info(f"Загружено {len(remote_files)} файлов организаций.")
+            except Exception as e:
+                logger.error(f"Ошибка синхронизации организаций из S3: {e}")
+
+    def _sync_to_s3(self, local_path: str):
+        if self.storage and self.orgs_path:
+            try:
+                filename = os.path.basename(local_path)
+                remote_path = f"{self.orgs_path.rstrip('/')}/{filename}"
+                logger.info(f"Выгрузка организации {filename} в {remote_path}...")
+                self.storage.upload(local_path, remote_path)
+            except Exception as e:
+                logger.error(f"Ошибка выгрузки организации в S3: {e}")
 
     def sync_from_disk(self):
         """Публичный метод для синхронизации памяти с файлами на диске."""
@@ -77,7 +126,7 @@ class OrganizationManager:
                         else:
                             self._add_to_mem(data)
                 except (json.JSONDecodeError, KeyError, Exception) as e:
-                    print(f"[!] Ошибка чтения {filename}: {e}")
+                    logger.error(f"Ошибка чтения {filename}: {e}")
                     continue
 
     def _add_to_mem(self, data: dict):
@@ -103,9 +152,10 @@ class OrganizationManager:
         path = os.path.join(self.storage_dir, f"{org.org_id}.json")
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(org.to_dict(), f, ensure_ascii=False, indent=4)
+        self._sync_to_s3(path)
 
     def sync_to_s3(self, bucket_name: str, s3_key: str, 
-                   region: str = 'us-east-1', 
+                   region: str = 'ru-central1',
                    endpoint_url: Optional[str] = None):
         """
         Сериализует ВСЮ базу в один JSON и отправляет в S3.
@@ -123,11 +173,11 @@ class OrganizationManager:
                 Body=json_data,
                 ContentType='application/json'
             )
-            print(f"[SUCCESS] База синхронизирована с S3: s3://{bucket_name}/{s3_key}")
+            logger.info(f"База синхронизирована с S3: s3://{bucket_name}/{s3_key}")
         except ClientError as e:
-            print(f"[ERROR] Ошибка S3: {e}")
+            logger.error(f"Ошибка S3: {e}")
         except Exception as e:
-            print(f"[ERROR] Непредвиденная ошибка: {e}")
+            logger.error(f"Непредвиденная ошибка: {e}")
 
 # --- ПРИМЕР ИСПОЛЬЗОВАНИЯ ---
 if __name__ == "__main__":
@@ -148,4 +198,4 @@ if __name__ == "__main__":
         print(org.name)
 
     # Синхронизация с облаком (пример для Selectel или AWS)
-    # manager.sync_to_s3(bucket_name='my-project-data', s3_key='backups/orgs_db.json')  
+    # manager.sync_to_s3(bucket_name='my-project-data', s3_key='backups/orgs_db.json')

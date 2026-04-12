@@ -1,5 +1,7 @@
 import time
 import logging
+import os
+import json
 from pathlib import Path
 
 # Импорты ваших модулей
@@ -26,13 +28,30 @@ class TokenRefreshWorker:
         # Путь к базе организаций
         org_storage = Path(__file__).parent / "my_orgs"
         self.org_manager = OrganizationManager(str(org_storage))
+        self.interval = self._load_interval()
+
+    def _load_interval(self) -> int:
+        config_path = os.environ.get('TOKENS_CONFIG') or 'config.json'
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    return config.get('tokens_update_interval', 600)
+            except Exception as e:
+                logger.error(f"Ошибка загрузки интервала из {config_path}: {e}")
+        return 600
 
     def check_and_refresh(self):
         logger.info("--- Запуск цикла проверки токенов (JWT + Auth/СУЗ) ---")
         
-        # Синхронизация данных с диска
+        # Синхронизация данных
+        if hasattr(self.tp, '_sync_from_s3'):
+            self.tp._sync_from_s3()
         self.tp.read_tokens_file()
         self.tp.process_tokens()
+
+        if hasattr(self.org_manager, '_sync_from_s3'):
+            self.org_manager._sync_from_s3()
         self.org_manager.sync_from_disk()
         
         organizations = self.org_manager.list()
@@ -92,7 +111,9 @@ class TokenRefreshWorker:
             else:
                 logger.debug(f"[{name}] Auth: Пропуск (нет ConnectionID)")
 
-    def start(self, interval: int = 600):
+    def start(self, interval: int = None):
+        if interval is None:
+            interval = self.interval
         logger.info("Воркер мониторинга запущен (Интервал: %s сек).", interval)
         try:
             while True:
@@ -104,5 +125,4 @@ class TokenRefreshWorker:
 
 if __name__ == "__main__":
     worker = TokenRefreshWorker()
-    # Проверка каждые 10 минут
-    worker.start(interval=600)
+    worker.start()
