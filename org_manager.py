@@ -70,12 +70,42 @@ class OrganizationManager:
         if self.orgs_path and self.orgs_path.startswith('s3://'):
             self.storage = get_storage(self.orgs_path, self.s3_config)
             logger.info(f"Инициализирован S3 storage для организаций: {self.orgs_path}")
-            self._sync_from_s3()
+            self._sync_on_init()
         else:
             self.storage = None
             logger.info(f"Используется локальное хранилище для организаций: {self.storage_dir}")
 
         self.sync_from_disk()
+
+    def _sync_on_init(self):
+        """Двусторонняя синхронизация при инициализации."""
+        if not self.storage or not self.orgs_path:
+            return
+
+        try:
+            # 1. Загружаем то, что есть в S3
+            logger.info(f"Синхронизация организаций из {self.orgs_path}...")
+            remote_files = self.storage.list_files(self.orgs_path, "*.json")
+            remote_filenames = set()
+            for remote_file in remote_files:
+                filename = os.path.basename(remote_file)
+                remote_filenames.add(filename)
+                local_path = os.path.join(self.storage_dir, filename)
+                self.storage.download(remote_file, local_path)
+
+            # 2. Выгружаем то, что есть локально, но нет в S3
+            local_files = [f for f in os.listdir(self.storage_dir) if f.endswith('.json')]
+            upload_count = 0
+            for filename in local_files:
+                if filename not in remote_filenames:
+                    local_path = os.path.join(self.storage_dir, filename)
+                    remote_path = f"{self.orgs_path.rstrip('/')}/{filename}"
+                    self.storage.upload(local_path, remote_path)
+                    upload_count += 1
+
+            logger.info(f"Синхронизация завершена. Загружено: {len(remote_files)}, Выгружено: {upload_count}")
+        except Exception as e:
+            logger.error(f"Ошибка при начальной синхронизации организаций: {e}")
 
     def _sync_from_s3(self):
         if self.storage and self.orgs_path:

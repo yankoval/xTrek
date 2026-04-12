@@ -39,7 +39,7 @@ class TokenProcessor:
             self.storage = get_storage(self.tokens_path, self.s3_config)
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
             logger.info(f"Инициализирован S3 storage для токенов: {self.tokens_path}")
-            self._sync_from_s3()
+            self._sync_on_init()
         else:
             self.storage = None
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
@@ -55,11 +55,34 @@ class TokenProcessor:
         self.read_tokens_file()
         self.process_tokens()
 
+    def _sync_on_init(self):
+        """Синхронизация при инициализации: если нет в S3 - выгружаем, если есть - загружаем."""
+        if not self.storage or not self.tokens_path:
+            return
+
+        try:
+            s3_exists = self.storage.exists(self.tokens_path)
+            local_exists = Path(self.file_path).exists()
+
+            if s3_exists:
+                logger.info(f"Токены найдены в S3. Загрузка в {self.file_path}")
+                self.storage.download(self.tokens_path, self.file_path)
+            elif local_exists:
+                logger.info(f"Токены не найдены в S3. Выгрузка локального файла {self.file_path} в S3")
+                self.storage.upload(self.file_path, self.tokens_path)
+            else:
+                logger.info("Токены не найдены ни в S3, ни локально.")
+        except Exception as e:
+            logger.error(f"Ошибка при начальной синхронизации токенов: {e}")
+
     def _sync_from_s3(self):
         if self.storage and self.tokens_path:
             try:
-                logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
-                self.storage.download(self.tokens_path, self.file_path)
+                if self.storage.exists(self.tokens_path):
+                    logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
+                    self.storage.download(self.tokens_path, self.file_path)
+                else:
+                    logger.debug(f"Файл {self.tokens_path} отсутствует в S3, пропуск загрузки.")
             except Exception as e:
                 logger.error(f"Ошибка синхронизации из S3: {e}")
 
@@ -412,7 +435,7 @@ class TokenProcessor:
 
     def get_tokens_by_inn_list(self, inn_list: List[str]) -> List[Dict[str, Any]]:
         """
-        Находит все токены для списка INN
+        Находит все токены для списка ИНН
 
         Args:
             inn_list (List[str]): Список ИНН для поиска
@@ -461,7 +484,7 @@ class TokenProcessor:
 
         # Токены с INN
         tokens_with_inn = [t for t in self.processed_tokens if t.get('inn')]
-        logger.info(f"Токенов с INN: {len(tokens_with_inn)}")
+        logger.info(f"Токенов с ИНН: {len(tokens_with_inn)}")
 
         # Уникальные INN
         unique_inns = set(str(t.get('inn')) for t in tokens_with_inn if t.get('inn'))
