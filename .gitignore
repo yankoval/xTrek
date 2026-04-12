@@ -9,3 +9,4 @@ __pycache__/
 *.xlsx
 tst.json
 /tokens_config.json
+/my_orgs/
