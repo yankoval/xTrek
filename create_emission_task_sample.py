@@ -25,10 +25,52 @@ SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def sign_and_send(order: EmissionOrder, inn: str, signing_dir: str, timeout: int):
+def sign_and_send(order: EmissionOrder, inn: str, signing_dir: str, timeout: int,
+                  oms_id: str = None, client_token: str = None):
     """
     Подписывает заказ через файловый обмен и отправляет в СУЗ
     """
+    # 1. Сначала проверяем учетные данные, чтобы не ждать подписи зря
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+
+    # Поиск подходящей организации
+    final_oms_id = oms_id
+    final_client_token = client_token
+
+    if not final_oms_id or not final_client_token:
+        found_org = None
+        for o in org_manager.list():
+            if o.inn == inn and o.oms_id:
+                found_org = o
+                break
+
+        if not found_org:
+            # Если с oms_id не нашли, берем любую по ИНН
+            found_org = org_manager.find(inn=inn)
+
+        if found_org:
+            final_oms_id = final_oms_id or found_org.oms_id
+            final_client_token = final_client_token or found_org.connection_id
+
+    if not final_oms_id:
+        logger.error(f"[!] OMS ID для ИНН {inn} не найден в базе и не передан параметром.")
+        return None
+
+    if not final_client_token:
+        logger.error(f"[!] Connection ID (clientToken) для ИНН {inn} не найден в базе.")
+        return None
+
+    token_processor = TokenProcessor(org_manager=org_manager)
+    # Для СУЗ обычно требуется UUID токен (auth)
+    token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=final_client_token)
+
+    if not token:
+        logger.error(f"[!] Активный токен для ИНН {inn} и Connection ID {final_client_token} не найден.")
+        logger.error("Получите токен с помощью crpt_auth.py перед запуском.")
+        return None
+
+    # 2. Подготовка к подписи
     work_dir = Path(signing_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -57,35 +99,10 @@ def sign_and_send(order: EmissionOrder, inn: str, signing_dir: str, timeout: int
         time.sleep(0.5) # Небольшая пауза для завершения записи файла
         logger.info("[+] Подпись обнаружена!")
 
-        # Инициализация SUZ и отправка
-        # Используем TokenProcessor и OrganizationManager для получения учетных данных
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
-        org = org_manager.find(inn=inn)
-        if not org:
-            logger.error(f"[!] Организация с ИНН {inn} не найдена в базе (папка my_orgs).")
-            return None
+        # 3. Инициализация SUZ и отправка
+        suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
 
-        if not org.oms_id:
-            logger.error(f"[!] OMS ID для организации с ИНН {inn} не задан в профиле.")
-            return None
-
-        if not org.connection_id:
-            logger.error(f"[!] Connection ID (clientToken) для организации с ИНН {inn} не задан.")
-            return None
-
-        token_processor = TokenProcessor(org_manager=org_manager)
-        # Для СУЗ обычно требуется UUID токен (auth)
-        token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=org.connection_id)
-
-        if not token:
-            logger.error(f"[!] Активный токен для ИНН {inn} и Connection ID {org.connection_id} не найден.")
-            logger.error("Получите токен с помощью crpt_auth.py перед запуском.")
-            return None
-
-        suz_api = SUZ(token=token, omsId=org.oms_id, clientToken=org.connection_id)
-
-        logger.info(f"[*] Отправка заказа в СУЗ (omsId: {org.oms_id})...")
+        logger.info(f"[*] Отправка заказа в СУЗ (omsId: {final_oms_id})...")
         result = suz_api.order_create(str(body_path), str(signature_path))
         return result
 
@@ -104,6 +121,8 @@ def main():
     parser.add_argument("--quantity", type=int, default=515, help="Количество запрашиваемых кодов")
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
+    parser.add_argument("--oms_id", help="OMS ID (если не задан, будет найден в my_orgs по ИНН)")
+    parser.add_argument("--client_token", help="Client Token / Connection ID")
     parser.add_argument("--signing_dir", default=SIGNING_DIR, help="Директория для обмена с демоном подписи")
     parser.add_argument("--timeout", type=int, default=SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
 
@@ -146,7 +165,8 @@ def main():
 
     # 3. Подписываем и отправляем
     try:
-        result = sign_and_send(order, inn, args.signing_dir, args.timeout)
+        result = sign_and_send(order, inn, args.signing_dir, args.timeout,
+                             oms_id=args.oms_id, client_token=args.client_token)
 
         if result:
             logger.info("[+++] Заказ успешно создан!")
