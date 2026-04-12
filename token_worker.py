@@ -24,10 +24,10 @@ logger = logging.getLogger("TokenWorker")
 
 class TokenRefreshWorker:
     def __init__(self):
-        self.tp = TokenProcessor()
         # Путь к базе организаций
         org_storage = Path(__file__).parent / "my_orgs"
         self.org_manager = OrganizationManager(str(org_storage))
+        self.tp = TokenProcessor(org_manager=self.org_manager)
         self.interval = self._load_interval()
 
     def _load_interval(self) -> int:

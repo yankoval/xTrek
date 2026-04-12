@@ -9,11 +9,7 @@ from pathlib import Path
 from org_manager import OrganizationManager
 from storage import get_storage
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+# Настройка логирования (без basicConfig)
 logger = logging.getLogger("TokenProcessor")
 
 home_dir = Path.home()
@@ -25,13 +21,14 @@ class TokenProcessor:
     Класс для обработки токенов из JSON файла
     """
 
-    def __init__(self, file_path: str = '', orgs_dir: str = 'my_orgs'):
+    def __init__(self, file_path: str = '', orgs_dir: str = 'my_orgs', org_manager: Optional[OrganizationManager] = None):
         """
         Инициализация процессора токенов
 
         Args:
             file_path (str): Путь к JSON файлу с токенами
             orgs_dir (str): Путь к директории с организациями
+            org_manager (OrganizationManager, optional): Существующий менеджер организаций
         """
         self.config = self._load_config()
         self.s3_config = self.config.get('s3_config')
@@ -45,7 +42,11 @@ class TokenProcessor:
             self.storage = None
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
 
-        self.org_manager = OrganizationManager(orgs_dir)
+        if org_manager:
+            self.org_manager = org_manager
+        else:
+            self.org_manager = OrganizationManager(orgs_dir or 'my_orgs')
+
         self.tokens = []
         self.processed_tokens = []
         self.read_tokens_file()
@@ -85,7 +86,7 @@ class TokenProcessor:
         """Обертка для получения UUID токена по ИНН"""
         return self.get_token_value_by_inn(inn, token_type='UUID')
 
-    def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT') -> Optional[str]:
+    def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Возвращает только строку токена, если он найден и активен"""
         # Синонимы для UUID
         if token_type in ['auth', 'uuid']:
@@ -100,6 +101,12 @@ class TokenProcessor:
         tokens_of_type = [t for t in tokens if t.get('ТипТокена') == token_type]
         if not tokens_of_type:
             return None
+
+        # Если указан conid, фильтруем по нему (Идентификатор)
+        if conid:
+            tokens_of_type = [t for t in tokens_of_type if str(t.get('Идентификатор')) == str(conid)]
+            if not tokens_of_type:
+                return None
 
         # Фильтруем активные токены
         active_tokens_list = self.get_active_tokens()
@@ -593,6 +600,9 @@ class TokenProcessor:
 
 # Пример использования
 def main():
+    # Настройка логирования для примера
+    logging.basicConfig(level=logging.INFO)
+
     # Путь к файлу с токенами
     #file_path = "tokens.json"
 
