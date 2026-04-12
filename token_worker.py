@@ -91,7 +91,7 @@ class TokenRefreshWorker:
             # --- БЛОК 2: Мониторинг Auth (Токен СУЗ через Connection ID) ---
             if conid:
                 # Ищем токен именно для этой связки ИНН + ConnectionID
-                auth_token = self.tp.get_token_value_by_inn(inn, conid=conid)
+                auth_token = self.tp.get_token_value_by_inn(inn, token_type='auth', conid=conid)
                 
                 if auth_token:
                     logger.info(f"[{name}] Auth (СУЗ): Актуален")
