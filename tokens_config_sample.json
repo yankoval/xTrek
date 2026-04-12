@@ -1,0 +1,11 @@
+{
+    "tokens_path": "s3://your-bucket-name/tokens.json",
+    "orgs_path": "s3://your-bucket-name/my_orgs/",
+    "tokens_update_interval": 60,
+    "s3_config": {
+        "endpoint_url": "https://storage.yandexcloud.net",
+        "aws_access_key_id": "YOUR_ACCESS_KEY",
+        "aws_secret_access_key": "YOUR_SECRET_KEY",
+        "region_name": "ru-central1"
+    }
+}

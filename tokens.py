@@ -3,8 +3,15 @@ import base64
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import re
+import os
+import logging
 from pathlib import Path
 from org_manager import OrganizationManager
+from storage import get_storage
+from config_loader import load_config
+
+# Настройка логирования
+logger = logging.getLogger("TokenProcessor")
 
 home_dir = Path.home()
 
@@ -15,20 +22,77 @@ class TokenProcessor:
     Класс для обработки токенов из JSON файла
     """
 
-    def __init__(self, file_path: str = '', orgs_dir: str = 'my_orgs'):
+    def __init__(self, file_path: str = '', orgs_dir: str = 'my_orgs', org_manager: Optional[OrganizationManager] = None):
         """
         Инициализация процессора токенов
 
         Args:
             file_path (str): Путь к JSON файлу с токенами
             orgs_dir (str): Путь к директории с организациями
+            org_manager (OrganizationManager, optional): Существующий менеджер организаций
         """
-        self.file_path = file_path if file_path else Path(home_dir,'tokens.json')
-        self.org_manager = OrganizationManager(orgs_dir)
+        self.config = load_config()
+        self.s3_config = self.config.get('s3_config')
+        self.tokens_path = self.config.get('tokens_path')
+
+        if self.tokens_path and self.tokens_path.startswith('s3://'):
+            self.storage = get_storage(self.tokens_path, self.s3_config)
+            self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
+            logger.info(f"Инициализирован S3 storage для токенов: {self.tokens_path}")
+            self._sync_on_init()
+        else:
+            self.storage = None
+            self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
+            logger.info(f"Используется локальное хранилище для токенов: {self.file_path}")
+
+        if org_manager:
+            self.org_manager = org_manager
+        else:
+            self.org_manager = OrganizationManager(orgs_dir or 'my_orgs')
+
         self.tokens = []
         self.processed_tokens = []
         self.read_tokens_file()
         self.process_tokens()
+
+    def _sync_on_init(self):
+        """Синхронизация при инициализации: если нет в S3 - выгружаем, если есть - загружаем."""
+        if not self.storage or not self.tokens_path:
+            return
+
+        try:
+            s3_exists = self.storage.exists(self.tokens_path)
+            local_exists = Path(self.file_path).exists()
+
+            if s3_exists:
+                logger.info(f"Токены найдены в S3. Загрузка в {self.file_path}")
+                self.storage.download(self.tokens_path, self.file_path)
+            elif local_exists:
+                logger.info(f"Токены не найдены в S3. Выгрузка локального файла {self.file_path} в S3")
+                self.storage.upload(self.file_path, self.tokens_path)
+            else:
+                logger.info("Токены не найдены ни в S3, ни локально.")
+        except Exception as e:
+            logger.error(f"Ошибка при начальной синхронизации токенов: {e}")
+
+    def _sync_from_s3(self):
+        if self.storage and self.tokens_path:
+            try:
+                if self.storage.exists(self.tokens_path):
+                    logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
+                    self.storage.download(self.tokens_path, self.file_path)
+                else:
+                    logger.debug(f"Файл {self.tokens_path} отсутствует в S3, пропуск загрузки.")
+            except Exception as e:
+                logger.error(f"Ошибка синхронизации из S3: {e}")
+
+    def _sync_to_s3(self):
+        if self.storage and self.tokens_path:
+            try:
+                logger.info(f"Выгрузка токенов из {self.file_path} в {self.tokens_path}")
+                self.storage.upload(self.file_path, self.tokens_path)
+            except Exception as e:
+                logger.error(f"Ошибка синхронизации в S3: {e}")
 
     def get_jwt_token_value_by_inn(self, inn: str) -> Optional[str]:
         """Обертка для получения JWT токена по ИНН"""
@@ -38,7 +102,7 @@ class TokenProcessor:
         """Обертка для получения UUID токена по ИНН"""
         return self.get_token_value_by_inn(inn, token_type='UUID')
 
-    def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT') -> Optional[str]:
+    def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Возвращает только строку токена, если он найден и активен"""
         # Синонимы для UUID
         if token_type in ['auth', 'uuid']:
@@ -53,6 +117,12 @@ class TokenProcessor:
         tokens_of_type = [t for t in tokens if t.get('ТипТокена') == token_type]
         if not tokens_of_type:
             return None
+
+        # Если указан conid, фильтруем по нему (Идентификатор)
+        if conid:
+            tokens_of_type = [t for t in tokens_of_type if str(t.get('Идентификатор')) == str(conid)]
+            if not tokens_of_type:
+                return None
 
         # Фильтруем активные токены
         active_tokens_list = self.get_active_tokens()
@@ -365,7 +435,7 @@ class TokenProcessor:
 
     def get_tokens_by_inn_list(self, inn_list: List[str]) -> List[Dict[str, Any]]:
         """
-        Находит все токены для списка INN
+        Находит все токены для списка ИНН
 
         Args:
             inn_list (List[str]): Список ИНН для поиска
@@ -393,9 +463,9 @@ class TokenProcessor:
         if not self.processed_tokens:
             self.process_tokens()
 
-        print("=" * 60)
-        print("СВОДНАЯ ИНФОРМАЦИЯ О ТОКЕНАХ")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("СВОДНАЯ ИНФОРМАЦИЯ О ТОКЕНАХ")
+        logger.info("=" * 60)
 
         # Статистика по типам токенов
         token_types = {}
@@ -403,28 +473,28 @@ class TokenProcessor:
             token_type = token.get('ТипТокена', 'НЕИЗВЕСТНО')
             token_types[token_type] = token_types.get(token_type, 0) + 1
 
-        print(f"\nОбщее количество токенов: {len(self.processed_tokens)}")
-        print("\nРаспределение по типам:")
+        logger.info(f"Общее количество токенов: {len(self.processed_tokens)}")
+        logger.info("Распределение по типам:")
         for token_type, count in token_types.items():
-            print(f"  {token_type}: {count}")
+            logger.info(f"  {token_type}: {count}")
 
         # Активные токены
         active_tokens = self.get_active_tokens()
-        print(f"\nАктивных токенов: {len(active_tokens)}")
+        logger.info(f"Активных токенов: {len(active_tokens)}")
 
         # Токены с INN
         tokens_with_inn = [t for t in self.processed_tokens if t.get('inn')]
-        print(f"Токенов с INN: {len(tokens_with_inn)}")
+        logger.info(f"Токенов с ИНН: {len(tokens_with_inn)}")
 
         # Уникальные INN
         unique_inns = set(str(t.get('inn')) for t in tokens_with_inn if t.get('inn'))
-        print(f"Уникальных INN: {len(unique_inns)}")
+        logger.info(f"Уникальных ИНН: {len(unique_inns)}")
 
         # Сроки действия
         expired_tokens = len(self.processed_tokens) - len(active_tokens)
-        print(f"Истекших токенов: {expired_tokens}")
+        logger.info(f"Истекших токенов: {expired_tokens}")
 
-        print("\n" + "=" * 60)
+        logger.info("=" * 60)
 
     def save_token(self, token_value: str, conid: Optional[str] = None):
         """
@@ -444,12 +514,12 @@ class TokenProcessor:
                 if pid:
                     identifier = str(pid)
             except Exception as e:
-                print(f"Ошибка при извлечении pid из JWT: {e}")
+                logger.error(f"Ошибка при извлечении pid из JWT: {e}")
         else:
             identifier = conid
 
         if not identifier:
-             print("[!] Не удалось определить идентификатор для сохранения токена.")
+             logger.warning("Не удалось определить идентификатор для сохранения токена.")
              return
 
         new_entry = {
@@ -477,9 +547,10 @@ class TokenProcessor:
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, 'w', encoding='utf-8') as f:
                 json.dump(self.tokens, f, indent=4, ensure_ascii=False)
-            print(f"[+] Токен сохранен в базу с идентификатором: {identifier}")
+            logger.info(f"Токен сохранен в базу с идентификатором: {identifier}")
+            self._sync_to_s3()
         except Exception as e:
-            print(f"[!] Ошибка записи в файл {self.file_path}: {e}")
+            logger.error(f"Ошибка записи в файл {self.file_path}: {e}")
 
         # Обновляем внутреннее состояние
         self.process_tokens()
@@ -499,52 +570,55 @@ class TokenProcessor:
             tokens_to_display = tokens_to_display[:max_tokens]
 
         for i, token in enumerate(tokens_to_display, 1):
-            print(f"\n{'='*60}")
-            print(f"ТОКЕН #{i}")
-            print(f"{'='*60}")
+            logger.info(f"{'='*60}")
+            logger.info(f"ТОКЕН #{i}")
+            logger.info(f"{'='*60}")
 
             # Основная информация
-            print(f"Идентификатор: {token.get('Идентификатор', 'Нет данных')}")
-            print(f"Тип токена: {token.get('ТипТокена', 'Нет данных')}")
+            logger.info(f"Идентификатор: {token.get('Идентификатор', 'Нет данных')}")
+            logger.info(f"Тип токена: {token.get('ТипТокена', 'Нет данных')}")
 
             # Сокращенный токен
             token_value = token.get('Токен', '')
             if token_value:
                 if len(token_value) > 50:
-                    print(f"Токен: {token_value[:50]}...")
+                    logger.info(f"Токен: {token_value[:50]}...")
                 else:
-                    print(f"Токен: {token_value}")
+                    logger.info(f"Токен: {token_value}")
 
             # Срок действия
             expiry_str = token.get('ДействуетДо', '')
-            print(f"Действует до: {expiry_str if expiry_str else 'Нет данных'}")
+            logger.info(f"Действует до: {expiry_str if expiry_str else 'Нет данных'}")
 
             # Статус активности
             active_tokens = self.get_active_tokens()
             is_active = token in active_tokens
-            print(f"Активен: {'ДА' if is_active else 'НЕТ'}")
+            logger.info(f"Активен: {'ДА' if is_active else 'НЕТ'}")
 
             # Декодированные поля JWT (если есть)
             if token.get('ТипТокена') == 'JWT':
-                print("\nДекодированные поля JWT:")
-                print(f"  INN: {token.get('inn', 'Нет данных')}")
-                print(f"  Имя: {token.get('full_name', 'Нет данных')}")
-                print(f"  Статус пользователя: {token.get('user_status', 'Нет данных')}")
-                print(f"  PID: {token.get('pid', 'Нет данных')}")
-                print(f"  ID: {token.get('id', 'Нет данных')}")
-                print(f"  Срок действия (exp): {token.get('exp', 'Нет данных')}")
+                logger.info("Декодированные поля JWT:")
+                logger.info(f"  INN: {token.get('inn', 'Нет данных')}")
+                logger.info(f"  Имя: {token.get('full_name', 'Нет данных')}")
+                logger.info(f"  Статус пользователя: {token.get('user_status', 'Нет данных')}")
+                logger.info(f"  PID: {token.get('pid', 'Нет данных')}")
+                logger.info(f"  ID: {token.get('id', 'Нет данных')}")
+                logger.info(f"  Срок действия (exp): {token.get('exp', 'Нет данных')}")
 
                 # Scope
                 scope = token.get('scope')
                 if scope:
                     if isinstance(scope, list) and len(scope) > 0:
-                        print(f"  Scope: {', '.join(scope[:3])}{'...' if len(scope) > 3 else ''}")
+                        logger.info(f"  Scope: {', '.join(scope[:3])}{'...' if len(scope) > 3 else ''}")
                     else:
-                        print(f"  Scope: {scope}")
+                        logger.info(f"  Scope: {scope}")
 
 
 # Пример использования
 def main():
+    # Настройка логирования для примера
+    logging.basicConfig(level=logging.INFO)
+
     # Путь к файлу с токенами
     #file_path = "tokens.json"
 
@@ -553,62 +627,54 @@ def main():
         processor = TokenProcessor(file_path)
 
         # 1. Чтение и обработка токенов
-        print("Чтение и обработка токенов...")
+        logger.info("Чтение и обработка токенов...")
         processed_tokens = processor.process_tokens()
-        print(f"Обработано токенов: {len(processed_tokens)}")
+        logger.info(f"Обработано токенов: {len(processed_tokens)}")
 
         # 2. Вывод сводной информации
         processor.print_summary()
 
         # 3. Получение активных токенов
-        print("\n" + "="*60)
-        print("АКТИВНЫЕ ТОКЕНЫ:")
-        print("="*60)
+        logger.info("АКТИВНЫЕ ТОКЕНЫ:")
 
         active_tokens = processor.get_active_tokens()
         for i, token in enumerate(active_tokens, 1):
-            print(f"\n{i}. ID: {token.get('Идентификатор')}, "
+            logger.info(f"{i}. ID: {token.get('Идентификатор')}, "
                   f"INN: {token.get('inn', 'Н/Д')}, "
                   f"Имя: {token.get('full_name', 'Н/Д')}")
 
         # 4. Поиск токена по INN
-        print("\n" + "="*60)
-        print("ПОИСК ТОКЕНА ПО INN:")
-        print("="*60)
+        logger.info("ПОИСК ТОКЕНА ПО INN:")
 
         # Пример поиска по INN из вашего файла
         inn_to_find = "9723161905"
         found_token = processor.get_token_by_inn(inn_to_find)
 
         if found_token:
-            print(f"\nНайден токен для ИНН {inn_to_find}:")
-            print(f"  Идентификатор: {found_token.get('Идентификатор')}")
-            print(f"  Имя: {found_token.get('full_name')}")
-            print(f"  Активен: {'Да' if found_token in active_tokens else 'Нет'}")
+            logger.info(f"Найден токен для ИНН {inn_to_find}:")
+            logger.info(f"  Идентификатор: {found_token.get('Идентификатор')}")
+            logger.info(f"  Имя: {found_token.get('full_name')}")
+            logger.info(f"  Активен: {'Да' if found_token in active_tokens else 'Нет'}")
         else:
-            print(f"\nТокен для ИНН {inn_to_find} не найден")
+            logger.info(f"Токен для ИНН {inn_to_find} не найден")
 
         # 5. Поиск по нескольким INN
-        print("\n" + "="*60)
-        print("ПОИСК ПО НЕСКОЛЬКИМ INN:")
-        print("="*60)
+        logger.info("ПОИСК ПО НЕСКОЛЬКИМ INN:")
 
         inn_list = ["9723161905", "9718180660", "несуществующий_инн"]
         tokens_by_inn = processor.get_tokens_by_inn_list(inn_list)
 
-        print(f"\nНайдено токенов для списка ИНН: {len(tokens_by_inn)}")
+        logger.info(f"Найдено токенов для списка ИНН: {len(tokens_by_inn)}")
         for token in tokens_by_inn:
-            print(f"  - INN: {token.get('inn')}, ID: {token.get('Идентификатор')}")
+            logger.info(f"  - INN: {token.get('inn')}, ID: {token.get('Идентификатор')}")
 
         # 6. Детальная информация о первых N токенах
-        print("\n" + "="*60)
-        print("ДЕТАЛЬНАЯ ИНФОРМАЦИЯ (первые 3 токена):")
-        print("="*60)
+        logger.info("ДЕТАЛЬНАЯ ИНФОРМАЦИЯ (первые 3 токена):")
 
         processor.print_detailed_info(max_tokens=3)
 
     except Exception as e:
-        print(f"Ошибка при обработке токенов: {e}")
+        logger.error(f"Ошибка при обработке токенов: {e}")
         import traceback
         traceback.print_exc()
 

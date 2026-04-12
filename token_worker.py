@@ -1,10 +1,13 @@
 import time
 import logging
+import os
+import json
 from pathlib import Path
 
 # Импорты ваших модулей
 from tokens import TokenProcessor
 from org_manager import OrganizationManager
+from config_loader import load_config
 
 # Импортируем ваш метод получения токена
 try:
@@ -22,17 +25,24 @@ logger = logging.getLogger("TokenWorker")
 
 class TokenRefreshWorker:
     def __init__(self):
-        self.tp = TokenProcessor()
+        self.config = load_config()
         # Путь к базе организаций
         org_storage = Path(__file__).parent / "my_orgs"
         self.org_manager = OrganizationManager(str(org_storage))
+        self.tp = TokenProcessor(org_manager=self.org_manager)
+        self.interval = self.config.get('tokens_update_interval', 600)
 
     def check_and_refresh(self):
         logger.info("--- Запуск цикла проверки токенов (JWT + Auth/СУЗ) ---")
         
-        # Синхронизация данных с диска
+        # Синхронизация данных
+        if hasattr(self.tp, '_sync_from_s3'):
+            self.tp._sync_from_s3()
         self.tp.read_tokens_file()
         self.tp.process_tokens()
+
+        if hasattr(self.org_manager, '_sync_from_s3'):
+            self.org_manager._sync_from_s3()
         self.org_manager.sync_from_disk()
         
         organizations = self.org_manager.list()
@@ -72,7 +82,7 @@ class TokenRefreshWorker:
             # --- БЛОК 2: Мониторинг Auth (Токен СУЗ через Connection ID) ---
             if conid:
                 # Ищем токен именно для этой связки ИНН + ConnectionID
-                auth_token = self.tp.get_token_value_by_inn(inn, conid=conid)
+                auth_token = self.tp.get_token_value_by_inn(inn, token_type='auth', conid=conid)
                 
                 if auth_token:
                     logger.info(f"[{name}] Auth (СУЗ): Актуален")
@@ -92,7 +102,9 @@ class TokenRefreshWorker:
             else:
                 logger.debug(f"[{name}] Auth: Пропуск (нет ConnectionID)")
 
-    def start(self, interval: int = 600):
+    def start(self, interval: int = None):
+        if interval is None:
+            interval = self.interval
         logger.info("Воркер мониторинга запущен (Интервал: %s сек).", interval)
         try:
             while True:
@@ -104,5 +116,4 @@ class TokenRefreshWorker:
 
 if __name__ == "__main__":
     worker = TokenRefreshWorker()
-    # Проверка каждые 10 минут
-    worker.start(interval=600)
+    worker.start()
