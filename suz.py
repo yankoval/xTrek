@@ -36,12 +36,16 @@ class SUZ:
             raise ValueError("omsId не найден")
         self.clientToken = clientToken or os.getenv('CLIENT_TOKEN')
         if not self.clientToken:
-            raise ValueError("omsId не найден")
+            raise ValueError("clientToken не найден")
 
         self.base_url = f"https://suzgrid.crpt.ru/"  # order/list?omsId={omsId}
+        # В СУЗ API v3 для аутентификации используется заголовок clientToken.
+        # В него передается либо динамический UUID-токен (полученный через auth),
+        # либо статический Connection ID из ЛК.
+        # Использование Authorization: Bearer приводит к ошибкам валидации или конфликтам.
         self.headers = {
-            "clientToken": f"{self.clientToken}",
-            "Accept": "application/json"  # Accept: application/json
+            "clientToken": f"{self.token or self.clientToken}",
+            "Accept": "application/json"
         }
 
     def order_list(self):
