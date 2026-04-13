@@ -36,14 +36,22 @@ class SUZ:
             raise ValueError("omsId не найден")
         self.clientToken = clientToken or os.getenv('CLIENT_TOKEN')
         if not self.clientToken:
-            raise ValueError("omsId не найден")
+            raise ValueError("clientToken не найден")
 
         self.base_url = f"https://suzgrid.crpt.ru/"  # order/list?omsId={omsId}
-        self.headers = {
-            "Authorization": f"Bearer {self.token}",
-            "clientToken": f"{self.clientToken}",
-            "Accept": "application/json"  # Accept: application/json
-        }
+        # В СУЗ API v3 заголовок clientToken и Authorization взаимоисключающие (Error 1450).
+        # Если есть токен сессии (JWT/UUID), используем Authorization.
+        # Если токена нет, используем статический clientToken (Connection ID).
+        if self.token:
+            self.headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json"
+            }
+        else:
+            self.headers = {
+                "clientToken": f"{self.clientToken}",
+                "Accept": "application/json"
+            }
 
     def order_list(self):
         response = requests.get(self.base_url + f'api/v3/order/list?omsId={self.omsId}',
