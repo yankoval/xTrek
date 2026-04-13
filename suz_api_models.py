@@ -142,3 +142,4 @@ class EmissionOrderStatus(SUZBase):
     totalPassed: int
     poolsExhausted: bool
     templateId: Optional[int] = None
+    expiredDate: Optional[str] = None

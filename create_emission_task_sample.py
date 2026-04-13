@@ -234,7 +234,14 @@ def update_emission_order_status(production_order_id: str):
 
         # Берем первый элемент статуса
         status_data = status_response[0]
-        status_obj = EmissionOrderStatus(**status_data)
+
+        # Фильтруем поля для инициализации dataclass, на случай появления новых полей в API
+        import inspect
+        sig = inspect.signature(EmissionOrderStatus.__init__)
+        valid_fields = {k for k, v in sig.parameters.items() if k != 'self'}
+        filtered_data = {k: v for k, v in status_data.items() if k in valid_fields}
+
+        status_obj = EmissionOrderStatus(**filtered_data)
 
         # 4. Сохранение результата
         storage_emissions = get_storage(emissions_path, s3_config)
