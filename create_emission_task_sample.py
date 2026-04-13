@@ -10,11 +10,13 @@ from pathlib import Path
 # Добавляем текущую директорию в путь поиска модулей
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from suz_api_models import EmissionOrder, OrderAttributes, OrderProduct
+from suz_api_models import EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts
 from suz import SUZ
 from gs1_processor import get_inn_by_gtin
 from tokens import TokenProcessor
 from org_manager import OrganizationManager
+from storage import get_storage
+from config_loader import load_config
 
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
 SIGNING_DIR = os.path.join(os.path.expanduser("~"), "tst")
@@ -25,7 +27,7 @@ SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def sign_and_send(order: EmissionOrder, inn: str, signing_dir: str, timeout: int,
+def sign_and_send_emission(order: EmissionOrder, inn: str, signing_dir: str, timeout: int,
                   oms_id: str = None, client_token: str = None):
     """
     Подписывает заказ через файловый обмен и отправляет в СУЗ
@@ -105,6 +107,40 @@ def sign_and_send(order: EmissionOrder, inn: str, signing_dir: str, timeout: int
 
         logger.info(f"[*] Отправка заказа в СУЗ (omsId: {final_oms_id})...")
         result = suz_api.order_create(str(body_path), str(signature_path))
+
+        # 4. Сохранение в S3
+        if isinstance(result, EmissionOrderreceipts):
+            try:
+                config = load_config('suz_worker_config')
+                s3_config = config.get('s3_config')
+                emission_orders_path = config.get('emission_orders_path')
+
+                if emission_orders_path:
+                    storage = get_storage(emission_orders_path, s3_config)
+                    production_order_id = order.attributes.productionOrderId
+                    remote_filename = f"{production_order_id}.json"
+                    # Убеждаемся, что путь заканчивается на /
+                    base_remote_path = emission_orders_path.rstrip('/') + '/'
+                    remote_path = base_remote_path + remote_filename
+
+                    if storage.exists(remote_path):
+                        existing_content = storage.read_text(remote_path)
+                        logger.info(f"[!] Файл {remote_path} уже существует в S3. Содержимое:")
+                        logger.info(existing_content)
+                    else:
+                        # Временный локальный файл для загрузки
+                        temp_local = work_dir / f"response_{unique_id}.json"
+                        with open(temp_local, 'w', encoding='utf-8') as f:
+                            json.dump(result.to_dict(), f, ensure_ascii=False, indent=4)
+
+                        logger.info(f"[*] Выгрузка ответа в S3: {remote_path}")
+                        storage.upload(str(temp_local), remote_path)
+
+                        try: temp_local.unlink()
+                        except: pass
+            except Exception as s3_err:
+                logger.error(f"Ошибка при сохранении ответа в S3: {s3_err}")
+
         return result
 
     finally:
@@ -166,12 +202,14 @@ def main():
 
     # 3. Подписываем и отправляем
     try:
-        result = sign_and_send(order, inn, args.signing_dir, args.timeout,
+        result = sign_and_send_emission(order, inn, args.signing_dir, args.timeout,
                              oms_id=args.oms_id, client_token=args.client_token)
 
-        if result:
+        if isinstance(result, EmissionOrderreceipts):
             logger.info("[+++] Заказ успешно создан!")
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+        elif result:
+            logger.error(f"Не удалось создать заказ. Ответ СУЗ: {result}")
         else:
             logger.error("Не удалось создать заказ (см. логи выше).")
     except Exception as e:

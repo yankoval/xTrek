@@ -16,7 +16,8 @@ import requests
 from requests import HTTPError
 #import pyperclip
 import json
-from typing import List, Dict, Any, Generator
+from typing import List, Dict, Any, Generator, Union
+from suz_api_models import EmissionOrderreceipts
 
 # logging
 logger = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ class SUZ:
                     return False
 
         return True
-    def order_create(self, body_file: str, signature_file: str, max_retries: int = 3):
+    def order_create(self, body_file: str, signature_file: str, max_retries: int = 3) -> Union[EmissionOrderreceipts, str]:
         """
         Создание заказа на эмиссию кодов
 
@@ -209,6 +210,14 @@ class SUZ:
 
                 logger.info(f"Ответ: {response.status_code}")
 
+                if response.status_code == 200:
+                    data = response.json()
+                    return EmissionOrderreceipts(
+                        orderId=data.get('orderId'),
+                        expectedCompleteTimestamp=data.get('expectedCompleteTimestamp'),
+                        omsId=data.get('omsId')
+                    )
+
                 response.raise_for_status()
                 return response.json()
 
@@ -230,21 +239,22 @@ class SUZ:
                 except:
                     pass
 
-                raise
+                # Вместо исключения возвращаем текст ошибки, если это последняя попытка или ошибка не 503
+                return str(e.response.text)
 
             except requests.exceptions.Timeout:
                 logger.error(f"Таймаут запроса")
                 if attempt < max_retries - 1:
                     time.sleep(5)
                     continue
-                raise
+                return ""
 
             except requests.exceptions.ConnectionError as e:
                 logger.error(f"Ошибка соединения: {str(e)}")
                 if attempt < max_retries - 1:
                     time.sleep(5)
                     continue
-                raise
+                return ""
 
 # Использование
 if __name__ == "__main__":
@@ -317,7 +327,10 @@ if __name__ == "__main__":
             logger.info(f"  Подпись: {args.signature_file}")
 
             result = api.order_create(args.body_file, args.signature_file, args.max_retries)
-            print(json.dumps(result, indent=4, ensure_ascii=False))
+            if isinstance(result, EmissionOrderreceipts):
+                print(json.dumps(result.to_dict(), indent=4, ensure_ascii=False))
+            else:
+                print(result)
             exit()
         if args.eorder=='test':
             res = api.order_list()
