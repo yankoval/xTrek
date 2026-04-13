@@ -10,7 +10,10 @@ from pathlib import Path
 # Добавляем текущую директорию в путь поиска модулей
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from suz_api_models import EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts
+from suz_api_models import (
+    EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
+    EmissionOrderStatus, ProductionOrder, PasportData
+)
 from suz import SUZ
 from gs1_processor import get_inn_by_gtin
 from tokens import TokenProcessor
@@ -152,6 +155,119 @@ def sign_and_send_emission(order: EmissionOrder, inn: str, signing_dir: str, tim
             try: signature_path.unlink()
             except: pass
 
+def update_emission_order_status(production_order_id: str):
+    """
+    Получает статус заказа из СУЗ и сохраняет его в S3
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        emission_orders_path = config.get('emission_orders_path')
+        production_orders_path = config.get('production_orders_path')
+        emissions_path = config.get('emissions_path')
+
+        if not all([emission_orders_path, production_orders_path, emissions_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, production_orders_path, emissions_path)")
+            return None
+
+        # 1. Загружаем чек заказа на эмиссию
+        storage_receipts = get_storage(emission_orders_path, s3_config)
+        receipt_path = f"{emission_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage_receipts.exists(receipt_path):
+            logger.error(f"[!] Файл чека не найден: {receipt_path}")
+            return None
+
+        receipt_data = json.loads(storage_receipts.read_text(receipt_path))
+        order_id = receipt_data.get('orderId')
+        oms_id = receipt_data.get('omsId')
+
+        # 2. Загружаем производственный заказ для получения GTIN
+        storage_production = get_storage(production_orders_path, s3_config)
+        prod_order_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage_production.exists(prod_order_path):
+            logger.error(f"[!] Файл производственного заказа не найден: {prod_order_path}")
+            return None
+
+        prod_data = json.loads(storage_production.read_text(prod_order_path))
+        gtin = prod_data.get('Gtin')
+
+        if not all([order_id, oms_id, gtin]):
+            logger.error(f"[!] Не удалось получить все данные (orderId, omsId, gtin) для {production_order_id}")
+            return None
+
+        # 3. Инициализация API и получение статуса
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+
+        # Ищем организацию по oms_id
+        found_org = None
+        for o in org_manager.list():
+            if o.oms_id == oms_id:
+                found_org = o
+                break
+
+        if not found_org:
+            logger.error(f"[!] Организация с omsId {oms_id} не найдена в базе.")
+            return None
+
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(found_org.inn, token_type='UUID', conid=found_org.connection_id)
+
+        if not token:
+            logger.error(f"[!] Активный токен для ИНН {found_org.inn} не найден.")
+            return None
+
+        suz_api = SUZ(token=token, omsId=oms_id, clientToken=found_org.connection_id)
+        logger.info(f"[*] Запрос статуса для orderId: {order_id}, gtin: {gtin}")
+
+        try:
+            status_response = suz_api.order_status(order_id, gtin)
+        except Exception as api_err:
+            logger.error(f"[!] Ошибка при запросе статуса: {api_err}")
+            return str(api_err)
+
+        if not status_response or not isinstance(status_response, list):
+            logger.error(f"[!] Получен некорректный ответ от СУЗ: {status_response}")
+            return str(status_response)
+
+        # Берем первый элемент статуса
+        status_data = status_response[0]
+
+        # Фильтруем поля для инициализации dataclass, на случай появления новых полей в API
+        import inspect
+        sig = inspect.signature(EmissionOrderStatus.__init__)
+        valid_fields = {k for k, v in sig.parameters.items() if k != 'self'}
+        filtered_data = {k: v for k, v in status_data.items() if k in valid_fields}
+
+        status_obj = EmissionOrderStatus(**filtered_data)
+
+        # 4. Сохранение результата
+        storage_emissions = get_storage(emissions_path, s3_config)
+        output_filename = f"{order_id}.json"
+        output_path = f"{emissions_path.rstrip('/')}/{output_filename}"
+
+        # Временный локальный файл
+        temp_local = Path(f"temp_status_{order_id}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(status_obj.to_json())
+
+        logger.info(f"[*] Сохранение статуса в {output_path}")
+        storage_emissions.upload(str(temp_local), output_path)
+
+        # Установка тегов/расширения
+        storage_emissions.set_tags(output_path, {"bufferStatus": status_obj.bufferStatus})
+
+        try: temp_local.unlink()
+        except: pass
+
+        return status_obj
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в update_emission_order_status: {e}")
+        return str(e)
+
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--gtin", default="04630234044646", help="GTIN товара (для определения ИНН)")
@@ -162,8 +278,17 @@ def main():
     parser.add_argument("--client_token", help="Client Token / Connection ID")
     parser.add_argument("--signing_dir", default=SIGNING_DIR, help="Директория для обмена с демоном подписи")
     parser.add_argument("--timeout", type=int, default=SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
+    parser.add_argument("--status", help="Получить статус заказа по productionOrderId")
 
     args = parser.parse_args()
+
+    if args.status:
+        result = update_emission_order_status(args.status)
+        if isinstance(result, EmissionOrderStatus):
+            print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"Результат: {result}")
+        return
 
     # 1. Определяем ИНН по GTIN
     # Используем базу gs1prefix_inn_db.json

@@ -25,6 +25,8 @@ class BaseStorage:
         pass
     def read_text(self, path):
         pass
+    def set_tags(self, path, tags):
+        pass
 
 class LocalStorage(BaseStorage):
     def list_files(self, path, pattern):
@@ -75,6 +77,15 @@ class LocalStorage(BaseStorage):
     def read_text(self, path):
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
+
+    def set_tags(self, path, tags):
+        if 'bufferStatus' in tags:
+            p = Path(path)
+            new_path = p.with_suffix('.' + tags['bufferStatus'])
+            if p.exists():
+                p.replace(new_path)
+                return str(new_path)
+        return path
 
 class S3Storage(BaseStorage):
     def __init__(self, s3_config):
@@ -175,6 +186,19 @@ class S3Storage(BaseStorage):
         bucket, key = self._parse_s3_url(path)
         response = self.s3.get_object(Bucket=bucket, Key=key)
         return response['Body'].read().decode('utf-8')
+
+    def set_tags(self, path, tags):
+        bucket, key = self._parse_s3_url(path)
+        tag_set = [{'Key': k, 'Value': str(v)} for k, v in tags.items()]
+        try:
+            self.s3.put_object_tagging(
+                Bucket=bucket,
+                Key=key,
+                Tagging={'TagSet': tag_set}
+            )
+        except Exception as e:
+            logger.error(f"Error setting S3 tags: {e}")
+        return path
 
 def get_storage(path, s3_config=None):
     if str(path).startswith('s3://'):

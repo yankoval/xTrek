@@ -86,3 +86,60 @@ class AggregationReport(SUZBase):
     participantId: str
     productGroup: str
     aggregationUnits: List[AggregationUnit]
+
+# --- Новые модели для работы со статусами и производственными заказами ---
+
+@dataclass
+class PasportData(SUZBase):
+    Format: str
+    LabelLanguage: str
+    Manufacturer_inn: str
+    Manufacturer_name: str
+    Manufacturer_address: str
+    Manufacturer_phone: str
+    Product_id: str
+    Product_article: str
+    Product_gtin: str
+    Product_ShowArticle: str
+    Product_name_part1: str
+    Product_name_part2: str
+    Product_name_part3: str
+    Product_gost: str
+    Product_PackInfo: str
+    Product_PackQty: str
+    Product_PackBarcode: str
+    Product_PackIcons1: str
+    Product_PackIcons2: str
+    Product_ClientBarcode: str
+    Batch_id: str
+    Batch_number: str
+    Batch_BN_1С: str
+    Batch_BN_1С_full: str
+    Batch_date_production: str
+    Batch_date_packing: str
+    Batch_date_expired: str
+    Batch_date_packing_descr: str
+    Batch_date_expired_descr: str
+    client_AdditionalInfo: str
+
+@dataclass
+class ProductionOrder(SUZBase):
+    Article: str
+    Gtin: str
+    Quantity: str
+    PasportData: PasportData
+
+@dataclass
+class EmissionOrderStatus(SUZBase):
+    omsId: str
+    orderId: str
+    gtin: str
+    bufferStatus: str
+    leftInBuffer: int
+    totalCodes: int
+    unavailableCodes: int
+    availableCodes: int
+    totalPassed: int
+    poolsExhausted: bool
+    templateId: Optional[int] = None
+    expiredDate: Optional[str] = None
