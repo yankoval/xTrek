@@ -119,7 +119,7 @@ def sign_and_send(order: EmissionOrder, inn: str, signing_dir: str, timeout: int
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--gtin", default="4630234044646", help="GTIN товара (для определения ИНН)")
-    parser.add_argument("--quantity", type=int, default=515, help="Количество запрашиваемых кодов")
+    parser.add_argument("--quantity", type=int, default=10, help="Количество запрашиваемых кодов")
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
     parser.add_argument("--oms_id", help="OMS ID (если не задан, будет найден в my_orgs по ИНН)")
