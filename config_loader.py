@@ -5,11 +5,11 @@ from typing import Dict, Any
 
 logger = logging.getLogger("ConfigLoader")
 
-def load_config() -> Dict[str, Any]:
+def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
     """
     Загружает конфигурацию из файла.
     Порядок поиска:
-    1. Переменная окружения TOKENS_CONFIG
+    1. Переменная окружения env_name (по умолчанию TOKENS_CONFIG)
     2. tokens_config.json в текущей директории
     3. config.json в текущей директории
     4. tokens_config.json в директории скрипта
@@ -18,7 +18,7 @@ def load_config() -> Dict[str, Any]:
     config_candidates = []
 
     # 1. Переменная окружения
-    env_config = os.environ.get('TOKENS_CONFIG')
+    env_config = os.environ.get(env_name)
     if env_config:
         config_candidates.append(env_config)
 

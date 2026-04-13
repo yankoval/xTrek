@@ -36,6 +36,12 @@ class EmissionOrder(SUZBase):
     attributes: OrderAttributes
     products: List[OrderProduct]
 
+@dataclass
+class EmissionOrderreceipts(SUZBase):
+    orderId: str
+    expectedCompleteTimestamp: int
+    omsId: str
+
 # --- Блок получения кодов ---
 
 @dataclass
