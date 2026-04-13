@@ -9,7 +9,7 @@ class SUZBase:
         return {k: v for k, v in asdict(self).items() if v is not None}
     
     def to_json(self):
-        return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+        return json.dumps(self.to_dict(), ensure_ascii=False, separators=(',', ':'))
 
 # --- Блок Эмиссии (Заказ) ---
 
