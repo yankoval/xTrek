@@ -151,9 +151,19 @@ class SUZ:
         if not os.path.exists(signature_file):
             raise FileNotFoundError(f"Файл с подписью не найден: {signature_file}")
 
-        # Чтение JSON тела
-        with open(body_file, 'r', encoding='utf-8') as f:
-            body_data = json.load(f)
+        # Чтение JSON тела в бинарном виде для обеспечения идентичности при отправке
+        with open(body_file, 'rb') as f:
+            body_bytes = f.read()
+
+        # Декодируем для валидации и логирования
+        try:
+            body_data = json.loads(body_bytes.decode('utf-8'))
+        except UnicodeDecodeError:
+            logger.error("Файл тела заказа не является валидным UTF-8")
+            raise
+        except json.JSONDecodeError:
+            logger.error("Файл тела заказа не является валидным JSON")
+            raise
 
         # Валидация тела запроса
         if not self.validate_order_body(body_data):
@@ -173,7 +183,7 @@ class SUZ:
         # Формирование заголовков
         headers = self.headers.copy()
         headers.update({
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
             "X-Signature": signature
         })
 
@@ -184,7 +194,8 @@ class SUZ:
         logger.info(f"URL: {url}")
         logger.info(f"Заголовки (без подписи): { {k: v for k, v in headers.items() if k != 'X-Signature'} }")
         logger.info(f"Длина подписи: {len(signature)} символов")
-        logger.info(f"Тело запроса: {json.dumps(body_data, indent=2, ensure_ascii=False)}")
+        logger.info(f"Тело запроса (бинарное, длина): {len(body_bytes)} байт")
+        logger.info(f"Тело запроса (превью): {body_bytes.decode('utf-8')[:500]}...")
 
         # Попытки с повторением при ошибке 503
         for attempt in range(max_retries):
@@ -192,7 +203,7 @@ class SUZ:
                 logger.info(f"Попытка {attempt + 1}/{max_retries}")
                 response = requests.post(url,
                                         headers=headers,
-                                        json=body_data,
+                                        data=body_bytes,
                                         verify=False,
                                         timeout=30)
 
