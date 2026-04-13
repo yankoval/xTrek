@@ -16,6 +16,9 @@ class TestGS1Processor(unittest.TestCase):
         self.assertEqual(gs1_processor.get_gs1_prefix("4610117633945"), "4610117")
         self.assertEqual(gs1_processor.get_gs1_prefix("4670017921234"), "467001792")
         self.assertEqual(gs1_processor.get_gs1_prefix("4607051794405.0"), "4607051")
+        # Тест ведущего нуля
+        self.assertEqual(gs1_processor.get_gs1_prefix("04610117633945"), "4610117")
+        self.assertEqual(gs1_processor.get_gs1_prefix("04670017921234"), "467001792")
 
     def test_inn_from_filename(self):
         """Тест извлечения ИНН из имени"""
@@ -34,8 +37,12 @@ class TestGS1Processor(unittest.TestCase):
         with patch("gs1_processor.open", mock_open(read_data=fake_db)):
             # Проверка существующего 7-значного
             self.assertEqual(gs1_processor.get_inn_by_gtin("4610117000000"), "7733154124")
+            # Проверка 7-значного с ведущим нулем
+            self.assertEqual(gs1_processor.get_inn_by_gtin("04610117000000"), "7733154124")
             # Проверка нашего особого 9-значного
             self.assertEqual(gs1_processor.get_inn_by_gtin("4670017929999"), "7733154124")
+            # Проверка 9-значного с ведущим нулем
+            self.assertEqual(gs1_processor.get_inn_by_gtin("04670017929999"), "7733154124")
             # Проверка отсутствующего
             self.assertIsNone(gs1_processor.get_inn_by_gtin("4600000000000"))
 

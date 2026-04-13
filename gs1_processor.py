@@ -27,6 +27,11 @@ def get_gs1_prefix(gtin):
     if not gtin:
         return None
     gtin_str = str(gtin).strip().split('.')[0]
+
+    # Удаляем ведущий ноль
+    if gtin_str.startswith('0') and len(gtin_str) > 1:
+        gtin_str = gtin_str[1:]
+
     if not gtin_str.isdigit() or len(gtin_str) < 12:
         return None
 
