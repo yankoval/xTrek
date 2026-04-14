@@ -124,10 +124,10 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
         emission_orders_path = config.get('emission_orders_path')
-        emission_receipts_path = config.get('emissionReceipts')
+        emission_receipts_path = config.get('emission_receipts')
 
         if not all([emission_orders_path, emission_receipts_path]):
-            logger.error(f"[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emissionReceipts)")
+            logger.error(f"[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emission_receipts)")
             return None
 
         storage_orders = get_storage(emission_orders_path, s3_config)
@@ -424,12 +424,12 @@ def update_emission_order_status(production_order_id: str):
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
-        emission_receipts_path = config.get('emissionReceipts')
+        emission_receipts_path = config.get('emission_receipts')
         production_orders_path = config.get('production_orders_path')
         emissions_path = config.get('emissions_path')
 
         if not all([emission_receipts_path, production_orders_path, emissions_path]):
-            logger.error("[!] В конфигурации отсутствуют необходимые пути (emissionReceipts, production_orders_path, emissions_path)")
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (emission_receipts, production_orders_path, emissions_path)")
             return None
 
         # 1. Загружаем чек заказа на эмиссию
