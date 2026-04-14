@@ -81,7 +81,7 @@ class SUZ:
 
     def order_codes_retry(self, blockId: str):
         """ Метод «Получить повторно коды маркировки из заказа КМ» """
-        url = self.base_url + f'api/v3/order/codes/retry?omsId={self.omsId}&blockId={blockId}'
+        url = f"{self.base_url}/api/v3/order/codes/retry?omsId={self.omsId}&blockId={blockId}"
         return self._get(url)
 
     def order_codes_blocks(self, orderId: str, gtin: str):
@@ -246,7 +246,7 @@ class SUZ:
             raise ValueError("Тело запроса не прошло валидацию")
 
         # Формирование URL
-        url = self.base_url + f'api/v3/order?omsId={self.omsId}'
+        url = f"{self.base_url}/api/v3/order?omsId={self.omsId}"
 
         try:
             response = self._send_signed_request(url, body_file, signature_file, max_retries)

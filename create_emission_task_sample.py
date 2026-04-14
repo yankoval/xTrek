@@ -419,15 +419,32 @@ def get_emission_kodes(order_id: str):
         logger.error(f"[!] Ошибка в get_emission_kodes: {e}")
         return None
 
+def format_date_suz(date_str: str) -> str:
+    """Преобразует дату из dd.mm.yyyy в yyyy-MM-dd"""
+    if not date_str:
+        return None
+    try:
+        # Пробуем dd.mm.yyyy
+        if '.' in date_str:
+            parts = date_str.split('.')
+            if len(parts) == 3:
+                return f"{parts[2]}-{parts[1]}-{parts[0]}"
+        return date_str
+    except:
+        return date_str
+
 def create_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None):
     """
-    Создает задачу на отчет о нанесении на основе полученных кодов
+    Создает задачу на отчет о нанесении на основе полученных кодов.
+    Пытается автоматически найти даты в исходном производственном заказе.
     """
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
         kodes_path = config.get('kodes')
         utilisation_tasks_path = config.get('utilisation_tasks_path')
+        emission_receipts_path = config.get('emission_receipts')
+        production_orders_path = config.get('production_orders_path')
 
         if not all([kodes_path, utilisation_tasks_path]):
             logger.error("[!] В конфигурации отсутствуют пути (kodes, utilisation_tasks_path)")
@@ -447,6 +464,43 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
             logger.error(f"[!] В файле {kodes_file_path} нет кодов")
             return None
 
+        # 1. Попытка найти даты автоматически
+        auto_prod_date = production_date
+        auto_exp_date = expiration_date
+        manufacturer_inn = None
+
+        if not auto_prod_date or not auto_exp_date:
+            logger.info(f"[*] Поиск дат в исходном заказе для orderId: {order_id}")
+            # Пытаемся найти соответствие orderId -> productionOrderId
+            storage_receipts = get_storage(emission_receipts_path, s3_config)
+            # В S3Receipts файлы именуются по productionOrderId, поэтому придется искать перебором
+            # (или если у нас есть база соответствий, но тут мы ищем в S3)
+            # Для простоты примера предположим, что мы можем найти production_order_id
+
+            # Если не переданы даты, попробуем найти productionOrderId по содержимому чеков
+            production_order_id = None
+            if isinstance(storage_receipts, LocalStorage):
+                 for f in Path(emission_receipts_path).glob("*.json"):
+                     try:
+                         data = json.loads(f.read_text())
+                         if data.get('orderId') == order_id:
+                             production_order_id = f.stem
+                             break
+                     except: continue
+
+            if production_order_id:
+                storage_prod = get_storage(production_orders_path, s3_config)
+                prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+                if storage_prod.exists(prod_path):
+                    prod_data = json.loads(storage_prod.read_text(prod_path))
+                    pasport = prod_data.get('PasportData', {})
+                    if not auto_prod_date:
+                        auto_prod_date = format_date_suz(pasport.get('Batch_date_production'))
+                    if not auto_exp_date:
+                        auto_exp_date = format_date_suz(pasport.get('Batch_date_expired'))
+                    manufacturer_inn = pasport.get('Manufacturer_inn')
+                    logger.info(f"[+] Найдены даты: prod={auto_prod_date}, exp={auto_exp_date}")
+
         # Определяем GTIN по первому коду (01 + 14 цифр)
         first_code = codes[0]
         if first_code.startswith('01'):
@@ -457,11 +511,14 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
 
         # Формируем атрибуты
         attributes = {}
-        # participantId ИСКЛЮЧЕН, так как это вызывает ошибку 400 в СУЗ
-        if production_date:
-            attributes["productionDate"] = production_date
-        if expiration_date:
-            attributes["expirationDate"] = expiration_date
+        # participantId ИСКЛЮЧЕН, так как это вызывает ошибку 400 в СУЗ,
+        # но если мы нашли manufacturer_inn, можно попробовать (или оставить исключенным)
+        # В примере пользователя participantId отсутствовал в успешно принятом JSON.
+
+        if auto_prod_date:
+            attributes["productionDate"] = auto_prod_date
+        if auto_exp_date:
+            attributes["expirationDate"] = auto_exp_date
 
         report = UtilisationReport(
             productGroup=group,
