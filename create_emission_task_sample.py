@@ -5,6 +5,7 @@ import time
 import argparse
 import uuid
 import logging
+import inspect
 from pathlib import Path
 
 # Добавляем текущую директорию в путь поиска модулей
@@ -12,7 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
-    EmissionOrderStatus, ProductionOrder, PasportData
+    EmissionOrderStatus, ProductionOrder, PasportData,
+    UtilisationReport, UtilisationReportReceipt
 )
 from suz import SUZ
 from gs1_processor import get_inn_by_gtin
@@ -417,6 +419,205 @@ def get_emission_kodes(order_id: str):
         logger.error(f"[!] Ошибка в get_emission_kodes: {e}")
         return None
 
+def create_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None):
+    """
+    Создает задачу на отчет о нанесении на основе полученных кодов
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        kodes_path = config.get('kodes')
+        utilisation_tasks_path = config.get('utilisation_tasks_path')
+
+        if not all([kodes_path, utilisation_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (kodes, utilisation_tasks_path)")
+            return None
+
+        storage_kodes = get_storage(kodes_path, s3_config)
+        kodes_file_path = f"{kodes_path.rstrip('/')}/{order_id}.json"
+
+        if not storage_kodes.exists(kodes_file_path):
+            logger.error(f"[!] Файл кодов не найден: {kodes_file_path}")
+            return None
+
+        codes_data = json.loads(storage_kodes.read_text(kodes_file_path))
+        codes = codes_data.get('codes', [])
+
+        if not codes:
+            logger.error(f"[!] В файле {kodes_file_path} нет кодов")
+            return None
+
+        # Определяем GTIN по первому коду (01 + 14 цифр)
+        first_code = codes[0]
+        if first_code.startswith('01'):
+            gtin = first_code[2:16]
+        else:
+            logger.error(f"[!] Не удалось определить GTIN из кода: {first_code}")
+            return None
+
+        # Формируем атрибуты
+        attributes = {}
+        # participantId ИСКЛЮЧЕН, так как это вызывает ошибку 400 в СУЗ
+        if production_date:
+            attributes["productionDate"] = production_date
+        if expiration_date:
+            attributes["expirationDate"] = expiration_date
+
+        report = UtilisationReport(
+            productGroup=group,
+            sntins=codes,
+            attributes=attributes
+        )
+
+        # Сохраняем в S3
+        storage_util = get_storage(utilisation_tasks_path, s3_config)
+        remote_path = f"{utilisation_tasks_path.rstrip('/')}/{order_id}.json"
+
+        temp_local = Path(f"temp_util_{order_id}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(report.to_json())
+
+        logger.info(f"[*] Выгрузка задачи на отчет о нанесении в S3: {remote_path}")
+        storage_util.upload(str(temp_local), remote_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return order_id
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_utilisation_task: {e}")
+        return None
+
+def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
+                            oms_id: str = None, client_token: str = None):
+    """
+    Загружает задачу отчета о нанесении, подписывает и отправляет в СУЗ
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        utilisation_tasks_path = config.get('utilisation_tasks_path')
+        utilisation_receipts_path = config.get('utilisation_receipts')
+
+        if not all([utilisation_tasks_path, utilisation_receipts_path]):
+            logger.error(f"[!] В конфигурации отсутствуют пути (utilisation_tasks_path, utilisation_receipts)")
+            return None
+
+        storage_tasks = get_storage(utilisation_tasks_path, s3_config)
+        task_path = f"{utilisation_tasks_path.rstrip('/')}/{order_id}.json"
+
+        if not storage_tasks.exists(task_path):
+            logger.error(f"[!] Файл задачи не найден: {task_path}")
+            return None
+
+        # Помечаем как processing
+        storage_tasks.mark_processing(task_path)
+
+        task_content = storage_tasks.read_text(task_path)
+        task_data = json.loads(task_content)
+
+        # Получаем ИНН из атрибутов или по GTIN
+        inn = task_data.get('attributes', {}).get('participantId')
+        if not inn:
+             first_code = task_data['sntins'][0]
+             gtin = first_code[2:16] if first_code.startswith('01') else None
+             base_path = os.path.dirname(os.path.abspath(__file__))
+             inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН для задачи {order_id}")
+            storage_tasks.mark_error(task_path)
+            return None
+
+        # Разрешение учетных данных
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+
+        final_oms_id = oms_id
+        final_client_token = client_token
+
+        if not final_oms_id or not final_client_token:
+            found_org = None
+            for o in org_manager.list():
+                if o.inn == inn and o.oms_id:
+                    found_org = o
+                    break
+            if not found_org:
+                found_org = org_manager.find(inn=inn)
+
+            if found_org:
+                final_oms_id = final_oms_id or found_org.oms_id
+                final_client_token = final_client_token or found_org.connection_id
+
+        if not final_oms_id or not final_client_token:
+            logger.error(f"[!] Недостаточно данных для ИНН {inn}")
+            storage_tasks.mark_error(task_path)
+            return None
+
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=final_client_token)
+
+        if not token:
+            logger.error(f"[!] Токен не найден.")
+            storage_tasks.mark_error(task_path)
+            return None
+
+        # Подпись
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_utilisation.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
+
+        try:
+            with open(body_path, "w", encoding="utf-8") as f:
+                json.dump(task_data, f, ensure_ascii=False, separators=(',', ':'))
+
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    storage_tasks.mark_error(task_path)
+                    return None
+                time.sleep(1)
+
+            # Отправка
+            suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
+            logger.info(f"[*] Отправка отчета в СУЗ (orderId: {order_id})...")
+            report_id = suz_api.utilisation_send(str(body_path), str(signature_path), orderId=order_id)
+
+            if report_id and not report_id.startswith('{') and 'Error' not in report_id:
+                logger.info(f"[+++] Отчет принят! ID: {report_id}")
+                storage_tasks.mark_finished(task_path)
+
+                storage_receipts = get_storage(utilisation_receipts_path, s3_config)
+                remote_receipt_path = f"{utilisation_receipts_path.rstrip('/')}/{order_id}.json"
+
+                temp_receipt = work_dir / f"receipt_util_{unique_id}.json"
+                with open(temp_receipt, 'w', encoding='utf-8') as f:
+                    json.dump({"reportId": report_id, "orderId": order_id, "omsId": final_oms_id}, f, indent=4)
+
+                storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                try: temp_receipt.unlink()
+                except: pass
+
+                return report_id
+            else:
+                logger.error(f"[!] Ошибка СУЗ: {report_id}")
+                storage_tasks.mark_error(task_path)
+                return report_id
+
+        finally:
+            if body_path.exists(): body_path.unlink()
+            if signature_path.exists(): signature_path.unlink()
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в sign_and_send_utilisation: {e}")
+        return None
+
 def update_emission_order_status(production_order_id: str):
     """
     Получает статус заказа из СУЗ и сохраняет его в S3
@@ -498,7 +699,6 @@ def update_emission_order_status(production_order_id: str):
         status_data = status_response[0]
 
         # Фильтруем поля для инициализации dataclass, на случай появления новых полей в API
-        import inspect
         sig = inspect.signature(EmissionOrderStatus.__init__)
         valid_fields = {k for k, v in sig.parameters.items() if k != 'self'}
         filtered_data = {k: v for k, v in status_data.items() if k in valid_fields}
@@ -534,6 +734,8 @@ def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
+    parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
+    parser.add_argument("--send-utilisation", help="Подписать и отправить отчет о нанесении по orderId (UUID)")
 
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
@@ -542,6 +744,8 @@ def main():
     parser.add_argument("--signing_dir", default=SIGNING_DIR, help="Директория для обмена с демоном подписи")
     parser.add_argument("--timeout", type=int, default=SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
     parser.add_argument("--status", help="Получить статус заказа по productionOrderId")
+    parser.add_argument("--production-date", help="Дата производства для отчета (yyyy-MM-dd)")
+    parser.add_argument("--expiration-date", help="Дата истечения срока годности для отчета (yyyy-MM-dd)")
     parser.add_argument("--get-codes", help="Получить коды для заказа по orderId (UUID)")
 
     args = parser.parse_args()
@@ -580,6 +784,25 @@ def main():
             logger.error(f"[!] Не удалось отправить заказ. Ответ СУЗ: {result}")
         else:
             logger.error("[!] Не удалось отправить заказ (см. логи выше).")
+        return
+
+    if args.create_utilisation:
+        result = create_utilisation_task(args.create_utilisation, args.group,
+                                       production_date=args.production_date,
+                                       expiration_date=args.expiration_date)
+        if result:
+            logger.info(f"[+++] Задача на отчет о нанесении успешно создана для {result}")
+        else:
+            logger.error(f"[!] Не удалось создать задачу для {args.create_utilisation}")
+        return
+
+    if args.send_utilisation:
+        result = sign_and_send_utilisation(args.send_utilisation, args.signing_dir, args.timeout,
+                                         oms_id=args.oms_id, client_token=args.client_token)
+        if result and not result.startswith('{') and 'Error' not in result:
+             logger.info(f"[+++] Отчет о нанесении успешно отправлен! ID: {result}")
+        elif result:
+            logger.error(f"[!] Ошибка отправки: {result}")
         return
 
     parser.print_help()

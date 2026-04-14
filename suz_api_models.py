@@ -57,9 +57,14 @@ class CodesBlock(SUZBase):
 class UtilisationReport(SUZBase):
     """Отчет о нанесении (Метод 4.4.11)"""
     productGroup: str
-    usageType: str  # 'VERIFIED'
     sntins: List[str]
+    usageType: Optional[str] = None
     attributes: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class UtilisationReportReceipt(SUZBase):
+    """Ответ на отправку отчета о нанесении"""
+    reportId: str
 
 @dataclass
 class IntroductionReport(SUZBase):

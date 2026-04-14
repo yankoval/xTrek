@@ -92,7 +92,7 @@ class SUZ:
         url = f"{self.base_url}/api/v3/providers?omsId={self.omsId}"
         return self._get(url)
 
-    def _send_signed_request(self, url: str, body_file: str, signature_file: str, max_retries: int = 3) -> requests.Response:
+    def _send_signed_request(self, url: str, body_file: str, signature_file: str, max_retries: int = 3, extra_headers: dict = None) -> requests.Response:
         """
         Вспомогательный метод для отправки подписанного POST запроса в СУЗ
         """
@@ -122,6 +122,8 @@ class SUZ:
             "Content-Type": "application/json; charset=utf-8",
             "X-Signature": signature
         })
+        if extra_headers:
+            headers.update(extra_headers)
 
         logger.info(f"URL: {url}")
         logger.info(f"Тело запроса (бинарное, длина): {len(body_bytes)} байт")
@@ -152,13 +154,17 @@ class SUZ:
                 raise
         return None
 
-    def utilisation_send(self, body_file: str, signature_file: str, max_retries: int = 3) -> str:
+    def utilisation_send(self, body_file: str, signature_file: str, max_retries: int = 3, orderId: str = None) -> str:
         """
         Отправить отчёт об использовании (нанесении) КМ (Метод 4.4.11)
         """
         url = f"{self.base_url}/api/v3/utilisation?omsId={self.omsId}"
+        extra_headers = {}
+        if orderId:
+            extra_headers["orderId"] = orderId
+
         try:
-            response = self._send_signed_request(url, body_file, signature_file, max_retries)
+            response = self._send_signed_request(url, body_file, signature_file, max_retries, extra_headers=extra_headers)
             if response and response.status_code == 200:
                 data = response.json()
                 return data.get('reportId', '')
@@ -305,10 +311,8 @@ if __name__ == "__main__":
                         help='Количество кодов для выгрузки. 0 - все доступные')
     parser.add_argument('--utilisation-reports-list', action='store_true',
                         help='Получить список отчетов о нанесении и коды из них')
-    parser.add_argument('--days', type=int, default=1,
-                        help='Количество дней для поиска отчетов (по умолчанию 1)')
     parser.add_argument('--group', type=str, default='chemistry',
-                        help='Товарная группа для поиска отчетов (по умолчанию chemistry)')
+                        help='Товарная группа (например, для utilisation_send)')
 
 
     parser.add_argument('--limit', type=int, help='Лимит количества отчетов')
