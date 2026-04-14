@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
     EmissionOrderStatus, ProductionOrder, PasportData,
-    UtilisationReport, UtilisationReportReceipt
+    UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus
 )
 from suz import SUZ
 from gs1_processor import get_inn_by_gtin
@@ -817,12 +817,108 @@ def update_emission_order_status(production_order_id: str):
         logger.error(f"[!] Ошибка в update_emission_order_status: {e}")
         return str(e)
 
+def update_utilisation_report_status(order_id: str):
+    """
+    Получает актуальный статус отчета о нанесении из СУЗ и сохраняет в S3/Локально.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        utilisation_receipts_path = config.get('utilisation_receipts')
+        utilisation_reports_path = config.get('utilisation_reports')
+
+        if not all([utilisation_receipts_path, utilisation_reports_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (utilisation_receipts, utilisation_reports)")
+            return None
+
+        # 1. Загружаем чек отчета (там reportId и omsId)
+        storage_receipts = get_storage(utilisation_receipts_path, s3_config)
+        receipt_path = f"{utilisation_receipts_path.rstrip('/')}/{order_id}.json"
+
+        if not storage_receipts.exists(receipt_path):
+            logger.error(f"[!] Чек отчета о нанесении не найден: {receipt_path}")
+            return None
+
+        receipt_data = json.loads(storage_receipts.read_text(receipt_path))
+        report_id = receipt_data.get('reportId')
+        oms_id = receipt_data.get('omsId')
+
+        if not report_id or not oms_id:
+            logger.error(f"[!] Недостаточно данных в чеке для {order_id}: reportId={report_id}, omsId={oms_id}")
+            return None
+
+        # 2. Инициализация API
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+
+        found_org = None
+        for o in org_manager.list():
+            if o.oms_id == oms_id:
+                found_org = o
+                break
+
+        if not found_org:
+            logger.error(f"[!] Организация с omsId {oms_id} не найдена.")
+            return None
+
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(found_org.inn, token_type='UUID', conid=found_org.connection_id)
+
+        if not token:
+            logger.error(f"[!] Токен не найден.")
+            return None
+
+        suz_api = SUZ(token=token, omsId=oms_id, clientToken=found_org.connection_id)
+
+        # 3. Запрос статуса
+        logger.info(f"[*] Запрос статуса отчета {report_id} для заказа {order_id}...")
+        try:
+            status_res = suz_api.report_info(report_id)
+        except Exception as e:
+            logger.error(f"[!] Ошибка API: {e}")
+            return str(e)
+
+        if not status_res:
+            logger.error("[!] Пустой ответ от СУЗ.")
+            return None
+
+        # Фильтрация полей для dataclass
+        sig = inspect.signature(UtilisationReportStatus.__init__)
+        valid_fields = {k for k, v in sig.parameters.items() if k != 'self'}
+        filtered_data = {k: v for k, v in status_res.items() if k in valid_fields}
+
+        status_obj = UtilisationReportStatus(**filtered_data)
+
+        # 4. Сохранение
+        storage_reports = get_storage(utilisation_reports_path, s3_config)
+        output_path = f"{utilisation_reports_path.rstrip('/')}/{order_id}.json"
+
+        temp_local = Path(f"temp_util_status_{order_id}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(status_obj.to_json())
+
+        logger.info(f"[*] Сохранение статуса отчета в {output_path}")
+        storage_reports.upload(str(temp_local), output_path)
+
+        # Теги для расширения (если локально) или метаданных S3
+        storage_reports.set_tags(output_path, {"reportStatus": status_obj.reportStatus})
+
+        try: temp_local.unlink()
+        except: pass
+
+        return status_obj
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в update_utilisation_report_status: {e}")
+        return str(e)
+
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
     parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
     parser.add_argument("--send-utilisation", help="Подписать и отправить отчет о нанесении по orderId (UUID)")
+    parser.add_argument("--utilisation-status", help="Получить статус отчета о нанесении по orderId (UUID)")
 
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
@@ -890,6 +986,14 @@ def main():
              logger.info(f"[+++] Отчет о нанесении успешно отправлен! ID: {result}")
         elif result:
             logger.error(f"[!] Ошибка отправки: {result}")
+        return
+
+    if args.utilisation_status:
+        result = update_utilisation_report_status(args.utilisation_status)
+        if isinstance(result, UtilisationReportStatus):
+            print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"Результат: {result}")
         return
 
     parser.print_help()

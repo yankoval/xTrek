@@ -68,6 +68,14 @@ class UtilisationReportReceipt(SUZBase):
     reportId: str
 
 @dataclass
+class UtilisationReportStatus(SUZBase):
+    """Статус обработки отчета о нанесении (Метод 4.4.13)"""
+    omsId: str
+    reportId: str
+    reportStatus: str
+    errorReason: Optional[str] = None
+
+@dataclass
 class IntroductionReport(SUZBase):
     """Сообщение о вводе в оборот"""
     participantId: str
