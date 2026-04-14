@@ -327,6 +327,12 @@ if __name__ == "__main__":
                         help='Идентификатор заказа на эмиссию для выгрузки')
     parser.add_argument('-qt', '--qty', dest='qty', type=int, default=1,
                         help='Количество кодов для выгрузки. 0 - все доступные')
+    parser.add_argument('--utilisation-reports-list', action='store_true',
+                        help='Получить список отчетов о нанесении и коды из них')
+    parser.add_argument('--days', type=int, default=1,
+                        help='Количество дней для поиска отчетов (по умолчанию 1)')
+    parser.add_argument('--group', type=str, default='chemistry',
+                        help='Товарная группа для поиска отчетов (по умолчанию chemistry)')
 
 
     # Parse command line arguments
@@ -347,6 +353,33 @@ if __name__ == "__main__":
 
     try:
         api = SUZ(token, omsId, clientToken)
+
+        # Если указан флаг получения списка отчетов о нанесении
+        if args.utilisation_reports_list:
+            from datetime import datetime, timedelta
+            from_date = (datetime.now() - timedelta(days=args.days)).strftime('%Y-%m-%d')
+            logger.info(f"Запрос отчетов о нанесении для группы {args.group} начиная с {from_date}")
+
+            reports_data = api.utilisation_reports_list(productGroup=args.group, fromDate=from_date)
+            reports = reports_data.get('reports', [])
+
+            if not reports:
+                logger.info("Отчеты не найдены.")
+            else:
+                for report in reports:
+                    report_id = report.get('reportId')
+                    status = report.get('status')
+                    logger.info(f"Отчет ID: {report_id}, Статус: {status}")
+
+                    try:
+                        codes_data = api.utilisation_codes(report_id)
+                        codes = codes_data.get('sntins', [])
+                        logger.info(f"  Количество КИ в отчете: {len(codes)}")
+                        for code in codes:
+                            logger.info(f"    Code: {code}")
+                    except Exception as e:
+                        logger.error(f"  Не удалось получить коды для отчета {report_id}: {e}")
+            exit()
 
         # Если указан флаг создания заказа
         if args.create_order:
