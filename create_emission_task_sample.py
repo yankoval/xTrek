@@ -204,8 +204,9 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
 
         try:
             with open(body_path, "w", encoding="utf-8") as f:
-                # СУЗ требует компактный JSON без пробелов между ключами
-                json.dump(order_data, f, ensure_ascii=False, separators=(',', ':'))
+                # СУЗ требует компактный JSON без пробелов между ключами.
+                # Используем ensure_ascii=True (по умолчанию) для экранирования ASCII 29 как \u001d.
+                json.dump(order_data, f, separators=(',', ':'))
 
             logger.info(f"[*] Файл заказа сохранен в: {body_path}. Ожидание подписи...")
 
@@ -236,7 +237,7 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
 
                     temp_receipt = work_dir / f"receipt_{unique_id}.json"
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
-                        json.dump(result.to_dict(), f, ensure_ascii=False, indent=4)
+                        json.dump(result.to_dict(), f, indent=4)
 
                     logger.info(f"[*] Выгрузка чека в S3: {remote_receipt_path}")
                     storage_receipts.upload(str(temp_receipt), remote_receipt_path)
@@ -401,7 +402,7 @@ def get_emission_kodes(order_id: str):
 
         temp_file = Path(f"temp_codes_{order_id}.json")
         with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(codes_res, f, ensure_ascii=False, indent=4)
+            json.dump(codes_res, f, indent=4)
 
         logger.info(f"[*] Выгрузка кодов в: {output_path}")
         storage_kodes.upload(str(temp_file), output_path)
@@ -467,26 +468,42 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         # 1. Попытка найти даты автоматически
         auto_prod_date = production_date
         auto_exp_date = expiration_date
-        manufacturer_inn = None
 
         if not auto_prod_date or not auto_exp_date:
             logger.info(f"[*] Поиск дат в исходном заказе для orderId: {order_id}")
-            # Пытаемся найти соответствие orderId -> productionOrderId
             storage_receipts = get_storage(emission_receipts_path, s3_config)
-            # В S3Receipts файлы именуются по productionOrderId, поэтому придется искать перебором
-            # (или если у нас есть база соответствий, но тут мы ищем в S3)
-            # Для простоты примера предположим, что мы можем найти production_order_id
-
-            # Если не переданы даты, попробуем найти productionOrderId по содержимому чеков
             production_order_id = None
+
+            # Ищем во всех файлах чеков
             if isinstance(storage_receipts, LocalStorage):
-                 for f in Path(emission_receipts_path).glob("*.json"):
-                     try:
-                         data = json.loads(f.read_text())
-                         if data.get('orderId') == order_id:
-                             production_order_id = f.stem
-                             break
-                     except: continue
+                for f in Path(emission_receipts_path).glob("*.json"):
+                    try:
+                        content = f.read_text(encoding='utf-8')
+                        data = json.loads(content)
+                        if data.get('orderId') == order_id:
+                            production_order_id = f.stem
+                            if production_order_id.startswith('receipt_'):
+                                production_order_id = production_order_id[len('receipt_'):]
+                            logger.info(f"  -> Совпадение найдено в локальном файле: {f.name}, productionOrderId={production_order_id}")
+                            break
+                    except: continue
+            else:
+                # В S3 перебираем объекты в папке чеков
+                try:
+                    bucket, prefix = storage_receipts._parse_s3_url(emission_receipts_path)
+                    res = storage_receipts.s3.list_objects_v2(Bucket=bucket, Prefix=prefix.strip('/') + '/')
+                    for obj in res.get('Contents', []):
+                        if obj['Key'].endswith('.json'):
+                            content = storage_receipts.read_text(f"s3://{bucket}/{obj['Key']}")
+                            data = json.loads(content)
+                            if data.get('orderId') == order_id:
+                                production_order_id = Path(obj['Key']).stem
+                                if production_order_id.startswith('receipt_'):
+                                    production_order_id = production_order_id[len('receipt_'):]
+                                logger.info(f"  -> Совпадение найдено в S3: {obj['Key']}, productionOrderId={production_order_id}")
+                                break
+                except Exception as e:
+                    logger.error(f"Ошибка при поиске в S3: {e}")
 
             if production_order_id:
                 storage_prod = get_storage(production_orders_path, s3_config)
@@ -498,8 +515,9 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
                         auto_prod_date = format_date_suz(pasport.get('Batch_date_production'))
                     if not auto_exp_date:
                         auto_exp_date = format_date_suz(pasport.get('Batch_date_expired'))
-                    manufacturer_inn = pasport.get('Manufacturer_inn')
-                    logger.info(f"[+] Найдены даты: prod={auto_prod_date}, exp={auto_exp_date}")
+                    logger.info(f"[+] Извлечены даты: prod={auto_prod_date}, exp={auto_exp_date}")
+                else:
+                    logger.warning(f"[!] Файл производственного заказа {production_order_id} не найден по пути {prod_path}")
 
         # Определяем GTIN по первому коду (01 + 14 цифр)
         first_code = codes[0]
@@ -630,7 +648,8 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
 
         try:
             with open(body_path, "w", encoding="utf-8") as f:
-                json.dump(task_data, f, ensure_ascii=False, separators=(',', ':'))
+                # Важно: ensure_ascii=True для корректной передачи GS1-разделителей
+                json.dump(task_data, f, separators=(',', ':'))
 
             logger.info(f"[*] Ожидание подписи для {body_path}...")
             start_time = time.time()
