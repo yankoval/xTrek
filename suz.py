@@ -18,6 +18,8 @@ from requests import HTTPError
 import json
 from typing import List, Dict, Any, Generator, Union
 from suz_api_models import EmissionOrderreceipts
+from org_manager import OrganizationManager
+from tokens import TokenProcessor
 
 # logging
 logger = logging.getLogger(__name__)
@@ -315,6 +317,8 @@ if __name__ == "__main__":
                         help='Токен из ЛК УОТ/Упавление заказами/Устройства')
     parser.add_argument('-oid', '--omsid', dest='omsId', type=str,
                         help='OMS ID из ЛК УОТ/Упавление заказами/Устройства')
+    parser.add_argument('--inn', type=str,
+                        help='ИНН организации для автоматического поиска параметров')
     parser.add_argument('--create-order', action='store_true',
                         help='Создать заказ на эмиссию кодов')
     parser.add_argument('--body-file', type=str,
@@ -342,14 +346,41 @@ if __name__ == "__main__":
 
     # Получение параметров
     token = args.token or os.getenv('HONEST_SIGN_TOKEN')
-    if not token:
-        raise ValueError("Токен не найден")
     omsId = args.omsId or os.getenv('OMSID')
-    if not omsId:
-        raise ValueError("omsId не найден")
     clientToken = args.client_token or os.getenv('CLIENT_TOKEN')
+    inn = args.inn
+
+    # Автоматическое определение параметров по ИНН
+    if inn and (not token or not omsId or not clientToken):
+        logger.info(f"Поиск параметров для ИНН: {inn}")
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+
+        found_org = org_manager.find(inn=inn)
+        if not found_org:
+            # Пытаемся найти среди всех, вдруг там несколько записей
+            for o in org_manager.list():
+                if o.inn == inn and o.oms_id:
+                    found_org = o
+                    break
+
+        if found_org:
+            logger.info(f"[*] Используется профиль организации: {found_org.name}")
+            omsId = omsId or found_org.oms_id
+            clientToken = clientToken or found_org.connection_id
+
+            if not token:
+                token_processor = TokenProcessor(org_manager=org_manager)
+                token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=clientToken)
+                if token:
+                    logger.info("[*] Токен успешно получен из базы")
+
+    if not token:
+        raise ValueError("Токен не найден. Укажите --token, установите HONEST_SIGN_TOKEN или укажите --inn с настроенной базой.")
+    if not omsId:
+        raise ValueError("omsId не найден. Укажите --omsid, установите OMSID или укажите --inn с настроенной базой.")
     if not clientToken:
-        raise ValueError("CLIENT_TOKEN не найден")
+        raise ValueError("clientToken не найден. Укажите --client_token, установите CLIENT_TOKEN или укажите --inn с настроенной базой.")
 
     try:
         api = SUZ(token, omsId, clientToken)
