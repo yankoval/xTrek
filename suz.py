@@ -55,53 +55,42 @@ class SUZ:
             "Accept": "application/json"
         }
 
+    def _get(self, url, params=None):
+        try:
+            response = requests.get(url, params=params, headers=self.headers, verify=False)
+            if response.status_code != 200:
+                logger.debug(f"GET {url} failed with {response.status_code}: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"GET {url} failed. Status: {e.response.status_code}, Body: {e.response.text}")
+            raise
+
     def order_list(self):
         url = f"{self.base_url}/api/v3/order/list?omsId={self.omsId}"
-        response = requests.get(url, headers=self.headers, verify=False)
-        response.raise_for_status()
-        return response.json()
+        return self._get(url)
 
     def order_status(self, orderId: str, gtin: str):
         url = f"{self.base_url}/api/v3/order/status?omsId={self.omsId}&orderId={orderId}&gtin={gtin}"
-        response = requests.get(url, headers=self.headers, verify=False)
-        response.raise_for_status()
-        return response.json()
+        return self._get(url)
 
     def codes(self, orderId: str, quantity: int, gtin: str):
         url = f"{self.base_url}/api/v3/codes?omsId={self.omsId}&orderId={orderId}&quantity={quantity}&gtin={gtin}"
-        response = requests.get(url, headers=self.headers, verify=False)
-        response.raise_for_status()
-        return response.json()
+        return self._get(url)
 
     def order_codes_retry(self, blockId: str):
-        """ Метод «Получить повторно коды маркировки из заказа КМ»
-        Этот метод используется для повторного получения массива эмитированных КМ из 
-        заказа кодов маркировки в случае, если коды маркировки не были получены в результате 
-        коммуникационных ошибок или ошибок на стороне Системы, взаимодействующей с СУЗ. 
-        Метод использует следующие параметры: идентификатор СУЗ, идентификатор 
-        пакета кодов маркировки.
-        . Ограничения (Restrictions)
-        Повторно коды маркировки могут быть запрошены только в том случае, если:
-        1) они были ранее запрошены через API;
-        2) заказ кодов маркировки не был закрыт.
-        """
-        response = requests.get(self.base_url + f'api/v3/order/codes/retry?omsId={self.omsId}'
-                                                f'&blockId={blockId}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
-        response.raise_for_status()
-        return response.json()
+        """ Метод «Получить повторно коды маркировки из заказа КМ» """
+        url = self.base_url + f'api/v3/order/codes/retry?omsId={self.omsId}&blockId={blockId}'
+        return self._get(url)
 
     def order_codes_blocks(self, orderId: str, gtin: str):
         url = f"{self.base_url}/api/v3/order/codes/blocks?omsId={self.omsId}&orderId={orderId}&gtin={gtin}"
-        response = requests.get(url, headers=self.headers, verify=False)
-        response.raise_for_status()
-        return response.json()
+        return self._get(url)
 
     def providers(self):
         url = f"{self.base_url}/api/v3/providers?omsId={self.omsId}"
-        response = requests.get(url, headers=self.headers, verify=False)
-        response.raise_for_status()
-        return response.json()
+        return self._get(url)
 
     def _send_signed_request(self, url: str, body_file: str, signature_file: str, max_retries: int = 3) -> requests.Response:
         """
@@ -185,40 +174,25 @@ class SUZ:
         Получить статус обработки отчёта (Метод 4.4.13)
         """
         url = f"{self.base_url}/api/v3/report/info?omsId={self.omsId}&reportId={reportId}"
-        response = requests.get(url, headers=self.headers, verify=False)
-        response.raise_for_status()
-        return response.json()
+        return self._get(url)
 
-    def utilisation_reports_list(self, productGroup: str, fromDate: str = None, toDate: str = None,
-                                 status: str = None, limit: int = None, offset: int = None):
+    def utilisation_reports_list(self, orderId: str, limit: int = None, skip: int = None):
         """
         Получить список идентификаторов отчетов «Сведения о нанесении» (Метод 4.4.15)
         """
-        url = f"{self.base_url}/api/v3/utilisation/reports?omsId={self.omsId}"
-        params = {
-            "productGroup": productGroup
-        }
-        if fromDate: params["fromDate"] = fromDate
-        if toDate: params["toDate"] = toDate
-        if status: params["status"] = status
+        url = f"{self.base_url}/api/v3/quality?omsId={self.omsId}&orderId={orderId}"
+        params = {}
         if limit: params["limit"] = limit
-        if offset: params["offset"] = offset
+        if skip: params["skip"] = skip
 
-        logger.debug(f"GET {url} with params {params}")
-        response = requests.get(url, params=params, headers=self.headers, verify=False)
-        if response.status_code != 200:
-            logger.error(f"Error {response.status_code}: {response.text}")
-        response.raise_for_status()
-        return response.json()
+        return self._get(url, params=params)
 
     def utilisation_codes(self, reportId: str):
         """
         Получить список КИ из отчета «Сведения о нанесении» (Метод 4.4.16)
         """
         url = f"{self.base_url}/api/v3/utilisation/codes?omsId={self.omsId}&reportId={reportId}"
-        response = requests.get(url, headers=self.headers, verify=False)
-        response.raise_for_status()
-        return response.json()
+        return self._get(url)
 
     def validate_order_body(self, body_data: dict) -> bool:
         """
@@ -324,6 +298,7 @@ if __name__ == "__main__":
                         help='Путь к файлу с подписью')
     parser.add_argument('--max-retries', type=int, default=3,
                     help='Максимальное количество повторных попыток при ошибке 503')
+    parser.add_argument('--order-id', type=str, help='Идентификатор заказа (orderId)')
     parser.add_argument('-eo', '--eorder', dest='eorder', type=str, default='',
                         help='Идентификатор заказа на эмиссию для выгрузки')
     parser.add_argument('-qt', '--qty', dest='qty', type=int, default=1,
@@ -335,6 +310,9 @@ if __name__ == "__main__":
     parser.add_argument('--group', type=str, default='chemistry',
                         help='Товарная группа для поиска отчетов (по умолчанию chemistry)')
 
+
+    parser.add_argument('--limit', type=int, help='Лимит количества отчетов')
+    parser.add_argument('--skip', type=int, help='Пропустить N отчетов')
 
     # Parse command line arguments
     args = parser.parse_args()
@@ -384,29 +362,34 @@ if __name__ == "__main__":
 
         # Если указан флаг получения списка отчетов о нанесении
         if args.utilisation_reports_list:
-            from datetime import datetime, timedelta
-            from_date = (datetime.now() - timedelta(days=args.days)).strftime('%Y-%m-%d')
-            logger.info(f"Запрос отчетов о нанесении для группы {args.group} начиная с {from_date}")
+            order_id = args.order_id or args.eorder
+            if not order_id:
+                raise ValueError("Для получения списка отчетов необходимо указать --order-id или -eo")
 
-            reports_data = api.utilisation_reports_list(productGroup=args.group, fromDate=from_date)
-            reports = reports_data.get('reports', [])
+            logger.info(f"Запрос отчетов о нанесении для заказа {order_id}")
 
-            if not reports:
+            reports_data = api.utilisation_reports_list(orderId=order_id, limit=args.limit, skip=args.skip)
+            # В методе 4.4.15 возвращается "results": ["reportId1", "reportId2", ...]
+            report_ids = reports_data.get('results', [])
+
+            if not report_ids:
                 logger.info("Отчеты не найдены.")
             else:
-                for report in reports:
-                    report_id = report.get('reportId')
-                    status = report.get('status')
-                    logger.info(f"Отчет ID: {report_id}, Статус: {status}")
+                for report_id in report_ids:
+                    logger.info(f"Отчет ID: {report_id}")
 
                     try:
+                        # Получаем информацию об отчете (статус)
+                        info = api.report_info(report_id)
+                        logger.info(f"  Статус: {info.get('reportStatus')}")
+
                         codes_data = api.utilisation_codes(report_id)
                         codes = codes_data.get('sntins', [])
                         logger.info(f"  Количество КИ в отчете: {len(codes)}")
-                        for code in codes:
-                            logger.info(f"    Code: {code}")
+                        if codes:
+                            logger.info(f"    Первые 5 кодов: {codes[:5]}")
                     except Exception as e:
-                        logger.error(f"  Не удалось получить коды для отчета {report_id}: {e}")
+                        logger.error(f"  Не удалось получить данные для отчета {report_id}: {e}")
             exit()
 
         # Если указан флаг создания заказа
