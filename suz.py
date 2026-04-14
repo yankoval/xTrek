@@ -105,6 +105,122 @@ class SUZ:
                                 headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
         response.raise_for_status()
         return response.json()
+
+    def _send_signed_request(self, url: str, body_file: str, signature_file: str, max_retries: int = 3) -> requests.Response:
+        """
+        Вспомогательный метод для отправки подписанного POST запроса в СУЗ
+        """
+        import time
+        import re
+
+        if not os.path.exists(body_file):
+            raise FileNotFoundError(f"Файл с телом запроса не найден: {body_file}")
+        if not os.path.exists(signature_file):
+            raise FileNotFoundError(f"Файл с подписью не найден: {signature_file}")
+
+        # Чтение JSON тела в бинарном виде для обеспечения идентичности при отправке
+        with open(body_file, 'rb') as f:
+            body_bytes = f.read()
+
+        # Чтение подписи и удаление всех пробельных символов
+        with open(signature_file, 'r', encoding='utf-8') as f:
+            signature = f.read().strip()
+        signature = re.sub(r'\s+', '', signature)
+
+        if not signature:
+            raise ValueError("Подпись не может быть пустой")
+
+        # Формирование заголовков
+        headers = self.headers.copy()
+        headers.update({
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Signature": signature
+        })
+
+        logger.info(f"URL: {url}")
+        logger.info(f"Тело запроса (бинарное, длина): {len(body_bytes)} байт")
+
+        # Попытки с повторением при ошибке 503 или сетевых ошибках
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Попытка {attempt + 1}/{max_retries}")
+                response = requests.post(url, headers=headers, data=body_bytes, verify=False, timeout=30)
+                logger.info(f"Ответ: {response.status_code}")
+
+                if response.status_code == 200:
+                    return response
+
+                response.raise_for_status()
+            except HTTPError as e:
+                if e.response.status_code == 503 and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    logger.warning(f"Сервис недоступен (503). Повтор через {wait_time} секунд...")
+                    time.sleep(wait_time)
+                    continue
+                raise
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Ошибка сети: {str(e)}. Повтор через 5 секунд...")
+                    time.sleep(5)
+                    continue
+                raise
+        return None
+
+    def utilisation_send(self, body_file: str, signature_file: str, max_retries: int = 3) -> str:
+        """
+        Отправить отчёт об использовании (нанесении) КМ (Метод 4.4.11)
+        """
+        url = self.base_url + f'api/v3/utilisation?omsId={self.omsId}'
+        try:
+            response = self._send_signed_request(url, body_file, signature_file, max_retries)
+            if response and response.status_code == 200:
+                data = response.json()
+                return data.get('reportId', '')
+            return ""
+        except Exception as e:
+            logger.error(f"Ошибка при отправке отчета о нанесении: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                return e.response.text
+            return str(e)
+
+    def report_info(self, reportId: str):
+        """
+        Получить статус обработки отчёта (Метод 4.4.13)
+        """
+        response = requests.get(self.base_url + f'api/v3/report/info?omsId={self.omsId}&reportId={reportId}',
+                                headers=self.headers, verify=False)
+        response.raise_for_status()
+        return response.json()
+
+    def utilisation_reports_list(self, productGroup: str, fromDate: str = None, toDate: str = None,
+                                 status: str = None, limit: int = None, offset: int = None):
+        """
+        Получить список идентификаторов отчетов «Сведения о нанесении» (Метод 4.4.15)
+        """
+        params = {
+            "omsId": self.omsId,
+            "productGroup": productGroup
+        }
+        if fromDate: params["fromDate"] = fromDate
+        if toDate: params["toDate"] = toDate
+        if status: params["status"] = status
+        if limit: params["limit"] = limit
+        if offset: params["offset"] = offset
+
+        response = requests.get(self.base_url + 'api/v3/utilisation/reports',
+                                params=params, headers=self.headers, verify=False)
+        response.raise_for_status()
+        return response.json()
+
+    def utilisation_codes(self, reportId: str):
+        """
+        Получить список КИ из отчета «Сведения о нанесении» (Метод 4.4.16)
+        """
+        response = requests.get(self.base_url + f'api/v3/utilisation/codes?omsId={self.omsId}&reportId={reportId}',
+                                headers=self.headers, verify=False)
+        response.raise_for_status()
+        return response.json()
+
     def validate_order_body(self, body_data: dict) -> bool:
         """
         Валидация тела запроса для создания заказа
@@ -142,119 +258,42 @@ class SUZ:
             signature_file: путь к файлу с подписью
             max_retries: максимальное количество повторных попыток при ошибке 503
         """
-        import time
-        import re
-
-        # Чтение тела запроса из файла
-        if not os.path.exists(body_file):
-            raise FileNotFoundError(f"Файл с телом запроса не найден: {body_file}")
-
-        if not os.path.exists(signature_file):
-            raise FileNotFoundError(f"Файл с подписью не найден: {signature_file}")
-
-        # Чтение JSON тела в бинарном виде для обеспечения идентичности при отправке
-        with open(body_file, 'rb') as f:
-            body_bytes = f.read()
-
-        # Декодируем для валидации и логирования
-        try:
-            body_data = json.loads(body_bytes.decode('utf-8'))
-        except UnicodeDecodeError:
-            logger.error("Файл тела заказа не является валидным UTF-8")
-            raise
-        except json.JSONDecodeError:
-            logger.error("Файл тела заказа не является валидным JSON")
-            raise
+        # Чтение тела для валидации
+        with open(body_file, 'r', encoding='utf-8') as f:
+            body_data = json.load(f)
 
         # Валидация тела запроса
         if not self.validate_order_body(body_data):
             raise ValueError("Тело запроса не прошло валидацию")
 
-        # Чтение подписи и удаление символов новой строки
-        with open(signature_file, 'r', encoding='utf-8') as f:
-            signature = f.read().strip()
-
-        # Удаляем все пробельные символы из подписи
-        signature = re.sub(r'\s+', '', signature)
-
-        # Проверяем, что подпись не пустая
-        if not signature:
-            raise ValueError("Подпись не может быть пустой")
-
-        # Формирование заголовков
-        headers = self.headers.copy()
-        headers.update({
-            "Content-Type": "application/json; charset=utf-8",
-            "X-Signature": signature
-        })
-
         # Формирование URL
         url = self.base_url + f'api/v3/order?omsId={self.omsId}'
 
-        # Логирование для отладки
-        logger.info(f"URL: {url}")
-        logger.info(f"Заголовки (без подписи): { {k: v for k, v in headers.items() if k != 'X-Signature'} }")
-        logger.info(f"Длина подписи: {len(signature)} символов")
-        logger.info(f"Тело запроса (бинарное, длина): {len(body_bytes)} байт")
-        logger.info(f"Тело запроса (превью): {body_bytes.decode('utf-8')[:500]}...")
+        try:
+            response = self._send_signed_request(url, body_file, signature_file, max_retries)
 
-        # Попытки с повторением при ошибке 503
-        for attempt in range(max_retries):
+            if response and response.status_code == 200:
+                data = response.json()
+                return EmissionOrderreceipts(
+                    orderId=data.get('orderId'),
+                    expectedCompleteTimestamp=data.get('expectedCompleteTimestamp'),
+                    omsId=data.get('omsId')
+                )
+            return ""
+
+        except HTTPError as e:
+            logger.error(f"HTTP Error {e.response.status_code}")
+            logger.error(f"Ответ сервера: {e.response.text[:500]}...")
             try:
-                logger.info(f"Попытка {attempt + 1}/{max_retries}")
-                response = requests.post(url,
-                                        headers=headers,
-                                        data=body_bytes,
-                                        verify=False,
-                                        timeout=30)
+                error_detail = e.response.json()
+                logger.error(f"Детали ошибки: {json.dumps(error_detail, indent=2, ensure_ascii=False)}")
+            except:
+                pass
+            return str(e.response.text)
 
-                logger.info(f"Ответ: {response.status_code}")
-
-                if response.status_code == 200:
-                    data = response.json()
-                    return EmissionOrderreceipts(
-                        orderId=data.get('orderId'),
-                        expectedCompleteTimestamp=data.get('expectedCompleteTimestamp'),
-                        omsId=data.get('omsId')
-                    )
-
-                response.raise_for_status()
-                return response.json()
-
-            except HTTPError as e:
-                if e.response.status_code == 503 and attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5  # Увеличиваем время ожидания
-                    logger.warning(f"Сервис недоступен (503). Повтор через {wait_time} секунд...")
-                    time.sleep(wait_time)
-                    continue
-
-                # Для других ошибок или последней попытки при 503
-                logger.error(f"HTTP Error {e.response.status_code}")
-                logger.error(f"Ответ сервера: {e.response.text[:500]}...")
-
-                # Попробуем получить больше информации об ошибке
-                try:
-                    error_detail = e.response.json()
-                    logger.error(f"Детали ошибки: {json.dumps(error_detail, indent=2, ensure_ascii=False)}")
-                except:
-                    pass
-
-                # Вместо исключения возвращаем текст ошибки, если это последняя попытка или ошибка не 503
-                return str(e.response.text)
-
-            except requests.exceptions.Timeout:
-                logger.error(f"Таймаут запроса")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                return ""
-
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"Ошибка соединения: {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                return ""
+        except Exception as e:
+            logger.error(f"Ошибка: {str(e)}")
+            return ""
 
 # Использование
 if __name__ == "__main__":

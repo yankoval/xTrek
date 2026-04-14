@@ -55,13 +55,11 @@ class CodesBlock(SUZBase):
 
 @dataclass
 class UtilisationReport(SUZBase):
-    """Отчет о нанесении"""
-    participantId: str
+    """Отчет о нанесении (Метод 4.4.11)"""
     productGroup: str
     usageType: str  # 'VERIFIED'
     sntins: List[str]
-    productionDate: Optional[str] = None
-    expirationDate: Optional[str] = None
+    attributes: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class IntroductionReport(SUZBase):
