@@ -56,7 +56,18 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         gtin = prod_data.get('Gtin')
-        quantity = int(prod_data.get('Quantity', 0))
+
+        # Количество в заказе указано в коробках.
+        # Чтобы получить количество КМ, умножаем на количество в одной коробке (Product_PackQty)
+        boxes_qty = int(prod_data.get('Quantity', 0))
+        pack_qty_str = prod_data.get('PasportData', {}).get('Product_PackQty', '1')
+        try:
+            pack_qty = int(pack_qty_str)
+        except (ValueError, TypeError):
+            logger.warning(f"[!] Некорректный Product_PackQty: '{pack_qty_str}', используем 1")
+            pack_qty = 1
+
+        quantity = boxes_qty * pack_qty
 
         if not gtin or not quantity:
             logger.error(f"[!] Некорректные данные в производственном заказе {production_order_id}: gtin={gtin}, quantity={quantity}")
