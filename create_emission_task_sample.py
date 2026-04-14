@@ -18,7 +18,7 @@ from suz import SUZ
 from gs1_processor import get_inn_by_gtin
 from tokens import TokenProcessor
 from org_manager import OrganizationManager
-from storage import get_storage
+from storage import get_storage, LocalStorage, S3Storage
 from config_loader import load_config
 
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
@@ -155,6 +155,168 @@ def sign_and_send_emission(order: EmissionOrder, inn: str, signing_dir: str, tim
             try: signature_path.unlink()
             except: pass
 
+def get_emission_kodes(order_id: str):
+    """
+    Получает коды маркировки для заказа, если он в статусе ACTIVE и еще не обрабатывался.
+    """
+    MAX_CODES_QTY = 10000
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        emissions_path = config.get('emissions_path')
+        kodes_path = config.get('kodes')
+
+        if not all([emissions_path, kodes_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (emissions_path, kodes)")
+            return None
+
+        storage_emissions = get_storage(emissions_path, s3_config)
+
+        # Поиск файла статуса
+        target_path = None
+        if isinstance(storage_emissions, LocalStorage):
+            p = Path(emissions_path)
+            if not p.exists():
+                logger.error(f"[!] Директория {emissions_path} не существует.")
+                return None
+            matches = list(p.glob(f"{order_id}.*"))
+            if matches:
+                target_path = str(matches[0])
+        else:
+            target_path = f"{emissions_path.rstrip('/')}/{order_id}.json"
+            if not storage_emissions.exists(target_path):
+                target_path = None
+
+        if not target_path:
+            logger.error(f"[!] Файл статуса для orderId {order_id} не найден в {emissions_path}")
+            return None
+
+        # Проверка на status:processing / finished
+        is_processing = False
+        if isinstance(storage_emissions, S3Storage):
+            bucket, key = storage_emissions._parse_s3_url(target_path)
+            try:
+                resp = storage_emissions.s3.get_object_tagging(Bucket=bucket, Key=key)
+                tags = {t['Key']: t['Value'] for t in resp.get('TagSet', [])}
+                if tags.get('status') == 'processing':
+                    is_processing = True
+                if tags.get('status') == 'finished':
+                    logger.info(f"[*] Заказ {order_id} уже обработан (status:finished).")
+                    return None
+            except Exception as e:
+                logger.error(f"Ошибка при проверке тегов S3: {e}")
+        elif isinstance(storage_emissions, LocalStorage):
+            if target_path.endswith('.processing'):
+                is_processing = True
+            if target_path.endswith('.finished'):
+                logger.info(f"[*] Заказ {order_id} уже обработан (status:finished).")
+                return None
+
+        if is_processing:
+            logger.info(f"[*] Заказ {order_id} уже в обработке.")
+            return None
+
+        # Читаем данные из файла статуса
+        status_content = storage_emissions.read_text(target_path)
+        status_data = json.loads(status_content)
+        gtin = status_data.get('gtin')
+        oms_id = status_data.get('omsId')
+
+        if not gtin or not oms_id:
+            logger.error(f"[!] Не удалось получить gtin или omsId из файла {target_path}")
+            return None
+
+        # Инициализация API
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+
+        found_org = None
+        for o in org_manager.list():
+            if o.oms_id == oms_id:
+                found_org = o
+                break
+
+        if not found_org:
+            logger.error(f"[!] Организация с omsId {oms_id} не найдена в базе my_orgs.")
+            return None
+
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(found_org.inn, token_type='UUID', conid=found_org.connection_id)
+        if not token:
+            logger.error(f"[!] Активный UUID токен для ИНН {found_org.inn} не найден.")
+            return None
+
+        suz_api = SUZ(token=token, omsId=oms_id, clientToken=found_org.connection_id)
+
+        # Проверяем статус в СУЗ
+        logger.info(f"[*] Запрос актуального статуса из СУЗ для orderId: {order_id}, gtin: {gtin}")
+        try:
+            api_status_res = suz_api.order_status(order_id, gtin)
+        except Exception as api_err:
+            logger.error(f"[!] Ошибка API при запросе статуса: {api_err}")
+            return None
+
+        if not api_status_res or not isinstance(api_status_res, list):
+            logger.error(f"[!] Некорректный ответ от API: {api_status_res}")
+            return None
+
+        api_status = api_status_res[0]
+        if api_status.get('bufferStatus') != 'ACTIVE':
+            logger.info(f"[*] Заказ {order_id} имеет статус {api_status.get('bufferStatus')}, а не ACTIVE. Пропуск.")
+            return None
+
+        # Устанавливаем статус processing
+        logger.info(f"[*] Пометка заказа {order_id} как processing")
+        new_path = storage_emissions.mark_processing(target_path)
+        if isinstance(storage_emissions, LocalStorage):
+            target_path = new_path
+
+        # Получаем коды
+        available_codes = api_status.get('availableCodes', 0)
+
+        if available_codes > MAX_CODES_QTY:
+            error_msg = f"Количество доступных кодов ({available_codes}) превышает максимально допустимое ({MAX_CODES_QTY})"
+            logger.error(f"[!] {error_msg}")
+            storage_emissions.mark_error(target_path)
+            raise ValueError(error_msg)
+
+        if available_codes == 0:
+            logger.info("[*] Доступных кодов нет (availableCodes=0). Завершение.")
+            storage_emissions.mark_finished(target_path)
+            return None
+
+        logger.info(f"[*] Получение {available_codes} кодов из СУЗ...")
+        try:
+            codes_res = suz_api.codes(order_id, available_codes, gtin)
+        except Exception as codes_err:
+            logger.error(f"[!] Ошибка при получении кодов: {codes_err}")
+            storage_emissions.mark_error(target_path)
+            return None
+
+        # Сохранение кодов
+        storage_kodes = get_storage(kodes_path, s3_config)
+        output_path = f"{kodes_path.rstrip('/')}/{order_id}.json"
+
+        temp_file = Path(f"temp_codes_{order_id}.json")
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(codes_res, f, ensure_ascii=False, indent=4)
+
+        logger.info(f"[*] Выгрузка кодов в: {output_path}")
+        storage_kodes.upload(str(temp_file), output_path)
+
+        # Пометка как finished
+        logger.info(f"[*] Пометка заказа {order_id} как finished")
+        storage_emissions.mark_finished(target_path)
+
+        try: temp_file.unlink()
+        except: pass
+
+        return codes_res
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в get_emission_kodes: {e}")
+        return None
+
 def update_emission_order_status(production_order_id: str):
     """
     Получает статус заказа из СУЗ и сохраняет его в S3
@@ -279,6 +441,7 @@ def main():
     parser.add_argument("--signing_dir", default=SIGNING_DIR, help="Директория для обмена с демоном подписи")
     parser.add_argument("--timeout", type=int, default=SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
     parser.add_argument("--status", help="Получить статус заказа по productionOrderId")
+    parser.add_argument("--get-codes", help="Получить коды для заказа по orderId (UUID)")
 
     args = parser.parse_args()
 
@@ -288,6 +451,14 @@ def main():
             print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
         else:
             print(f"Результат: {result}")
+        return
+
+    if args.get_codes:
+        result = get_emission_kodes(args.get_codes)
+        if result:
+            print(f"Успешно получено кодов: {len(result.get('codes', []))}")
+        else:
+            print("Не удалось получить коды.")
         return
 
     # 1. Определяем ИНН по GTIN
