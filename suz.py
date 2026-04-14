@@ -16,6 +16,7 @@ import requests
 from requests import HTTPError
 #import pyperclip
 import json
+import urllib3
 from typing import List, Dict, Any, Generator, Union
 from suz_api_models import EmissionOrderreceipts
 from org_manager import OrganizationManager
@@ -27,6 +28,9 @@ coloredlogs.install(level=logging.DEBUG, logger=logger, isatty=True,
                     fmt="%(asctime)s %(levelname)-8s %(message)s",
                     stream=sys.stderr,
                     datefmt='%Y-%m-%d %H:%M:%S')
+
+# Отключаем предупреждения о небезопасном соединении
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class SUZ:
@@ -41,7 +45,7 @@ class SUZ:
         if not self.clientToken:
             raise ValueError("clientToken не найден")
 
-        self.base_url = f"https://suzgrid.crpt.ru/"  # order/list?omsId={omsId}
+        self.base_url = "https://suzgrid.crpt.ru"
         # В СУЗ API v3 для аутентификации используется заголовок clientToken.
         # В него передается либо динамический UUID-токен (полученный через auth),
         # либо статический Connection ID из ЛК.
@@ -52,26 +56,20 @@ class SUZ:
         }
 
     def order_list(self):
-        response = requests.get(self.base_url + f'api/v3/order/list?omsId={self.omsId}',
-                                headers=self.headers, verify=False )  # json=["0104670404500312215'!,4L"],
+        url = f"{self.base_url}/api/v3/order/list?omsId={self.omsId}"
+        response = requests.get(url, headers=self.headers, verify=False)
         response.raise_for_status()
         return response.json()
-    def order_status(self,orderId:str, gtin:str):
 
-        response = requests.get(self.base_url + f'api/v3/order/status?omsId={self.omsId}'
-                                                f'&orderId={orderId}'
-                                                f'&gtin={gtin}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
+    def order_status(self, orderId: str, gtin: str):
+        url = f"{self.base_url}/api/v3/order/status?omsId={self.omsId}&orderId={orderId}&gtin={gtin}"
+        response = requests.get(url, headers=self.headers, verify=False)
         response.raise_for_status()
         return response.json()
 
     def codes(self, orderId: str, quantity: int, gtin: str):
-
-        response = requests.get(self.base_url + f'api/v3/codes?omsId={self.omsId}'
-                                                f'&orderId={orderId}'
-                                                f'&quantity={quantity}'
-                                                f'&gtin={gtin}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
+        url = f"{self.base_url}/api/v3/codes?omsId={self.omsId}&orderId={orderId}&quantity={quantity}&gtin={gtin}"
+        response = requests.get(url, headers=self.headers, verify=False)
         response.raise_for_status()
         return response.json()
 
@@ -93,18 +91,15 @@ class SUZ:
         response.raise_for_status()
         return response.json()
 
-    def order_codes_blocks(self,orderId:str, gtin:str, verify=False):
-
-        response = requests.get(self.base_url + f'api/v3/order/codes/blocks?omsId={self.omsId}'
-                                                f'&orderId={orderId}'
-                                                f'&gtin={gtin}',
-                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
+    def order_codes_blocks(self, orderId: str, gtin: str):
+        url = f"{self.base_url}/api/v3/order/codes/blocks?omsId={self.omsId}&orderId={orderId}&gtin={gtin}"
+        response = requests.get(url, headers=self.headers, verify=False)
         response.raise_for_status()
         return response.json()
 
     def providers(self):
-        response = requests.get(self.base_url + f'api/v3/providers?omsId={self.omsId}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
+        url = f"{self.base_url}/api/v3/providers?omsId={self.omsId}"
+        response = requests.get(url, headers=self.headers, verify=False)
         response.raise_for_status()
         return response.json()
 
@@ -172,7 +167,7 @@ class SUZ:
         """
         Отправить отчёт об использовании (нанесении) КМ (Метод 4.4.11)
         """
-        url = self.base_url + f'api/v3/utilisation?omsId={self.omsId}'
+        url = f"{self.base_url}/api/v3/utilisation?omsId={self.omsId}"
         try:
             response = self._send_signed_request(url, body_file, signature_file, max_retries)
             if response and response.status_code == 200:
@@ -189,8 +184,8 @@ class SUZ:
         """
         Получить статус обработки отчёта (Метод 4.4.13)
         """
-        response = requests.get(self.base_url + f'api/v3/report/info?omsId={self.omsId}&reportId={reportId}',
-                                headers=self.headers, verify=False)
+        url = f"{self.base_url}/api/v3/report/info?omsId={self.omsId}&reportId={reportId}"
+        response = requests.get(url, headers=self.headers, verify=False)
         response.raise_for_status()
         return response.json()
 
@@ -199,8 +194,8 @@ class SUZ:
         """
         Получить список идентификаторов отчетов «Сведения о нанесении» (Метод 4.4.15)
         """
+        url = f"{self.base_url}/api/v3/utilisation/reports?omsId={self.omsId}"
         params = {
-            "omsId": self.omsId,
             "productGroup": productGroup
         }
         if fromDate: params["fromDate"] = fromDate
@@ -209,8 +204,10 @@ class SUZ:
         if limit: params["limit"] = limit
         if offset: params["offset"] = offset
 
-        response = requests.get(self.base_url + 'api/v3/utilisation/reports',
-                                params=params, headers=self.headers, verify=False)
+        logger.debug(f"GET {url} with params {params}")
+        response = requests.get(url, params=params, headers=self.headers, verify=False)
+        if response.status_code != 200:
+            logger.error(f"Error {response.status_code}: {response.text}")
         response.raise_for_status()
         return response.json()
 
@@ -218,8 +215,8 @@ class SUZ:
         """
         Получить список КИ из отчета «Сведения о нанесении» (Метод 4.4.16)
         """
-        response = requests.get(self.base_url + f'api/v3/utilisation/codes?omsId={self.omsId}&reportId={reportId}',
-                                headers=self.headers, verify=False)
+        url = f"{self.base_url}/api/v3/utilisation/codes?omsId={self.omsId}&reportId={reportId}"
+        response = requests.get(url, headers=self.headers, verify=False)
         response.raise_for_status()
         return response.json()
 
