@@ -9,7 +9,8 @@ class SUZBase:
         return {k: v for k, v in asdict(self).items() if v is not None}
     
     def to_json(self):
-        return json.dumps(self.to_dict(), ensure_ascii=False, separators=(',', ':'))
+        # Используем ensure_ascii=True, чтобы спецсимволы (ASCII 29) экранировались как \u001d
+        return json.dumps(self.to_dict(), ensure_ascii=True, separators=(',', ':'))
 
 # --- Блок Эмиссии (Заказ) ---
 
@@ -55,13 +56,24 @@ class CodesBlock(SUZBase):
 
 @dataclass
 class UtilisationReport(SUZBase):
-    """Отчет о нанесении"""
-    participantId: str
-    productGroup: str
-    usageType: str  # 'VERIFIED'
+    """Отчет о нанесении (Метод 4.4.11)"""
     sntins: List[str]
-    productionDate: Optional[str] = None
-    expirationDate: Optional[str] = None
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    productGroup: str = ""
+    usageType: Optional[str] = None
+
+@dataclass
+class UtilisationReportReceipt(SUZBase):
+    """Ответ на отправку отчета о нанесении"""
+    reportId: str
+
+@dataclass
+class UtilisationReportStatus(SUZBase):
+    """Статус обработки отчета о нанесении (Метод 4.4.13)"""
+    omsId: str
+    reportId: str
+    reportStatus: str
+    errorReason: Optional[str] = None
 
 @dataclass
 class IntroductionReport(SUZBase):

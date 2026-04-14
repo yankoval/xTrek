@@ -16,8 +16,11 @@ import requests
 from requests import HTTPError
 #import pyperclip
 import json
+import urllib3
 from typing import List, Dict, Any, Generator, Union
 from suz_api_models import EmissionOrderreceipts
+from org_manager import OrganizationManager
+from tokens import TokenProcessor
 
 # logging
 logger = logging.getLogger(__name__)
@@ -25,6 +28,9 @@ coloredlogs.install(level=logging.DEBUG, logger=logger, isatty=True,
                     fmt="%(asctime)s %(levelname)-8s %(message)s",
                     stream=sys.stderr,
                     datefmt='%Y-%m-%d %H:%M:%S')
+
+# Отключаем предупреждения о небезопасном соединении
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class SUZ:
@@ -39,7 +45,7 @@ class SUZ:
         if not self.clientToken:
             raise ValueError("clientToken не найден")
 
-        self.base_url = f"https://suzgrid.crpt.ru/"  # order/list?omsId={omsId}
+        self.base_url = "https://suzgrid.crpt.ru"
         # В СУЗ API v3 для аутентификации используется заголовок clientToken.
         # В него передается либо динамический UUID-токен (полученный через auth),
         # либо статический Connection ID из ЛК.
@@ -49,62 +55,151 @@ class SUZ:
             "Accept": "application/json"
         }
 
-    def order_list(self):
-        response = requests.get(self.base_url + f'api/v3/order/list?omsId={self.omsId}',
-                                headers=self.headers, verify=False )  # json=["0104670404500312215'!,4L"],
-        response.raise_for_status()
-        return response.json()
-    def order_status(self,orderId:str, gtin:str):
+    def _get(self, url, params=None):
+        try:
+            response = requests.get(url, params=params, headers=self.headers, verify=False)
+            if response.status_code != 200:
+                logger.debug(f"GET {url} failed with {response.status_code}: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"GET {url} failed. Status: {e.response.status_code}, Body: {e.response.text}")
+            raise
 
-        response = requests.get(self.base_url + f'api/v3/order/status?omsId={self.omsId}'
-                                                f'&orderId={orderId}'
-                                                f'&gtin={gtin}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
-        response.raise_for_status()
-        return response.json()
+    def order_list(self):
+        url = f"{self.base_url}/api/v3/order/list?omsId={self.omsId}"
+        return self._get(url)
+
+    def order_status(self, orderId: str, gtin: str):
+        url = f"{self.base_url}/api/v3/order/status?omsId={self.omsId}&orderId={orderId}&gtin={gtin}"
+        return self._get(url)
 
     def codes(self, orderId: str, quantity: int, gtin: str):
-
-        response = requests.get(self.base_url + f'api/v3/codes?omsId={self.omsId}'
-                                                f'&orderId={orderId}'
-                                                f'&quantity={quantity}'
-                                                f'&gtin={gtin}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
-        response.raise_for_status()
-        return response.json()
+        url = f"{self.base_url}/api/v3/codes?omsId={self.omsId}&orderId={orderId}&quantity={quantity}&gtin={gtin}"
+        return self._get(url)
 
     def order_codes_retry(self, blockId: str):
-        """ Метод «Получить повторно коды маркировки из заказа КМ»
-        Этот метод используется для повторного получения массива эмитированных КМ из 
-        заказа кодов маркировки в случае, если коды маркировки не были получены в результате 
-        коммуникационных ошибок или ошибок на стороне Системы, взаимодействующей с СУЗ. 
-        Метод использует следующие параметры: идентификатор СУЗ, идентификатор 
-        пакета кодов маркировки.
-        . Ограничения (Restrictions)
-        Повторно коды маркировки могут быть запрошены только в том случае, если:
-        1) они были ранее запрошены через API;
-        2) заказ кодов маркировки не был закрыт.
-        """
-        response = requests.get(self.base_url + f'api/v3/order/codes/retry?omsId={self.omsId}'
-                                                f'&blockId={blockId}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
-        response.raise_for_status()
-        return response.json()
+        """ Метод «Получить повторно коды маркировки из заказа КМ» """
+        url = f"{self.base_url}/api/v3/order/codes/retry?omsId={self.omsId}&blockId={blockId}"
+        return self._get(url)
 
-    def order_codes_blocks(self,orderId:str, gtin:str, verify=False):
-
-        response = requests.get(self.base_url + f'api/v3/order/codes/blocks?omsId={self.omsId}'
-                                                f'&orderId={orderId}'
-                                                f'&gtin={gtin}',
-                                headers=self.headers)  # json=["0104670404500312215'!,4L"],
-        response.raise_for_status()
-        return response.json()
+    def order_codes_blocks(self, orderId: str, gtin: str):
+        url = f"{self.base_url}/api/v3/order/codes/blocks?omsId={self.omsId}&orderId={orderId}&gtin={gtin}"
+        return self._get(url)
 
     def providers(self):
-        response = requests.get(self.base_url + f'api/v3/providers?omsId={self.omsId}',
-                                headers=self.headers, verify=False)  # json=["0104670404500312215'!,4L"],
-        response.raise_for_status()
-        return response.json()
+        url = f"{self.base_url}/api/v3/providers?omsId={self.omsId}"
+        return self._get(url)
+
+    def _send_signed_request(self, url: str, body_file: str, signature_file: str, max_retries: int = 3, extra_headers: dict = None) -> requests.Response:
+        """
+        Вспомогательный метод для отправки подписанного POST запроса в СУЗ
+        """
+        import time
+        import re
+
+        if not os.path.exists(body_file):
+            raise FileNotFoundError(f"Файл с телом запроса не найден: {body_file}")
+        if not os.path.exists(signature_file):
+            raise FileNotFoundError(f"Файл с подписью не найден: {signature_file}")
+
+        # Чтение JSON тела в бинарном виде для обеспечения идентичности при отправке
+        with open(body_file, 'rb') as f:
+            body_bytes = f.read()
+
+        # Чтение подписи и удаление всех пробельных символов
+        with open(signature_file, 'r', encoding='utf-8') as f:
+            signature = f.read().strip()
+        signature = re.sub(r'\s+', '', signature)
+
+        if not signature:
+            raise ValueError("Подпись не может быть пустой")
+
+        # Формирование заголовков
+        headers = self.headers.copy()
+        headers.update({
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Signature": signature
+        })
+        if extra_headers:
+            headers.update(extra_headers)
+
+        logger.info(f"URL: {url}")
+        logger.info(f"Тело запроса (бинарное, длина): {len(body_bytes)} байт")
+
+        # Попытки с повторением при ошибке 503 или сетевых ошибках
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Попытка {attempt + 1}/{max_retries}")
+                response = requests.post(url, headers=headers, data=body_bytes, verify=False, timeout=30)
+                logger.info(f"Ответ: {response.status_code}")
+
+                if response.status_code == 200:
+                    return response
+
+                response.raise_for_status()
+            except HTTPError as e:
+                if e.response.status_code == 503 and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    logger.warning(f"Сервис недоступен (503). Повтор через {wait_time} секунд...")
+                    time.sleep(wait_time)
+                    continue
+                raise
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Ошибка сети: {str(e)}. Повтор через 5 секунд...")
+                    time.sleep(5)
+                    continue
+                raise
+        return None
+
+    def utilisation_send(self, body_file: str, signature_file: str, max_retries: int = 3, orderId: str = None) -> str:
+        """
+        Отправить отчёт об использовании (нанесении) КМ (Метод 4.4.11)
+        """
+        url = f"{self.base_url}/api/v3/utilisation?omsId={self.omsId}"
+        extra_headers = {}
+        if orderId:
+            extra_headers["orderId"] = orderId
+
+        try:
+            response = self._send_signed_request(url, body_file, signature_file, max_retries, extra_headers=extra_headers)
+            if response and response.status_code == 200:
+                data = response.json()
+                return data.get('reportId', '')
+            return ""
+        except Exception as e:
+            logger.error(f"Ошибка при отправке отчета о нанесении: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                return e.response.text
+            return str(e)
+
+    def report_info(self, reportId: str):
+        """
+        Получить статус обработки отчёта (Метод 4.4.13)
+        """
+        url = f"{self.base_url}/api/v3/report/info?omsId={self.omsId}&reportId={reportId}"
+        return self._get(url)
+
+    def utilisation_reports_list(self, orderId: str, limit: int = None, skip: int = None):
+        """
+        Получить список идентификаторов отчетов «Сведения о нанесении» (Метод 4.4.15)
+        """
+        url = f"{self.base_url}/api/v3/quality?omsId={self.omsId}&orderId={orderId}"
+        params = {}
+        if limit: params["limit"] = limit
+        if skip: params["skip"] = skip
+
+        return self._get(url, params=params)
+
+    def utilisation_codes(self, reportId: str):
+        """
+        Получить список КИ из отчета «Сведения о нанесении» (Метод 4.4.16)
+        """
+        url = f"{self.base_url}/api/v3/utilisation/codes?omsId={self.omsId}&reportId={reportId}"
+        return self._get(url)
+
     def validate_order_body(self, body_data: dict) -> bool:
         """
         Валидация тела запроса для создания заказа
@@ -142,119 +237,42 @@ class SUZ:
             signature_file: путь к файлу с подписью
             max_retries: максимальное количество повторных попыток при ошибке 503
         """
-        import time
-        import re
-
-        # Чтение тела запроса из файла
-        if not os.path.exists(body_file):
-            raise FileNotFoundError(f"Файл с телом запроса не найден: {body_file}")
-
-        if not os.path.exists(signature_file):
-            raise FileNotFoundError(f"Файл с подписью не найден: {signature_file}")
-
-        # Чтение JSON тела в бинарном виде для обеспечения идентичности при отправке
-        with open(body_file, 'rb') as f:
-            body_bytes = f.read()
-
-        # Декодируем для валидации и логирования
-        try:
-            body_data = json.loads(body_bytes.decode('utf-8'))
-        except UnicodeDecodeError:
-            logger.error("Файл тела заказа не является валидным UTF-8")
-            raise
-        except json.JSONDecodeError:
-            logger.error("Файл тела заказа не является валидным JSON")
-            raise
+        # Чтение тела для валидации
+        with open(body_file, 'r', encoding='utf-8') as f:
+            body_data = json.load(f)
 
         # Валидация тела запроса
         if not self.validate_order_body(body_data):
             raise ValueError("Тело запроса не прошло валидацию")
 
-        # Чтение подписи и удаление символов новой строки
-        with open(signature_file, 'r', encoding='utf-8') as f:
-            signature = f.read().strip()
-
-        # Удаляем все пробельные символы из подписи
-        signature = re.sub(r'\s+', '', signature)
-
-        # Проверяем, что подпись не пустая
-        if not signature:
-            raise ValueError("Подпись не может быть пустой")
-
-        # Формирование заголовков
-        headers = self.headers.copy()
-        headers.update({
-            "Content-Type": "application/json; charset=utf-8",
-            "X-Signature": signature
-        })
-
         # Формирование URL
-        url = self.base_url + f'api/v3/order?omsId={self.omsId}'
+        url = f"{self.base_url}/api/v3/order?omsId={self.omsId}"
 
-        # Логирование для отладки
-        logger.info(f"URL: {url}")
-        logger.info(f"Заголовки (без подписи): { {k: v for k, v in headers.items() if k != 'X-Signature'} }")
-        logger.info(f"Длина подписи: {len(signature)} символов")
-        logger.info(f"Тело запроса (бинарное, длина): {len(body_bytes)} байт")
-        logger.info(f"Тело запроса (превью): {body_bytes.decode('utf-8')[:500]}...")
+        try:
+            response = self._send_signed_request(url, body_file, signature_file, max_retries)
 
-        # Попытки с повторением при ошибке 503
-        for attempt in range(max_retries):
+            if response and response.status_code == 200:
+                data = response.json()
+                return EmissionOrderreceipts(
+                    orderId=data.get('orderId'),
+                    expectedCompleteTimestamp=data.get('expectedCompleteTimestamp'),
+                    omsId=data.get('omsId')
+                )
+            return ""
+
+        except HTTPError as e:
+            logger.error(f"HTTP Error {e.response.status_code}")
+            logger.error(f"Ответ сервера: {e.response.text[:500]}...")
             try:
-                logger.info(f"Попытка {attempt + 1}/{max_retries}")
-                response = requests.post(url,
-                                        headers=headers,
-                                        data=body_bytes,
-                                        verify=False,
-                                        timeout=30)
+                error_detail = e.response.json()
+                logger.error(f"Детали ошибки: {json.dumps(error_detail, indent=2, ensure_ascii=False)}")
+            except:
+                pass
+            return str(e.response.text)
 
-                logger.info(f"Ответ: {response.status_code}")
-
-                if response.status_code == 200:
-                    data = response.json()
-                    return EmissionOrderreceipts(
-                        orderId=data.get('orderId'),
-                        expectedCompleteTimestamp=data.get('expectedCompleteTimestamp'),
-                        omsId=data.get('omsId')
-                    )
-
-                response.raise_for_status()
-                return response.json()
-
-            except HTTPError as e:
-                if e.response.status_code == 503 and attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5  # Увеличиваем время ожидания
-                    logger.warning(f"Сервис недоступен (503). Повтор через {wait_time} секунд...")
-                    time.sleep(wait_time)
-                    continue
-
-                # Для других ошибок или последней попытки при 503
-                logger.error(f"HTTP Error {e.response.status_code}")
-                logger.error(f"Ответ сервера: {e.response.text[:500]}...")
-
-                # Попробуем получить больше информации об ошибке
-                try:
-                    error_detail = e.response.json()
-                    logger.error(f"Детали ошибки: {json.dumps(error_detail, indent=2, ensure_ascii=False)}")
-                except:
-                    pass
-
-                # Вместо исключения возвращаем текст ошибки, если это последняя попытка или ошибка не 503
-                return str(e.response.text)
-
-            except requests.exceptions.Timeout:
-                logger.error(f"Таймаут запроса")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                return ""
-
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"Ошибка соединения: {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                return ""
+        except Exception as e:
+            logger.error(f"Ошибка: {str(e)}")
+            return ""
 
 # Использование
 if __name__ == "__main__":
@@ -276,6 +294,8 @@ if __name__ == "__main__":
                         help='Токен из ЛК УОТ/Упавление заказами/Устройства')
     parser.add_argument('-oid', '--omsid', dest='omsId', type=str,
                         help='OMS ID из ЛК УОТ/Упавление заказами/Устройства')
+    parser.add_argument('--inn', type=str,
+                        help='ИНН организации для автоматического поиска параметров')
     parser.add_argument('--create-order', action='store_true',
                         help='Создать заказ на эмиссию кодов')
     parser.add_argument('--body-file', type=str,
@@ -284,11 +304,19 @@ if __name__ == "__main__":
                         help='Путь к файлу с подписью')
     parser.add_argument('--max-retries', type=int, default=3,
                     help='Максимальное количество повторных попыток при ошибке 503')
+    parser.add_argument('--order-id', type=str, help='Идентификатор заказа (orderId)')
     parser.add_argument('-eo', '--eorder', dest='eorder', type=str, default='',
                         help='Идентификатор заказа на эмиссию для выгрузки')
     parser.add_argument('-qt', '--qty', dest='qty', type=int, default=1,
                         help='Количество кодов для выгрузки. 0 - все доступные')
+    parser.add_argument('--utilisation-reports-list', action='store_true',
+                        help='Получить список отчетов о нанесении и коды из них')
+    parser.add_argument('--group', type=str, default='chemistry',
+                        help='Товарная группа (например, для utilisation_send)')
 
+
+    parser.add_argument('--limit', type=int, help='Лимит количества отчетов')
+    parser.add_argument('--skip', type=int, help='Пропустить N отчетов')
 
     # Parse command line arguments
     args = parser.parse_args()
@@ -297,17 +325,76 @@ if __name__ == "__main__":
 
     # Получение параметров
     token = args.token or os.getenv('HONEST_SIGN_TOKEN')
-    if not token:
-        raise ValueError("Токен не найден")
     omsId = args.omsId or os.getenv('OMSID')
-    if not omsId:
-        raise ValueError("omsId не найден")
     clientToken = args.client_token or os.getenv('CLIENT_TOKEN')
+    inn = args.inn
+
+    # Автоматическое определение параметров по ИНН
+    if inn and (not token or not omsId or not clientToken):
+        logger.info(f"Поиск параметров для ИНН: {inn}")
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+
+        found_org = org_manager.find(inn=inn)
+        if not found_org:
+            # Пытаемся найти среди всех, вдруг там несколько записей
+            for o in org_manager.list():
+                if o.inn == inn and o.oms_id:
+                    found_org = o
+                    break
+
+        if found_org:
+            logger.info(f"[*] Используется профиль организации: {found_org.name}")
+            omsId = omsId or found_org.oms_id
+            clientToken = clientToken or found_org.connection_id
+
+            if not token:
+                token_processor = TokenProcessor(org_manager=org_manager)
+                token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=clientToken)
+                if token:
+                    logger.info("[*] Токен успешно получен из базы")
+
+    if not token:
+        raise ValueError("Токен не найден. Укажите --token, установите HONEST_SIGN_TOKEN или укажите --inn с настроенной базой.")
+    if not omsId:
+        raise ValueError("omsId не найден. Укажите --omsid, установите OMSID или укажите --inn с настроенной базой.")
     if not clientToken:
-        raise ValueError("CLIENT_TOKEN не найден")
+        raise ValueError("clientToken не найден. Укажите --client_token, установите CLIENT_TOKEN или укажите --inn с настроенной базой.")
 
     try:
         api = SUZ(token, omsId, clientToken)
+
+        # Если указан флаг получения списка отчетов о нанесении
+        if args.utilisation_reports_list:
+            order_id = args.order_id or args.eorder
+            if not order_id:
+                raise ValueError("Для получения списка отчетов необходимо указать --order-id или -eo")
+
+            logger.info(f"Запрос отчетов о нанесении для заказа {order_id}")
+
+            reports_data = api.utilisation_reports_list(orderId=order_id, limit=args.limit, skip=args.skip)
+            # В методе 4.4.15 возвращается "results": ["reportId1", "reportId2", ...]
+            report_ids = reports_data.get('results', [])
+
+            if not report_ids:
+                logger.info("Отчеты не найдены.")
+            else:
+                for report_id in report_ids:
+                    logger.info(f"Отчет ID: {report_id}")
+
+                    try:
+                        # Получаем информацию об отчете (статус)
+                        info = api.report_info(report_id)
+                        logger.info(f"  Статус: {info.get('reportStatus')}")
+
+                        codes_data = api.utilisation_codes(report_id)
+                        codes = codes_data.get('sntins', [])
+                        logger.info(f"  Количество КИ в отчете: {len(codes)}")
+                        if codes:
+                            logger.info(f"    Первые 5 кодов: {codes[:5]}")
+                    except Exception as e:
+                        logger.error(f"  Не удалось получить данные для отчета {report_id}: {e}")
+            exit()
 
         # Если указан флаг создания заказа
         if args.create_order:
