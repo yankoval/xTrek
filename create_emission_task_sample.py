@@ -126,8 +126,8 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
         emission_orders_path = config.get('emission_orders_path')
         emission_receipts_path = config.get('emissionReceipts')
 
-        if not emission_orders_path:
-            logger.error("[!] В конфигурации отсутствует путь emission_orders_path")
+        if not all([emission_orders_path, emission_receipts_path]):
+            logger.error(f"[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emissionReceipts)")
             return None
 
         storage_orders = get_storage(emission_orders_path, s3_config)
@@ -424,17 +424,17 @@ def update_emission_order_status(production_order_id: str):
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
-        emission_orders_path = config.get('emission_orders_path')
+        emission_receipts_path = config.get('emissionReceipts')
         production_orders_path = config.get('production_orders_path')
         emissions_path = config.get('emissions_path')
 
-        if not all([emission_orders_path, production_orders_path, emissions_path]):
-            logger.error("[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, production_orders_path, emissions_path)")
+        if not all([emission_receipts_path, production_orders_path, emissions_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (emissionReceipts, production_orders_path, emissions_path)")
             return None
 
         # 1. Загружаем чек заказа на эмиссию
-        storage_receipts = get_storage(emission_orders_path, s3_config)
-        receipt_path = f"{emission_orders_path.rstrip('/')}/{production_order_id}.json"
+        storage_receipts = get_storage(emission_receipts_path, s3_config)
+        receipt_path = f"{emission_receipts_path.rstrip('/')}/{production_order_id}.json"
 
         if not storage_receipts.exists(receipt_path):
             logger.error(f"[!] Файл чека не найден: {receipt_path}")
