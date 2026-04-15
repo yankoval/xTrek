@@ -988,10 +988,13 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         signature_path = work_dir / f"{body_filename}.sig"
 
         try:
-            with open(body_path, "w", encoding="utf-8") as f:
-                # ЧЗ требует компактный JSON (иногда критично для подписи)
-                # ensure_ascii=False может помочь, если подписывающее ПО ожидает UTF-8
-                json.dump(report_data, f, separators=(',', ':'), ensure_ascii=False)
+            with open(body_path, "wb") as f:
+                # ЧЗ крайне чувствителен к изменению тела документа после подписи.
+                # Поэтому мы используем исходные байты, загруженные из S3.
+                if isinstance(report_content, str):
+                    f.write(report_content.encode('utf-8'))
+                else:
+                    f.write(report_content)
 
             logger.info(f"[*] Ожидание подписи для {body_path}...")
             start_time = time.time()
@@ -1001,9 +1004,13 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                     return None
                 time.sleep(1)
 
-            # Читаем тело и подпись, кодируем в Base64
+            # Читаем тело и подпись как байты, кодируем в Base64
+            # Мы повторно читаем файл body_path, чтобы гарантировать
+            # побайтовую идентичность с тем, что видел демон подписи.
             with open(body_path, "rb") as f:
-                doc_base64 = base64.b64encode(f.read()).decode('utf-8')
+                doc_bytes = f.read()
+                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+
             with open(signature_path, "rb") as f:
                 sig_base64 = base64.b64encode(f.read()).decode('utf-8')
 
