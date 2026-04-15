@@ -9,6 +9,7 @@ def mock_config():
     return {
         's3_config': None,
         'equipment-tasks': '/tmp/equipment-tasks',
+        'equipment-reports': '/tmp/equipment-reports',
         'agg-tasks': '/tmp/agg-tasks'
     }
 
@@ -40,34 +41,43 @@ def test_create_aggregation_report_success(mock_config):
          patch('create_emission_task_sample.get_storage') as mock_get_storage, \
          patch('create_emission_task_sample.get_inn_by_gtin', return_value=inn):
 
-        mock_storage = MagicMock()
-        mock_get_storage.return_value = mock_storage
+        mock_storage_tasks = MagicMock()
+        mock_storage_reports = MagicMock()
+        mock_storage_agg = MagicMock()
 
-        # Mock exists and read_text for task and report
-        mock_storage.exists.side_effect = lambda path: True
+        def side_effect_get_storage(path, s3_config):
+            if path == mock_config['equipment-tasks']:
+                return mock_storage_tasks
+            if path == mock_config['equipment-reports']:
+                return mock_storage_reports
+            if path == mock_config['agg-tasks']:
+                return mock_storage_agg
+            return MagicMock()
 
-        def storage_read_text(path):
-            if task_uuid in path:
-                return json.dumps(task_data)
-            if report_uuid in path:
-                return json.dumps(report_data)
-            return ""
-        mock_storage.read_text.side_effect = storage_read_text
+        mock_get_storage.side_effect = side_effect_get_storage
 
+        # Mock task storage
+        mock_storage_tasks.exists.return_value = True
+        mock_storage_tasks.read_text.return_value = json.dumps(task_data)
+
+        # Mock report storage
+        mock_storage_reports.exists.return_value = True
+        mock_storage_reports.read_text.return_value = json.dumps(report_data)
+
+        # Mock agg storage
         uploaded_content = None
         def mock_upload(local_path, remote_path):
             nonlocal uploaded_content
             with open(local_path, 'r') as f:
                 uploaded_content = json.load(f)
-
-        mock_storage.upload.side_effect = mock_upload
+        mock_storage_agg.upload.side_effect = mock_upload
 
         result = create_aggregation_report(task_uuid)
 
         assert result == task_uuid
 
         # Verify upload was called with correct data
-        assert mock_storage.upload.called
+        assert mock_storage_agg.upload.called
         assert uploaded_content is not None
         assert uploaded_content['participantId'] == inn
         assert len(uploaded_content['aggregationUnits']) == 1

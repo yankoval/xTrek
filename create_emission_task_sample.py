@@ -15,7 +15,8 @@ from suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
     EmissionOrderStatus, ProductionOrder, PasportData,
     UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
-    AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport
+    AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
+    EquipmentAggBox
 )
 from suz import SUZ
 from trueapi import HonestSignAPI
@@ -827,45 +828,59 @@ def create_aggregation_report(task_uuid: str):
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
         equipment_tasks_path = config.get('equipment-tasks')
+        equipment_reports_path = config.get('equipment-reports')
         agg_tasks_path = config.get('agg-tasks')
 
-        if not all([equipment_tasks_path, agg_tasks_path]):
-            logger.error("[!] В конфигурации отсутствуют пути (equipment-tasks, agg-tasks)")
+        if not all([equipment_tasks_path, equipment_reports_path, agg_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (equipment-tasks, equipment-reports, agg-tasks)")
             return None
 
-        storage_equipment = get_storage(equipment_tasks_path, s3_config)
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
 
         # 1. Загружаем задание оборудования
         task_path = f"{equipment_tasks_path.rstrip('/')}/{task_uuid}.json"
-        if not storage_equipment.exists(task_path):
+        if not storage_tasks.exists(task_path):
             logger.error(f"[!] Задание оборудования не найдено: {task_path}")
             return None
 
-        task_data = json.loads(storage_equipment.read_text(task_path))
+        task_data = json.loads(storage_tasks.read_text(task_path))
+        # Заменяем дефисы на подчеркивания для совместимости с dataclass
+        task_data_clean = {k.replace('-', '_'): v for k, v in task_data.items()}
         # Фильтрация полей для dataclass
         sig_task = inspect.signature(EquipmentAggTask.__init__)
         valid_fields_task = {k for k, v in sig_task.parameters.items() if k != 'self'}
-        filtered_task_data = {k: v for k, v in task_data.items() if k in valid_fields_task}
+        filtered_task_data = {k: v for k, v in task_data_clean.items() if k in valid_fields_task}
         task_obj = EquipmentAggTask(**filtered_task_data)
 
-        # 2. Получаем ID отчета из задания и ищем сам отчет
+        # 2. Получаем ID отчета из задания и ищем сам отчет в equipment-reports
         report_uuid = task_obj.id
-        report_path = f"{equipment_tasks_path.rstrip('/')}/{report_uuid}.json"
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        report_path = f"{equipment_reports_path.rstrip('/')}/{report_uuid}.json"
 
-        if not storage_equipment.exists(report_path):
-            logger.info(f"[*] Отчет оборудования {report_uuid} еще не существует. Завершение без ошибки.")
+        if not storage_reports.exists(report_path):
+            logger.info(f"[*] Отчет оборудования {report_uuid} не найден в {equipment_reports_path}. Завершение без ошибки.")
             return None
 
-        report_data = json.loads(storage_equipment.read_text(report_path))
+        report_data = json.loads(storage_reports.read_text(report_path))
         if not report_data.get('readyBox'):
             logger.info(f"[*] Отчет {report_uuid} содержит пустой readyBox. Завершение без ошибки.")
             return None
 
         # Фильтрация полей для отчета
-        # Т.к. readyBox это список объектов, нам нужно их тоже преобразовать
-        ready_boxes = []
-        for box in report_data.get('readyBox', []):
-            ready_boxes.append(box) # Мы можем оставить их словарями для простоты или обернуть в EquipmentAggBox
+        sig_report = inspect.signature(EquipmentAggTaskReport.__init__)
+        valid_fields_report = {k for k, v in sig_report.parameters.items() if k != 'self'}
+
+        boxes_raw = report_data.get('readyBox', [])
+        boxes_objs = []
+        sig_box = inspect.signature(EquipmentAggBox.__init__)
+        valid_fields_box = {k for k, v in sig_box.parameters.items() if k != 'self'}
+        for b_dict in boxes_raw:
+            filtered_box_data = {k: v for k, v in b_dict.items() if k in valid_fields_box}
+            boxes_objs.append(EquipmentAggBox(**filtered_box_data))
+
+        filtered_report_data = {k: v for k, v in report_data.items() if k in valid_fields_report}
+        filtered_report_data['readyBox'] = boxes_objs
+        report_obj = EquipmentAggTaskReport(**filtered_report_data)
 
         # 3. Определяем ИНН по GTIN задания
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -876,8 +891,8 @@ def create_aggregation_report(task_uuid: str):
 
         # 4. Формируем целевой отчет AggregationReport
         aggregation_units = []
-        for box in report_data['readyBox']:
-            box_number = str(box.get('boxNumber', ''))
+        for box in report_obj.readyBox:
+            box_number = str(box.boxNumber)
             # Нормализация SSCC: должен быть 20 цифр, начинаться на 00
             if len(box_number) == 18:
                 box_number = "00" + box_number
@@ -886,7 +901,7 @@ def create_aggregation_report(task_uuid: str):
 
             # Очистка кодов от криптохвоста (до первого \u001d)
             clean_sntins = []
-            for code in box.get('productNumbersFull', []):
+            for code in box.productNumbersFull:
                 clean_code = code.split('\u001d')[0]
                 clean_sntins.append(clean_code)
 

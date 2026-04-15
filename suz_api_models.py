@@ -103,20 +103,20 @@ class AggregationReport(SUZBase):
 
 @dataclass
 class EquipmentAggBox(SUZBase):
-    Number: int
     boxNumber: str
-    boxTime: str
     productNumbersFull: List[str]
+    Number: Optional[int] = None
+    boxTime: Optional[str] = None
 
 @dataclass
 class EquipmentAggTaskReport(SUZBase):
     id: str
-    startTime: str
-    endTime: str
-    operator: str
-    model: str
-    build: str
     readyBox: List[EquipmentAggBox]
+    startTime: Optional[str] = None
+    endTime: Optional[str] = None
+    operator: Optional[str] = None
+    model: Optional[str] = None
+    build: Optional[str] = None
 
 @dataclass
 class EquipmentAggTask(SUZBase):
