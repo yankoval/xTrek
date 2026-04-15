@@ -109,6 +109,30 @@ class HonestSignAPI:
             logger.warning(f"Ошибка кода {code}: {e}")
             return {"code": code, "error": str(e)}
 
+    def documents_create(self, document_json: str, pg: str) -> Dict[str, Any]:
+        """
+        Отправка отчета в ЛК ЧЗ (Метод /api/v3/true-api/lk/documents/create)
+        """
+        url = f"{self.host}/api/v3/true-api/lk/documents/create"
+        params = {"pg": pg}
+        try:
+            logger.info(f"Отправка документа в ЛК (pg={pg})...")
+            response = requests.post(
+                url,
+                data=document_json.encode('utf-8'),
+                params=params,
+                headers=self.headers,
+                verify=False
+            )
+            logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Ошибка при отправке документа: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Ответ сервера: {e.response.text}")
+            return {"error": str(e)}
+
     def get_codes_from_clipboard(self) -> List[str]:
         clipboard_text = pyperclip.paste()
         return [line.strip() for line in clipboard_text.split('\n') if line.strip()]

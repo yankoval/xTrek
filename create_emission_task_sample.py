@@ -14,9 +14,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
     EmissionOrderStatus, ProductionOrder, PasportData,
-    UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus
+    UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
+    AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport
 )
 from suz import SUZ
+from trueapi import HonestSignAPI
 from gs1_processor import get_inn_by_gtin
 from tokens import TokenProcessor
 from org_manager import OrganizationManager
@@ -817,6 +819,163 @@ def update_emission_order_status(production_order_id: str):
         logger.error(f"[!] Ошибка в update_emission_order_status: {e}")
         return str(e)
 
+def create_aggregation_report(task_uuid: str):
+    """
+    Создает отчет об агрегации для ЛК на основе отчета оборудования.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        equipment_tasks_path = config.get('equipment-tasks')
+        agg_tasks_path = config.get('agg-tasks')
+
+        if not all([equipment_tasks_path, agg_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (equipment-tasks, agg-tasks)")
+            return None
+
+        storage_equipment = get_storage(equipment_tasks_path, s3_config)
+
+        # 1. Загружаем задание оборудования
+        task_path = f"{equipment_tasks_path.rstrip('/')}/{task_uuid}.json"
+        if not storage_equipment.exists(task_path):
+            logger.error(f"[!] Задание оборудования не найдено: {task_path}")
+            return None
+
+        task_data = json.loads(storage_equipment.read_text(task_path))
+        # Фильтрация полей для dataclass
+        sig_task = inspect.signature(EquipmentAggTask.__init__)
+        valid_fields_task = {k for k, v in sig_task.parameters.items() if k != 'self'}
+        filtered_task_data = {k: v for k, v in task_data.items() if k in valid_fields_task}
+        task_obj = EquipmentAggTask(**filtered_task_data)
+
+        # 2. Получаем ID отчета из задания и ищем сам отчет
+        report_uuid = task_obj.id
+        report_path = f"{equipment_tasks_path.rstrip('/')}/{report_uuid}.json"
+
+        if not storage_equipment.exists(report_path):
+            logger.info(f"[*] Отчет оборудования {report_uuid} еще не существует. Завершение без ошибки.")
+            return None
+
+        report_data = json.loads(storage_equipment.read_text(report_path))
+        if not report_data.get('readyBox'):
+            logger.info(f"[*] Отчет {report_uuid} содержит пустой readyBox. Завершение без ошибки.")
+            return None
+
+        # Фильтрация полей для отчета
+        # Т.к. readyBox это список объектов, нам нужно их тоже преобразовать
+        ready_boxes = []
+        for box in report_data.get('readyBox', []):
+            ready_boxes.append(box) # Мы можем оставить их словарями для простоты или обернуть в EquipmentAggBox
+
+        # 3. Определяем ИНН по GTIN задания
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        inn = get_inn_by_gtin(task_obj.gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН для GTIN {task_obj.gtin}")
+            return None
+
+        # 4. Формируем целевой отчет AggregationReport
+        aggregation_units = []
+        for box in report_data['readyBox']:
+            box_number = str(box.get('boxNumber', ''))
+            # Нормализация SSCC: должен быть 20 цифр, начинаться на 00
+            if len(box_number) == 18:
+                box_number = "00" + box_number
+            elif len(box_number) == 20 and not box_number.startswith("00"):
+                logger.warning(f"[*] Странный формат boxNumber (20 знаков, не 00...): {box_number}")
+
+            # Очистка кодов от криптохвоста (до первого \u001d)
+            clean_sntins = []
+            for code in box.get('productNumbersFull', []):
+                clean_code = code.split('\u001d')[0]
+                clean_sntins.append(clean_code)
+
+            unit = AggregationUnit(
+                unitSerialNumber=box_number,
+                aggregationType="AGGREGATION",
+                sntins=clean_sntins
+            )
+            aggregation_units.append(unit)
+
+        final_report = AggregationReport(
+            participantId=inn,
+            aggregationUnits=aggregation_units
+        )
+
+        # 5. Сохраняем итоговый отчет
+        storage_agg = get_storage(agg_tasks_path, s3_config)
+        output_path = f"{agg_tasks_path.rstrip('/')}/{task_uuid}.json"
+
+        temp_local = Path(f"temp_agg_{task_uuid}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(final_report.to_json())
+
+        logger.info(f"[*] Выгрузка отчета об агрегации в S3: {output_path}")
+        storage_agg.upload(str(temp_local), output_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return task_uuid
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_aggregation_report: {e}")
+        return None
+
+def send_aggregation_report(task_uuid: str, group: str):
+    """
+    Загружает отчет об агрегации и отправляет его в ЛК ЧЗ
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        agg_tasks_path = config.get('agg-tasks')
+
+        if not agg_tasks_path:
+            logger.error("[!] В конфигурации отсутствует путь agg-tasks")
+            return None
+
+        storage_agg = get_storage(agg_tasks_path, s3_config)
+        report_path = f"{agg_tasks_path.rstrip('/')}/{task_uuid}.json"
+
+        if not storage_agg.exists(report_path):
+            logger.error(f"[!] Файл отчета об агрегации не найден: {report_path}")
+            return None
+
+        report_content = storage_agg.read_text(report_path)
+        report_data = json.loads(report_content)
+        inn = report_data.get('participantId')
+
+        if not inn:
+            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
+            return None
+
+        # Получаем токен
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+
+        # Для ЛК нужен JWT токен
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        if not token:
+            logger.error(f"[!] Активный JWT токен для ИНН {inn} не найден.")
+            return None
+
+        # Отправка через TrueAPI
+        api = HonestSignAPI(token=token)
+        result = api.documents_create(report_content, pg=group)
+
+        if result and "error" not in str(result).lower():
+            logger.info(f"[+++] Отчет об агрегации успешно отправлен в ЛК! Результат: {result}")
+            return result
+        else:
+            logger.error(f"[!] Ошибка отправки отчета в ЛК: {result}")
+            return result
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в send_aggregation_report: {e}")
+        return None
+
 def update_utilisation_report_status(order_id: str):
     """
     Получает актуальный статус отчета о нанесении из СУЗ и сохраняет в S3/Локально.
@@ -919,6 +1078,8 @@ def main():
     parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
     parser.add_argument("--send-utilisation", help="Подписать и отправить отчет о нанесении по orderId (UUID)")
     parser.add_argument("--utilisation-status", help="Получить статус отчета о нанесении по orderId (UUID)")
+    parser.add_argument("--create-aggregation", help="Создать отчет об агрегации для ЛК по UUID задания оборудования")
+    parser.add_argument("--send-aggregation", help="Отправить отчет об агрегации в ЛК по UUID задания оборудования")
 
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
@@ -994,6 +1155,23 @@ def main():
             print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
         else:
             print(f"Результат: {result}")
+        return
+
+    if args.create_aggregation:
+        result = create_aggregation_report(args.create_aggregation)
+        if result:
+            logger.info(f"[+++] Отчет об агрегации успешно создан для {result}")
+        else:
+            logger.error(f"[!] Не удалось создать отчет об агрегации для {args.create_aggregation}")
+        return
+
+    if args.send_aggregation:
+        result = send_aggregation_report(args.send_aggregation, args.group)
+        if result and "error" not in str(result).lower():
+            logger.info(f"[+++] Отчет об агрегации успешно отправлен!")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            logger.error(f"[!] Не удалось отправить отчет об агрегации.")
         return
 
     parser.print_help()

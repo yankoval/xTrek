@@ -96,10 +96,50 @@ class AggregationUnit(SUZBase):
 @dataclass
 class AggregationReport(SUZBase):
     participantId: str
-    productGroup: str
     aggregationUnits: List[AggregationUnit]
+    productGroup: Optional[str] = None
 
 # --- Новые модели для работы со статусами и производственными заказами ---
+
+@dataclass
+class EquipmentAggBox(SUZBase):
+    Number: int
+    boxNumber: str
+    boxTime: str
+    productNumbersFull: List[str]
+
+@dataclass
+class EquipmentAggTaskReport(SUZBase):
+    id: str
+    startTime: str
+    endTime: str
+    operator: str
+    model: str
+    build: str
+    readyBox: List[EquipmentAggBox]
+
+@dataclass
+class EquipmentAggTask(SUZBase):
+    id: str
+    gtin: str
+    date: Optional[str] = None
+    lineNum: Optional[str] = None
+    isGroup: Optional[bool] = None
+    lotNo: Optional[str] = None
+    expDate: Optional[str] = None
+    addProdInfo: Optional[str] = None
+    numPacksInBox: Optional[int] = None
+    numLayersInBox: Optional[int] = None
+    maxNoRead: Optional[int] = None
+    urlLabelProductTemplate: Optional[str] = None
+    urlLabelBoxTemplate: Optional[str] = None
+    numLabelAtBox: Optional[int] = None
+    lengthBox: Optional[float] = None
+    numPacksInParcel: Optional[int] = None
+    boxLabelFields: List[Dict[str, Any]] = field(default_factory=list)
+    productNumbers: List[str] = field(default_factory=list)
+    boxNumbers: List[str] = field(default_factory=list)
+    task_export_signed_link: Optional[str] = None
 
 @dataclass
 class PasportData(SUZBase):
