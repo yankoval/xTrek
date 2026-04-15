@@ -88,18 +88,66 @@ class IntroductionReport(SUZBase):
 
 @dataclass
 class AggregationUnit(SUZBase):
-    unitSerialNumber: str
-    aggregationType: str = "AGGREGATION"
     sntins: List[str] = field(default_factory=list) # Для товаров
-    unitSerialNumberList: List[str] = field(default_factory=list) # Для вложенных коробов
+    aggregationType: str = "AGGREGATION"
+    unitSerialNumber: str = ""
+    unitSerialNumberList: Optional[List[str]] = None # Для вложенных коробов
 
 @dataclass
 class AggregationReport(SUZBase):
-    participantId: str
-    productGroup: str
     aggregationUnits: List[AggregationUnit]
+    participantId: str
+    productGroup: Optional[str] = None
+
+@dataclass
+class DocumentWrapper(SUZBase):
+    document_format: str
+    product_document: str
+    type: str
+    signature: str
 
 # --- Новые модели для работы со статусами и производственными заказами ---
+
+@dataclass
+class EquipmentAggBox(SUZBase):
+    boxNumber: str
+    productNumbersFull: List[str]
+    Number: Optional[int] = None
+    boxTime: Optional[str] = None
+
+@dataclass
+class EquipmentAggTaskReport(SUZBase):
+    id: str
+    readyBox: List[EquipmentAggBox]
+    startTime: Optional[str] = None
+    endTime: Optional[str] = None
+    operator: Optional[str] = None
+    model: Optional[str] = None
+    build: Optional[str] = None
+
+@dataclass
+class EquipmentAggTask(SUZBase):
+    id: str
+    gtin: str
+    date: Optional[str] = None
+    lineNum: Optional[str] = None
+    isGroup: Optional[bool] = None
+    lotNo: Optional[str] = None
+    expDate: Optional[str] = None
+    addProdInfo: Optional[str] = None
+    numPacksInBox: Optional[int] = None
+    numРacksInBox: Optional[int] = None # Cyrillic 'P' as in user example
+    numLayersInBox: Optional[int] = None
+    maxNoRead: Optional[int] = None
+    urlLabelProductTemplate: Optional[str] = None
+    urlLabelBoxTemplate: Optional[str] = None
+    numLabelAtBox: Optional[int] = None
+    lengthBox: Optional[float] = None
+    numPacksInParcel: Optional[int] = None
+    boxLabelFields: List[Dict[str, Any]] = field(default_factory=list)
+    productNumbers: List[str] = field(default_factory=list)
+    boxNumbers: List[str] = field(default_factory=list)
+    task_export_signed_link: Optional[str] = None
 
 @dataclass
 class PasportData(SUZBase):
