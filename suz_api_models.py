@@ -76,13 +76,26 @@ class UtilisationReportStatus(SUZBase):
     errorReason: Optional[str] = None
 
 @dataclass
-class IntroductionReport(SUZBase):
-    """Сообщение о вводе в оборот"""
-    participantId: str
-    productGroup: str
-    sntins: List[str]
-    productionDate: str
-    # Для разных ТГ могут добавляться доп. поля через dict
+class GtinDocument(SUZBase):
+    certificate_date: str
+    certificate_number: str
+    certificate_type: str
+
+@dataclass
+class IntroduceProduct(SUZBase):
+    uit_code: str
+    tnved_code: str
+    certificate_document_data: List[GtinDocument]
+
+@dataclass
+class IntroduceMessage(SUZBase):
+    """Сообщение о вводе в оборот (True API)"""
+    production_type: str = "OWN_PRODUCTION"
+    production_date: str = ""
+    owner_inn: str = ""
+    producer_inn: str = ""
+    participant_inn: str = ""
+    products: List[IntroduceProduct] = field(default_factory=list)
 
 # --- Блок Агрегации ---
 

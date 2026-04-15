@@ -17,10 +17,11 @@ from suz_api_models import (
     EmissionOrderStatus, ProductionOrder, PasportData,
     UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
-    EquipmentAggBox, DocumentWrapper
+    EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
 )
 from suz import SUZ
 from trueapi import HonestSignAPI
+from nkapi import NK
 from gs1_processor import get_inn_by_gtin
 from tokens import TokenProcessor
 from crpt_auth import get_new_token
@@ -1182,6 +1183,288 @@ def update_utilisation_report_status(order_id: str):
         return str(e)
 
 
+def create_introduce_task(order_id: str, group: str = None, production_date: str = None):
+    """
+    Создает сообщение о вводе в оборот на основании выгруженных кодов.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        kodes_path = config.get('kodes')
+        introduce_tasks_path = config.get('introduce-tasks')
+        emission_receipts_path = config.get('emission_receipts')
+        production_orders_path = config.get('production_orders_path')
+
+        if not all([kodes_path, introduce_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (kodes, introduce-tasks)")
+            return None
+
+        storage_kodes = get_storage(kodes_path, s3_config)
+        kodes_file_path = f"{kodes_path.rstrip('/')}/{order_id}.json"
+
+        if not storage_kodes.exists(kodes_file_path):
+            logger.error(f"[!] Файл кодов не найден: {kodes_file_path}")
+            return None
+
+        codes_data = json.loads(storage_kodes.read_text(kodes_file_path))
+        codes = codes_data.get('codes', [])
+
+        if not codes:
+            logger.error(f"[!] В файле {kodes_file_path} нет кодов")
+            return None
+
+        # 1. Поиск даты производства и GTIN
+        auto_prod_date = production_date
+        gtin = None
+
+        # Определяем GTIN по первому коду
+        first_code = codes[0]
+        if first_code.startswith('01'):
+            gtin = first_code[2:16]
+        else:
+            logger.error(f"[!] Не удалось определить GTIN из кода: {first_code}")
+            return None
+
+        storage_receipts = get_storage(emission_receipts_path, s3_config)
+        production_order_id = None
+        found_group = group
+
+        # Ищем в чеках для получения productionOrderId
+        if isinstance(storage_receipts, LocalStorage):
+            for f in Path(emission_receipts_path).glob("*.json"):
+                try:
+                    data = json.loads(f.read_text(encoding='utf-8'))
+                    if data.get('orderId') == order_id:
+                        production_order_id = f.stem.replace('receipt_', '')
+                        break
+                except: continue
+        else:
+            try:
+                bucket, prefix = storage_receipts._parse_s3_url(emission_receipts_path)
+                res = storage_receipts.s3.list_objects_v2(Bucket=bucket, Prefix=prefix.strip('/') + '/')
+                for obj in res.get('Contents', []):
+                    if obj['Key'].endswith('.json'):
+                        data = json.loads(storage_receipts.read_text(f"s3://{bucket}/{obj['Key']}"))
+                        if data.get('orderId') == order_id:
+                            production_order_id = Path(obj['Key']).stem.replace('receipt_', '')
+                            break
+            except: pass
+
+        if production_order_id:
+            # Пытаемся получить группу из заказа на эмиссию
+            storage_em_orders = get_storage(emission_orders_path, s3_config)
+            em_order_path = f"{emission_orders_path.rstrip('/')}/{production_order_id}.json"
+            if storage_em_orders.exists(em_order_path):
+                em_data = json.loads(storage_em_orders.read_text(em_order_path))
+                found_group = em_data.get('productGroup') or found_group
+                logger.info(f"[*] Определена товарная группа из заказа: {found_group}")
+
+            storage_prod = get_storage(production_orders_path, s3_config)
+            prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+            if storage_prod.exists(prod_path):
+                prod_data = json.loads(storage_prod.read_text(prod_path))
+                if not auto_prod_date:
+                    auto_prod_date = format_date_suz(prod_data.get('PasportData', {}).get('Batch_date_production'))
+
+        if not auto_prod_date:
+            logger.error("[!] Не удалось определить дату производства (ни из CLI, ни из заказа)")
+            return None
+
+        # 2. Получаем ИНН
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}")
+            return None
+
+        # 3. Получаем данные из НК (ТН ВЭД и разрешительные документы)
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+             # Попробуем получить новый если нет
+             token = get_new_token(inn=inn, mode='jwt')
+             if token: token_processor.save_token(token)
+
+        if not token:
+            logger.error(f"[!] JWT токен для ИНН {inn} не найден, не удалось получить данные из НК")
+            return None
+
+        nk = NK(token=token)
+        product_info = nk.get_set_by_gtin(gtin)
+        if not product_info:
+            logger.error(f"[!] Не удалось получить информацию о товаре из НК для GTIN {gtin}")
+            return None
+
+        tnved = product_info.get('tnved_code') or product_info.get('result', {}).get('tnvedCode')
+        if not tnved:
+            # Попробуем из feedProduct
+            feed = nk.feedProduct(gtin)
+            if feed:
+                tnved = feed.get('tnved_code') or feed.get('result', {}).get('tnvedCode')
+
+        if not tnved:
+            logger.error(f"[!] Не удалось получить код ТН ВЭД для GTIN {gtin}")
+            return None
+
+        permits = nk.get_permit_document_by_gtin(gtin, inn)
+        if not permits:
+            logger.warning(f"[!] Разрешительные документы для GTIN {gtin} не найдены")
+            # Продолжаем или нет? Обычно они нужны. В примере они есть.
+
+        # 4. Формируем сообщение
+        introduce_products = []
+        for code in codes:
+            introduce_products.append(IntroduceProduct(
+                uit_code=code,
+                tnved_code=tnved,
+                certificate_document_data=permits
+            ))
+
+        message = IntroduceMessage(
+            production_date=auto_prod_date,
+            owner_inn=inn,
+            producer_inn=inn,
+            participant_inn=inn,
+            products=introduce_products
+        )
+
+        # 5. Сохраняем
+        storage_intro = get_storage(introduce_tasks_path, s3_config)
+        remote_path = f"{introduce_tasks_path.rstrip('/')}/{order_id}.json"
+
+        temp_local = Path(f"temp_intro_{order_id}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(message.to_json())
+
+        logger.info(f"[*] Выгрузка задачи на ввод в оборот в S3: {remote_path}")
+        storage_intro.upload(str(temp_local), remote_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return order_id
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_introduce_task: {e}")
+        return None
+
+def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False):
+    """
+    Подписывает и отправляет сообщение о вводе в оборот в ЛК ЧЗ.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        introduce_tasks_path = config.get('introduce-tasks')
+        introduce_receipts_path = config.get('introduce-receipts')
+
+        if not introduce_tasks_path:
+            logger.error("[!] В конфигурации отсутствует путь introduce-tasks")
+            return None
+
+        storage_intro = get_storage(introduce_tasks_path, s3_config)
+        task_path = f"{introduce_tasks_path.rstrip('/')}/{order_id}.json"
+
+        if not storage_intro.exists(task_path):
+            logger.error(f"[!] Файл задачи на ввод в оборот не найден: {task_path}")
+            return None
+
+        # Читаем задачу
+        task_content = storage_intro.read_text(task_path)
+        task_data = json.loads(task_content)
+        inn = task_data.get('owner_inn')
+
+        if not inn:
+            logger.error(f"[!] Не найден owner_inn в задаче {order_id}")
+            return None
+
+        # Токен
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+
+        token = None
+        if not refresh_token:
+            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            token = get_new_token(inn=inn, mode='jwt', timeout=timeout)
+            if token: token_processor.save_token(token)
+
+        if not token:
+            logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}")
+            return None
+
+        # Подпись
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_introduce.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
+
+        try:
+            with open(body_path, "wb") as f:
+                if isinstance(task_content, str):
+                    f.write(task_content.encode('utf-8'))
+                else:
+                    f.write(task_content)
+
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    return None
+                time.sleep(1)
+
+            with open(body_path, "rb") as f:
+                doc_bytes = f.read()
+                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+
+            with open(signature_path, "r", encoding="utf-8") as f:
+                sig_base64 = f.read().strip()
+
+            wrapper = DocumentWrapper(
+                document_format="MANUAL",
+                product_document=doc_base64,
+                type="LP_INTRODUCE_GOODS", # Тип документа для ввода в оборот
+                signature=sig_base64
+            )
+
+            api = HonestSignAPI(token=token)
+            result = api.documents_create(wrapper.to_json(), pg=group)
+
+            if result and "error" not in str(result).lower():
+                logger.info(f"[+++] Сообщение о вводе в оборот успешно отправлено! ID: {result}")
+
+                if introduce_receipts_path:
+                    storage_receipts = get_storage(introduce_receipts_path, s3_config)
+                    remote_receipt_path = f"{introduce_receipts_path.rstrip('/')}/{order_id}.json"
+
+                    temp_receipt = work_dir / f"receipt_intro_{unique_id}.json"
+                    with open(temp_receipt, 'w', encoding='utf-8') as f:
+                        json.dump(result, f, indent=4, ensure_ascii=False)
+
+                    storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                    try: temp_receipt.unlink()
+                    except: pass
+
+                return result
+            else:
+                logger.error(f"[!] Ошибка отправки: {result}")
+                return result
+
+        finally:
+            if body_path.exists(): body_path.unlink()
+            if signature_path.exists(): signature_path.unlink()
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в sign_and_send_introduce: {e}")
+        return None
+
 def update_aggregation_status(task_uuid: str, group: str):
     """
     Получает актуальный статус документа агрегации из ЛК ЧЗ и сохраняет чек.
@@ -1294,6 +1577,8 @@ def main():
     parser.add_argument("--create-aggregation", help="Создать отчет об агрегации для ЛК по UUID задания оборудования")
     parser.add_argument("--send-aggregation", help="Отправить отчет об агрегации в ЛК по UUID задания оборудования")
     parser.add_argument("--aggregation-status", help="Получить статус отчета об агрегации по UUID задания оборудования")
+    parser.add_argument("--create-introduce", help="Создать задачу на ввод в оборот по orderId (UUID)")
+    parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
 
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
@@ -1408,6 +1693,25 @@ def main():
             print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
             print(f"Результат: {result}")
+        return
+
+    if args.create_introduce:
+        result = create_introduce_task(args.create_introduce, args.group,
+                                     production_date=args.production_date)
+        if result:
+            logger.info(f"[+++] Задача на ввод в оборот успешно создана для {result}")
+        else:
+            logger.error(f"[!] Не удалось создать задачу для {args.create_introduce}")
+        return
+
+    if args.send_introduce:
+        result = sign_and_send_introduce(args.send_introduce, args.group, args.signing_dir, args.timeout,
+                                        refresh_token=args.refresh_token)
+        if result and "error" not in str(result).lower():
+            logger.info(f"[+++] Отчет о вводе в оборот успешно отправлен!")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            logger.error(f"[!] Не удалось отправить отчет о вводе в оборот.")
         return
 
     parser.print_help()
