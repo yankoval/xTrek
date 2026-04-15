@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import requests
 import pyperclip
 import logging
@@ -126,12 +127,18 @@ class HonestSignAPI:
                 verify=False
             )
             logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
-            response.raise_for_status()
-            return response.json()
+
+            if response.status_code >= 400:
+                logger.error(f"Ошибка API (Status {response.status_code}): {response.text}")
+                return {"error": response.text, "status_code": response.status_code}
+
+            try:
+                return response.json()
+            except json.JSONDecodeError:
+                # Если сервер вернул ID документа просто строкой (бывает в True API)
+                return {"document_id": response.text.strip('"')}
         except Exception as e:
             logger.error(f"Ошибка при отправке документа: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Ответ сервера: {e.response.text}")
             return {"error": str(e)}
 
     def get_codes_from_clipboard(self) -> List[str]:

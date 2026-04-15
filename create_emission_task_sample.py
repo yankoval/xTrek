@@ -951,6 +951,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             logger.error("[!] В конфигурации отсутствует путь agg-tasks")
             return None
 
+        # 1. Сначала загружаем отчет и проверяем ИНН
         storage_agg = get_storage(agg_tasks_path, s3_config)
         report_path = f"{agg_tasks_path.rstrip('/')}/{task_uuid}.json"
 
@@ -958,6 +959,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             logger.error(f"[!] Файл отчета об агрегации не найден: {report_path}")
             return None
 
+        logger.info(f"[*] Загрузка отчета {task_uuid} из {report_path}...")
         report_content = storage_agg.read_text(report_path)
         report_data = json.loads(report_content)
         inn = report_data.get('participantId')
@@ -966,7 +968,17 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
             return None
 
-        # Подготовка к подписи
+        # 2. Проверяем токен ДО цикла подписи, чтобы не ждать зря
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        if not token:
+            logger.error(f"[!] Активный JWT токен для ИНН {inn} не найден. Сначала выполните авторизацию.")
+            return None
+
+        # 3. Подготовка к подписи
         work_dir = Path(signing_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
         unique_id = uuid.uuid4()
@@ -1000,16 +1012,6 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                 type="AGGREGATION_DOCUMENT",
                 signature=sig_base64
             )
-
-            # Получаем токен
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
-            token_processor = TokenProcessor(org_manager=org_manager)
-
-            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
-            if not token:
-                logger.error(f"[!] Активный JWT токен для ИНН {inn} не найден.")
-                return None
 
             # Отправка через TrueAPI
             api = HonestSignAPI(token=token)
