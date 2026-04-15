@@ -109,9 +109,10 @@ class HonestSignAPI:
             logger.warning(f"Ошибка кода {code}: {e}")
             return {"code": code, "error": str(e)}
 
-    def documents_create(self, document_json: str, pg: str) -> Dict[str, Any]:
+    def documents_create(self, wrapped_document_json: str, pg: str) -> Dict[str, Any]:
         """
         Отправка отчета в ЛК ЧЗ (Метод /api/v3/true-api/lk/documents/create)
+        Ожидает в качестве document_json обертку с base64 телом и подписью.
         """
         url = f"{self.host}/api/v3/true-api/lk/documents/create"
         params = {"pg": pg}
@@ -119,7 +120,7 @@ class HonestSignAPI:
             logger.info(f"Отправка документа в ЛК (pg={pg})...")
             response = requests.post(
                 url,
-                data=document_json.encode('utf-8'),
+                data=wrapped_document_json.encode('utf-8'),
                 params=params,
                 headers=self.headers,
                 verify=False

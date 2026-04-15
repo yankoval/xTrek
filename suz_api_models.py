@@ -99,6 +99,13 @@ class AggregationReport(SUZBase):
     aggregationUnits: List[AggregationUnit]
     productGroup: Optional[str] = None
 
+@dataclass
+class DocumentWrapper(SUZBase):
+    document_format: str
+    product_document: str
+    type: str
+    signature: str
+
 # --- Новые модели для работы со статусами и производственными заказами ---
 
 @dataclass

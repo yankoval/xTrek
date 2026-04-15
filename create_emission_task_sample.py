@@ -11,12 +11,13 @@ from pathlib import Path
 # Добавляем текущую директорию в путь поиска модулей
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import base64
 from suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
     EmissionOrderStatus, ProductionOrder, PasportData,
     UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
-    EquipmentAggBox
+    EquipmentAggBox, DocumentWrapper
 )
 from suz import SUZ
 from trueapi import HonestSignAPI
@@ -937,9 +938,9 @@ def create_aggregation_report(task_uuid: str):
         logger.error(f"[!] Ошибка в create_aggregation_report: {e}")
         return None
 
-def send_aggregation_report(task_uuid: str, group: str):
+def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, timeout: int):
     """
-    Загружает отчет об агрегации и отправляет его в ЛК ЧЗ
+    Загружает отчет об агрегации, подписывает его и отправляет в ЛК ЧЗ в обертке.
     """
     try:
         config = load_config('suz_worker_config')
@@ -965,30 +966,68 @@ def send_aggregation_report(task_uuid: str, group: str):
             logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
             return None
 
-        # Получаем токен
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
-        token_processor = TokenProcessor(org_manager=org_manager)
+        # Подготовка к подписи
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_agg.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
 
-        # Для ЛК нужен JWT токен
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
-        if not token:
-            logger.error(f"[!] Активный JWT токен для ИНН {inn} не найден.")
-            return None
+        try:
+            with open(body_path, "w", encoding="utf-8") as f:
+                # ЧЗ требует компактный JSON (иногда критично для подписи)
+                json.dump(report_data, f, separators=(',', ':'))
 
-        # Отправка через TrueAPI
-        api = HonestSignAPI(token=token)
-        result = api.documents_create(report_content, pg=group)
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    return None
+                time.sleep(1)
 
-        if result and "error" not in str(result).lower():
-            logger.info(f"[+++] Отчет об агрегации успешно отправлен в ЛК! Результат: {result}")
-            return result
-        else:
-            logger.error(f"[!] Ошибка отправки отчета в ЛК: {result}")
-            return result
+            # Читаем тело и подпись, кодируем в Base64
+            with open(body_path, "rb") as f:
+                doc_base64 = base64.b64encode(f.read()).decode('utf-8')
+            with open(signature_path, "rb") as f:
+                sig_base64 = base64.b64encode(f.read()).decode('utf-8')
+
+            # Создаем обертку
+            wrapper = DocumentWrapper(
+                document_format="JSON",
+                product_document=doc_base64,
+                type="AGGREGATION_DOCUMENT",
+                signature=sig_base64
+            )
+
+            # Получаем токен
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+            token_processor = TokenProcessor(org_manager=org_manager)
+
+            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+            if not token:
+                logger.error(f"[!] Активный JWT токен для ИНН {inn} не найден.")
+                return None
+
+            # Отправка через TrueAPI
+            api = HonestSignAPI(token=token)
+            result = api.documents_create(wrapper.to_json(), pg=group)
+
+            if result and "error" not in str(result).lower():
+                logger.info(f"[+++] Отчет об агрегации успешно отправлен в ЛК! Результат: {result}")
+                return result
+            else:
+                logger.error(f"[!] Ошибка отправки отчета в ЛК: {result}")
+                return result
+
+        finally:
+            if body_path.exists(): body_path.unlink()
+            if signature_path.exists(): signature_path.unlink()
 
     except Exception as e:
-        logger.error(f"[!] Ошибка в send_aggregation_report: {e}")
+        logger.error(f"[!] Ошибка в sign_and_send_aggregation: {e}")
         return None
 
 def update_utilisation_report_status(order_id: str):
@@ -1181,7 +1220,7 @@ def main():
         return
 
     if args.send_aggregation:
-        result = send_aggregation_report(args.send_aggregation, args.group)
+        result = sign_and_send_aggregation(args.send_aggregation, args.group, args.signing_dir, args.timeout)
         if result and "error" not in str(result).lower():
             logger.info(f"[+++] Отчет об агрегации успешно отправлен!")
             print(json.dumps(result, indent=2, ensure_ascii=False))
