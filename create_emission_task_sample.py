@@ -995,7 +995,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
 
             # Создаем обертку
             wrapper = DocumentWrapper(
-                document_format="JSON",
+                document_format="MANUAL",
                 product_document=doc_base64,
                 type="AGGREGATION_DOCUMENT",
                 signature=sig_base64
