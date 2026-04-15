@@ -1191,9 +1191,10 @@ def update_aggregation_status(task_uuid: str, group: str):
         s3_config = config.get('s3_config')
         agg_receipts_path = config.get('agg-receipts')
         agg_tasks_path = config.get('agg-tasks')
+        aggs_path = config.get('aggs')
 
-        if not all([agg_receipts_path, agg_tasks_path]):
-            logger.error("[!] В конфигурации отсутствуют пути (agg-receipts, agg-tasks)")
+        if not all([agg_receipts_path, agg_tasks_path, aggs_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (agg-receipts, agg-tasks, aggs)")
             return None
 
         # 1. Загружаем чек отправки (там docId и ИНН)
@@ -1246,19 +1247,21 @@ def update_aggregation_status(task_uuid: str, group: str):
             logger.error(f"[!] Ошибка API при запросе статуса: {status_res}")
             return status_res
 
-        # 5. Сохранение обновленного чека (перезаписываем или дополняем)
-        # В данном случае просто сохраняем полный ответ API как актуальный статус
+        # 5. Сохранение актуального статуса
+        storage_aggs = get_storage(aggs_path, s3_config)
+        output_status_path = f"{aggs_path.rstrip('/')}/{task_uuid}.json"
+
         temp_local = Path(f"temp_agg_status_{task_uuid}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
             json.dump(status_res, f, indent=4, ensure_ascii=False)
 
-        logger.info(f"[*] Обновление чека агрегации в {receipt_path}")
-        storage_receipts.upload(str(temp_local), receipt_path)
+        logger.info(f"[*] Сохранение статуса агрегации в {output_status_path}")
+        storage_aggs.upload(str(temp_local), output_status_path)
 
         # Установка тегов статуса
         doc_status = status_res.get('status')
         if doc_status:
-            storage_receipts.set_tags(receipt_path, {"status": doc_status})
+            storage_aggs.set_tags(output_status_path, {"status": doc_status})
 
         try:
             temp_local.unlink()
