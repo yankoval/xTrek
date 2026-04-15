@@ -23,6 +23,7 @@ from suz import SUZ
 from trueapi import HonestSignAPI
 from gs1_processor import get_inn_by_gtin
 from tokens import TokenProcessor
+from crpt_auth import get_new_token
 from org_manager import OrganizationManager
 from storage import get_storage, LocalStorage, S3Storage
 from config_loader import load_config
@@ -821,7 +822,7 @@ def update_emission_order_status(production_order_id: str):
         logger.error(f"[!] Ошибка в update_emission_order_status: {e}")
         return str(e)
 
-def create_aggregation_report(task_uuid: str):
+def create_aggregation_report(task_uuid: str, inn_override: str = None):
     """
     Создает отчет об агрегации для ЛК на основе отчета оборудования.
     """
@@ -883,12 +884,17 @@ def create_aggregation_report(task_uuid: str):
         filtered_report_data['readyBox'] = boxes_objs
         report_obj = EquipmentAggTaskReport(**filtered_report_data)
 
-        # 3. Определяем ИНН по GTIN задания
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        inn = get_inn_by_gtin(task_obj.gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        # 3. Определяем ИНН по GTIN задания или используем переопределение
+        inn = inn_override
         if not inn:
-            logger.error(f"[!] Не удалось определить ИНН для GTIN {task_obj.gtin}")
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            inn = get_inn_by_gtin(task_obj.gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН для GTIN {task_obj.gtin} и не задан --inn")
             return None
+
+        logger.info(f"[*] Используется ИНН участника: {inn}")
 
         # 4. Формируем целевой отчет AggregationReport
         aggregation_units = []
@@ -939,7 +945,7 @@ def create_aggregation_report(task_uuid: str):
         logger.error(f"[!] Ошибка в create_aggregation_report: {e}")
         return None
 
-def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, timeout: int):
+def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False):
     """
     Загружает отчет об агрегации, подписывает его и отправляет в ЛК ЧЗ в обертке.
     """
@@ -974,10 +980,25 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
 
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = None
+        if not refresh_token:
+            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
         if not token:
-            logger.error(f"[!] Активный JWT токен для ИНН {inn} не найден. Сначала выполните авторизацию.")
-            return None
+            logger.info(f"[*] Получение нового JWT токена для ИНН {inn}...")
+            token = get_new_token(inn=inn, mode='jwt', timeout=timeout)
+            if token:
+                token_processor.save_token(token)
+                logger.info(f"[+] Новый токен успешно получен и сохранен.")
+            else:
+                logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}.")
+                return None
+
+        # Декодируем JWT для логов, чтобы проверить PID/INN
+        try:
+            payload = token_processor._decode_jwt_payload(token)
+            logger.info(f"[*] Токен участника: INN={payload.get('inn')}, PID={payload.get('pid')}, Name={payload.get('full_name')}")
+        except: pass
 
         # 3. Подготовка к подписи
         work_dir = Path(signing_dir)
@@ -1011,8 +1032,10 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                 doc_bytes = f.read()
                 doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
 
-            with open(signature_path, "rb") as f:
-                sig_base64 = base64.b64encode(f.read()).decode('utf-8')
+            with open(signature_path, "r", encoding="utf-8") as f:
+                # В данном проекте демон подписи сохраняет подпись в формате Base64.
+                # Повторное кодирование приведет к ошибке проверки подписи в ЛК.
+                sig_base64 = f.read().strip()
 
             # Создаем обертку
             wrapper = DocumentWrapper(
@@ -1149,6 +1172,8 @@ def main():
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
     parser.add_argument("--oms_id", help="OMS ID (если не задан, будет найден в my_orgs по ИНН)")
+    parser.add_argument("--inn", help="ИНН участника (переопределяет автоматическое определение)")
+    parser.add_argument("--refresh-token", action="store_true", help="Принудительно получить новый токен")
     parser.add_argument("--client_token", help="Client Token / Connection ID")
     parser.add_argument("--signing_dir", default=SIGNING_DIR, help="Директория для обмена с демоном подписи")
     parser.add_argument("--timeout", type=int, default=SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
@@ -1223,7 +1248,7 @@ def main():
         return
 
     if args.create_aggregation:
-        result = create_aggregation_report(args.create_aggregation)
+        result = create_aggregation_report(args.create_aggregation, inn_override=args.inn)
         if result:
             logger.info(f"[+++] Отчет об агрегации успешно создан для {result}")
         else:
@@ -1231,7 +1256,8 @@ def main():
         return
 
     if args.send_aggregation:
-        result = sign_and_send_aggregation(args.send_aggregation, args.group, args.signing_dir, args.timeout)
+        result = sign_and_send_aggregation(args.send_aggregation, args.group, args.signing_dir, args.timeout,
+                                          refresh_token=args.refresh_token)
         if result and "error" not in str(result).lower():
             logger.info(f"[+++] Отчет об агрегации успешно отправлен!")
             print(json.dumps(result, indent=2, ensure_ascii=False))
