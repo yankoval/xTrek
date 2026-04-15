@@ -1055,6 +1055,24 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
 
             if result and "error" not in str(result).lower():
                 logger.info(f"[+++] Отчет об агрегации успешно отправлен в ЛК! Результат: {result}")
+
+                # Сохраняем чек отправки
+                agg_receipts_path = config.get('agg-receipts')
+                if agg_receipts_path:
+                    storage_receipts = get_storage(agg_receipts_path, s3_config)
+                    remote_receipt_path = f"{agg_receipts_path.rstrip('/')}/{task_uuid}.json"
+
+                    temp_receipt = work_dir / f"receipt_agg_{unique_id}.json"
+                    with open(temp_receipt, 'w', encoding='utf-8') as f:
+                        json.dump(result, f, indent=4, ensure_ascii=False)
+
+                    logger.info(f"[*] Выгрузка чека агрегации в S3: {remote_receipt_path}")
+                    storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                    try:
+                        temp_receipt.unlink()
+                    except:
+                        pass
+
                 return result
             else:
                 logger.error(f"[!] Ошибка отправки отчета в ЛК: {result}")
@@ -1163,6 +1181,97 @@ def update_utilisation_report_status(order_id: str):
         logger.error(f"[!] Ошибка в update_utilisation_report_status: {e}")
         return str(e)
 
+
+def update_aggregation_status(task_uuid: str, group: str):
+    """
+    Получает актуальный статус документа агрегации из ЛК ЧЗ и сохраняет чек.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        agg_receipts_path = config.get('agg-receipts')
+        agg_tasks_path = config.get('agg-tasks')
+
+        if not all([agg_receipts_path, agg_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (agg-receipts, agg-tasks)")
+            return None
+
+        # 1. Загружаем чек отправки (там docId и ИНН)
+        storage_receipts = get_storage(agg_receipts_path, s3_config)
+        receipt_path = f"{agg_receipts_path.rstrip('/')}/{task_uuid}.json"
+
+        if not storage_receipts.exists(receipt_path):
+            logger.error(f"[!] Чек отправки агрегации не найден: {receipt_path}")
+            return None
+
+        receipt_data = json.loads(storage_receipts.read_text(receipt_path))
+        doc_id = receipt_data.get('document_id')
+
+        # Если в чеке нет doc_id, возможно это старая версия или ошибка
+        if not doc_id:
+            logger.error(f"[!] В чеке {task_uuid} отсутствует document_id")
+            return None
+
+        # 2. Получаем ИНН из исходного отчета для авторизации
+        storage_agg = get_storage(agg_tasks_path, s3_config)
+        report_path = f"{agg_tasks_path.rstrip('/')}/{task_uuid}.json"
+        if not storage_agg.exists(report_path):
+            logger.error(f"[!] Файл отчета об агрегации не найден: {report_path}")
+            return None
+
+        report_data = json.loads(storage_agg.read_text(report_path))
+        inn = report_data.get('participantId')
+
+        if not inn:
+            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
+            return None
+
+        # 3. Инициализация API
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            logger.error(f"[!] JWT токен для ИНН {inn} не найден.")
+            return None
+
+        api = HonestSignAPI(token=token)
+
+        # 4. Запрос статуса
+        logger.info(f"[*] Запрос статуса документа {doc_id} для задачи {task_uuid}...")
+        status_res = api.doc(doc_id, pg=group)
+
+        if not status_res or "error" in status_res:
+            logger.error(f"[!] Ошибка API при запросе статуса: {status_res}")
+            return status_res
+
+        # 5. Сохранение обновленного чека (перезаписываем или дополняем)
+        # В данном случае просто сохраняем полный ответ API как актуальный статус
+        temp_local = Path(f"temp_agg_status_{task_uuid}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            json.dump(status_res, f, indent=4, ensure_ascii=False)
+
+        logger.info(f"[*] Обновление чека агрегации в {receipt_path}")
+        storage_receipts.upload(str(temp_local), receipt_path)
+
+        # Установка тегов статуса
+        doc_status = status_res.get('status')
+        if doc_status:
+            storage_receipts.set_tags(receipt_path, {"status": doc_status})
+
+        try:
+            temp_local.unlink()
+        except:
+            pass
+
+        return status_res
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в update_aggregation_status: {e}")
+        return str(e)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
@@ -1172,6 +1281,7 @@ def main():
     parser.add_argument("--utilisation-status", help="Получить статус отчета о нанесении по orderId (UUID)")
     parser.add_argument("--create-aggregation", help="Создать отчет об агрегации для ЛК по UUID задания оборудования")
     parser.add_argument("--send-aggregation", help="Отправить отчет об агрегации в ЛК по UUID задания оборудования")
+    parser.add_argument("--aggregation-status", help="Получить статус отчета об агрегации по UUID задания оборудования")
 
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
@@ -1278,6 +1388,14 @@ def main():
             print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
             logger.error(f"[!] Не удалось отправить отчет об агрегации.")
+        return
+
+    if args.aggregation_status:
+        result = update_aggregation_status(args.aggregation_status, args.group)
+        if result and "error" not in str(result).lower():
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"Результат: {result}")
         return
 
     parser.print_help()

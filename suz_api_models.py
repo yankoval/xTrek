@@ -136,6 +136,7 @@ class EquipmentAggTask(SUZBase):
     expDate: Optional[str] = None
     addProdInfo: Optional[str] = None
     numPacksInBox: Optional[int] = None
+    numРacksInBox: Optional[int] = None # Cyrillic 'P' as in user example
     numLayersInBox: Optional[int] = None
     maxNoRead: Optional[int] = None
     urlLabelProductTemplate: Optional[str] = None
