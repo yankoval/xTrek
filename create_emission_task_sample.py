@@ -1047,7 +1047,11 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
 
             # Отправка через TrueAPI
             api = HonestSignAPI(token=token)
-            result = api.documents_create(wrapper.to_json(), pg=group)
+            wrapped_json = wrapper.to_json()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[*] Текст запроса агрегации: {wrapped_json}")
+
+            result = api.documents_create(wrapped_json, pg=group)
 
             if result and "error" not in str(result).lower():
                 logger.info(f"[+++] Отчет об агрегации успешно отправлен в ЛК! Результат: {result}")
@@ -1174,6 +1178,8 @@ def main():
     parser.add_argument("--oms_id", help="OMS ID (если не задан, будет найден в my_orgs по ИНН)")
     parser.add_argument("--inn", help="ИНН участника (переопределяет автоматическое определение)")
     parser.add_argument("--refresh-token", action="store_true", help="Принудительно получить новый токен")
+    parser.add_argument("--suz_worker_config", help="Путь к конфигурационному файлу")
+    parser.add_argument("--debug", action="store_true", help="Выводить отладочную информацию (текст запроса)")
     parser.add_argument("--client_token", help="Client Token / Connection ID")
     parser.add_argument("--signing_dir", default=SIGNING_DIR, help="Директория для обмена с демоном подписи")
     parser.add_argument("--timeout", type=int, default=SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
@@ -1183,6 +1189,15 @@ def main():
     parser.add_argument("--get-codes", help="Получить коды для заказа по orderId (UUID)")
 
     args = parser.parse_args()
+
+    if args.suz_worker_config:
+        os.environ['suz_worker_config'] = args.suz_worker_config
+        logger.info(f"[*] Переопределен путь к конфигу: {args.suz_worker_config}")
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger('trueapi').setLevel(logging.DEBUG)
+        logging.getLogger('suz').setLevel(logging.DEBUG)
 
     if args.status:
         result = update_emission_order_status(args.status)
