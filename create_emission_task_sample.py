@@ -909,7 +909,8 @@ def create_aggregation_report(task_uuid: str):
             unit = AggregationUnit(
                 unitSerialNumber=box_number,
                 aggregationType="AGGREGATION",
-                sntins=clean_sntins
+                sntins=clean_sntins,
+                unitSerialNumberList=None
             )
             aggregation_units.append(unit)
 
@@ -989,7 +990,8 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         try:
             with open(body_path, "w", encoding="utf-8") as f:
                 # ЧЗ требует компактный JSON (иногда критично для подписи)
-                json.dump(report_data, f, separators=(',', ':'))
+                # ensure_ascii=False может помочь, если подписывающее ПО ожидает UTF-8
+                json.dump(report_data, f, separators=(',', ':'), ensure_ascii=False)
 
             logger.info(f"[*] Ожидание подписи для {body_path}...")
             start_time = time.time()

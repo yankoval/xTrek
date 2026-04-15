@@ -88,15 +88,15 @@ class IntroductionReport(SUZBase):
 
 @dataclass
 class AggregationUnit(SUZBase):
-    unitSerialNumber: str
-    aggregationType: str = "AGGREGATION"
     sntins: List[str] = field(default_factory=list) # Для товаров
-    unitSerialNumberList: List[str] = field(default_factory=list) # Для вложенных коробов
+    aggregationType: str = "AGGREGATION"
+    unitSerialNumber: str = ""
+    unitSerialNumberList: Optional[List[str]] = None # Для вложенных коробов
 
 @dataclass
 class AggregationReport(SUZBase):
-    participantId: str
     aggregationUnits: List[AggregationUnit]
+    participantId: str
     productGroup: Optional[str] = None
 
 @dataclass
