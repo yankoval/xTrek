@@ -1243,7 +1243,11 @@ def update_aggregation_status(task_uuid: str, group: str):
         logger.info(f"[*] Запрос статуса документа {doc_id} для задачи {task_uuid}...")
         status_res = api.doc(doc_id, pg=group)
 
-        if not status_res or "error" in status_res:
+        if not status_res:
+            logger.error("[!] Пустой ответ от API.")
+            return None
+
+        if isinstance(status_res, dict) and "error" in status_res:
             logger.error(f"[!] Ошибка API при запросе статуса: {status_res}")
             return status_res
 
@@ -1259,7 +1263,12 @@ def update_aggregation_status(task_uuid: str, group: str):
         storage_aggs.upload(str(temp_local), output_status_path)
 
         # Установка тегов статуса
-        doc_status = status_res.get('status')
+        target_obj = status_res[0] if isinstance(status_res, list) and len(status_res) > 0 else status_res
+
+        doc_status = None
+        if isinstance(target_obj, dict):
+            doc_status = target_obj.get('status')
+
         if doc_status:
             storage_aggs.set_tags(output_status_path, {"status": doc_status})
 
