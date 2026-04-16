@@ -1409,8 +1409,8 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         introduce_tasks_path = config.get('introduce-tasks')
         introduce_receipts_path = config.get('introduce-receipts')
 
-        if not introduce_tasks_path:
-            logger.error("[!] В конфигурации отсутствует путь introduce-tasks")
+        if not all([introduce_tasks_path, introduce_receipts_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (introduce-tasks, introduce-receipts)")
             return None
 
         storage_intro = get_storage(introduce_tasks_path, s3_config)
@@ -1497,6 +1497,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result, f, indent=4, ensure_ascii=False)
 
+                    logger.info(f"[*] Выгрузка чека ввода в оборот в S3: {remote_receipt_path}")
                     storage_receipts.upload(str(temp_receipt), remote_receipt_path)
                     try: temp_receipt.unlink()
                     except: pass
@@ -1616,6 +1617,107 @@ def update_aggregation_status(task_uuid: str, group: str):
         return str(e)
 
 
+def update_introduce_status(order_id: str, group: str):
+    """
+    Получает актуальный статус документа ввода в оборот из ЛК ЧЗ и сохраняет чек.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        introduce_receipts_path = config.get('introduce-receipts')
+        introduce_tasks_path = config.get('introduce-tasks')
+        introduces_path = config.get('introduces')
+
+        if not all([introduce_receipts_path, introduce_tasks_path, introduces_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (introduce-receipts, introduce-tasks, introduces)")
+            return None
+
+        # 1. Загружаем чек отправки (там document_id)
+        storage_receipts = get_storage(introduce_receipts_path, s3_config)
+        receipt_path = f"{introduce_receipts_path.rstrip('/')}/{order_id}.json"
+
+        if not storage_receipts.exists(receipt_path):
+            logger.error(f"[!] Чек отправки ввода в оборот не найден: {receipt_path}")
+            return None
+
+        receipt_data = json.loads(storage_receipts.read_text(receipt_path))
+        doc_id = receipt_data.get('document_id')
+
+        if not doc_id:
+            logger.error(f"[!] В чеке {order_id} отсутствует document_id")
+            return None
+
+        # 2. Получаем ИНН из исходной задачи для авторизации
+        storage_intro = get_storage(introduce_tasks_path, s3_config)
+        task_path = f"{introduce_tasks_path.rstrip('/')}/{order_id}.json"
+        if not storage_intro.exists(task_path):
+            logger.error(f"[!] Файл задачи на ввод в оборот не найден: {task_path}")
+            return None
+
+        task_data = json.loads(storage_intro.read_text(task_path))
+        inn = task_data.get('owner_inn')
+
+        if not inn:
+            logger.error(f"[!] Не найден owner_inn в задаче {order_id}")
+            return None
+
+        # 3. Инициализация API
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            logger.error(f"[!] JWT токен для ИНН {inn} не найден.")
+            return None
+
+        api = HonestSignAPI(token=token)
+
+        # 4. Запрос статуса
+        logger.info(f"[*] Запрос статуса документа {doc_id} для заказа {order_id}...")
+        status_res = api.doc(doc_id, pg=group)
+
+        if not status_res:
+            logger.error("[!] Пустой ответ от API.")
+            return None
+
+        if isinstance(status_res, dict) and "error" in status_res:
+            logger.error(f"[!] Ошибка API при запросе статуса: {status_res}")
+            return status_res
+
+        # 5. Сохранение актуального статуса
+        storage_introduces = get_storage(introduces_path, s3_config)
+        output_status_path = f"{introduces_path.rstrip('/')}/{order_id}.json"
+
+        temp_local = Path(f"temp_intro_status_{order_id}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            json.dump(status_res, f, indent=4, ensure_ascii=False)
+
+        logger.info(f"[*] Сохранение статуса ввода в оборот в {output_status_path}")
+        storage_introduces.upload(str(temp_local), output_status_path)
+
+        # Установка тегов статуса
+        target_obj = status_res[0] if isinstance(status_res, list) and len(status_res) > 0 else status_res
+
+        doc_status = None
+        if isinstance(target_obj, dict):
+            doc_status = target_obj.get('status')
+
+        if doc_status:
+            storage_introduces.set_tags(output_status_path, {"status": doc_status})
+
+        try:
+            temp_local.unlink()
+        except:
+            pass
+
+        return status_res
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в update_introduce_status: {e}")
+        return str(e)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
@@ -1628,6 +1730,7 @@ def main():
     parser.add_argument("--aggregation-status", help="Получить статус отчета об агрегации по UUID задания оборудования")
     parser.add_argument("--create-introduce", help="Создать задачу на ввод в оборот по orderId (UUID)")
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
+    parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
 
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
@@ -1761,6 +1864,14 @@ def main():
             print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
             logger.error(f"[!] Не удалось отправить отчет о вводе в оборот.")
+        return
+
+    if args.introduce_status:
+        result = update_introduce_status(args.introduce_status, args.group)
+        if result and "error" not in str(result).lower():
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"Результат: {result}")
         return
 
     parser.print_help()
