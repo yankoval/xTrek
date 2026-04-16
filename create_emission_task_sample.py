@@ -1194,6 +1194,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         introduce_tasks_path = config.get('introduce-tasks')
         emission_receipts_path = config.get('emission_receipts')
         production_orders_path = config.get('production_orders_path')
+        emission_orders_path = config.get('emission_orders_path')
 
         if not all([kodes_path, introduce_tasks_path]):
             logger.error("[!] В конфигурации отсутствуют пути (kodes, introduce-tasks)")
