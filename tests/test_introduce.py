@@ -50,7 +50,7 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
     mock_storage = MagicMock()
     mock_get_storage.return_value = mock_storage
     mock_storage.exists.return_value = True
-    mock_storage.read_text.return_value = json.dumps({"codes": ["0104610117624776215!3krb"]})
+    mock_storage.read_text.return_value = json.dumps({"codes": ["0104610117624776215\u001d!3krb"]})
 
     mock_get_inn.return_value = "7733154124"
 

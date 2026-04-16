@@ -1345,8 +1345,10 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         # 4. Формируем сообщение
         introduce_products = []
         for code in codes:
+            # Очистка кодов от криптохвоста (до первого \u001d) для ввода в оборот
+            clean_code = code.split('\u001d')[0]
             introduce_products.append(IntroduceProduct(
-                uit_code=code,
+                uit_code=clean_code,
                 tnved_code=tnved,
                 certificate_document_data=permits
             ))
