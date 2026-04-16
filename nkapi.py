@@ -1,7 +1,9 @@
 import os
+import json
 import logging
 import requests
 from datetime import datetime
+from suz_api_models import GtinDocument
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,7 @@ class NK:
 
         try:
             data = response.json()
+            logger.info(f"Полный ответ API для GTIN {gtin}: {json.dumps(data, ensure_ascii=False)}")
         except Exception as e:
             logger.error(f"Ошибка декодирования JSON: {e}")
             return []
@@ -120,32 +123,22 @@ class NK:
         documents = []
         try:
             result = data.get("result", {})
+            if isinstance(result, list) and len(result) > 0:
+                result = result[0]
+
             docs = result.get("documents", [])
             errors = result.get("errors", [])
             logger.info(f'Gtin:{gtin} error:{errors}')
             for d in docs:
                 number = d.get("number")
                 from_date = d.get("from_date")
-                to_date = d.get("to_date")
-                applicant = d.get("applicant")
-                manufacturer = d.get("manufacturer")
+                type_doc = d.get("type") # Предполагаем 'type', логирование покажет точное имя
 
-                days_left = None
-                if to_date:
-                    try:
-                        dt_to = datetime.strptime(to_date, "%Y-%m-%d")
-                        days_left = (dt_to - datetime.now()).days
-                    except ValueError:
-                        logger.warning(f"Неверный формат даты: {to_date}")
-
-                documents.append({
-                    "number": number,
-                    "from_date": from_date,
-                    "to_date": to_date,
-                    "days_left": days_left,
-                    "applicant": applicant,
-                    "manufacturer": manufacturer,
-                })
+                documents.append(GtinDocument(
+                    certificate_number=number,
+                    certificate_date=from_date,
+                    certificate_type=type_doc
+                ))
         except Exception as e:
             logger.warning(f"Ошибка разбора структуры документа: {e}")
 
