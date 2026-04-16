@@ -1293,54 +1293,72 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             return None
 
         nk = NK(token=token)
-        product_info = nk.get_set_by_gtin(gtin)
-        if not product_info:
-            logger.error(f"[!] Не удалось получить информацию о товаре из НК для GTIN {gtin}")
+        feed = nk.feedProduct(gtin)
+        if not feed:
+            logger.error(f"[!] Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
             return None
 
-        # Обработка того, что result может быть списком
-        p_res = product_info.get('result', {})
-        if isinstance(p_res, list) and len(p_res) > 0:
-            p_res = p_res[0]
+        f_res = feed.get('result', {})
+        if isinstance(f_res, list) and len(f_res) > 0:
+            f_res = f_res[0]
 
-        tnved = product_info.get('tnved_code') or p_res.get('tnvedCode') or p_res.get('tnved_code')
+        tnved = feed.get('tnved_code') or f_res.get('tnvedCode') or f_res.get('tnved_code')
 
-        if not tnved:
-            # Попробуем из feedProduct
-            feed = nk.feedProduct(gtin)
-            if feed:
-                f_res = feed.get('result', {})
-                if isinstance(f_res, list) and len(f_res) > 0:
-                    f_res = f_res[0]
+        # Если все еще нет, ищем в good_attrs (attr_id 13933 - Код ТНВЭД)
+        if not tnved and 'good_attrs' in f_res:
+            for attr in f_res['good_attrs']:
+                if attr.get('attr_id') == 13933 or attr.get('attr_name') == 'Код ТНВЭД':
+                    tnved = attr.get('attr_value')
+                    break
 
-                tnved = feed.get('tnved_code') or f_res.get('tnvedCode') or f_res.get('tnved_code')
-
-                # Если все еще нет, ищем в good_attrs (attr_id 13933 - Код ТНВЭД)
-                if not tnved and 'good_attrs' in f_res:
-                    for attr in f_res['good_attrs']:
-                        if attr.get('attr_id') == 13933 or attr.get('attr_name') == 'Код ТНВЭД':
-                            tnved = attr.get('attr_value')
-                            break
-
-                # Или в категориях
-                if not tnved and 'categories' in f_res:
-                    for cat in f_res['categories']:
-                        cat_name = cat.get('cat_name', '')
-                        # Обычно начинается с 10 цифр кода
-                        if cat_name and cat_name[0].isdigit():
-                            potential_tnved = cat_name.split(' ')[0]
-                            if len(potential_tnved) >= 4:
-                                tnved = potential_tnved
-                                break
+        # Или в категориях
+        if not tnved and 'categories' in f_res:
+            for cat in f_res['categories']:
+                cat_name = cat.get('cat_name', '')
+                # Обычно начинается с 10 цифр кода
+                if cat_name and cat_name[0].isdigit():
+                    potential_tnved = cat_name.split(' ')[0]
+                    if len(potential_tnved) >= 4:
+                        tnved = potential_tnved
+                        break
 
         if not tnved:
             logger.error(f"[!] Не удалось получить код ТН ВЭД для GTIN {gtin}")
             return None
 
-        permits = nk.get_permit_document_by_gtin(gtin, inn)
+        # Получаем разрешительные документы из good_attrs
+        permits = []
+        CERT_TYPE_MAP = {
+            23557: "CONFORMITY_DECLARATION",
+            23561: "CONFORMITY_CERTIFICATE",
+            23890: "STATE_REGISTRATION_CERTIFICATE"
+        }
+
+        if 'good_attrs' in f_res:
+            for attr in f_res['good_attrs']:
+                if attr.get('attr_group_id') == 1065:
+                    attr_id = attr.get('attr_id')
+                    cert_type = CERT_TYPE_MAP.get(attr_id)
+                    if cert_type:
+                        val = attr.get('attr_value', '')
+                        if ':::' in val:
+                            parts = val.split(':::')
+                            cert_num = parts[0]
+                            cert_date = parts[1]
+                            permits.append(GtinDocument(
+                                certificate_number=cert_num,
+                                certificate_date=cert_date,
+                                certificate_type=cert_type
+                            ))
+                        else:
+                            logger.warning(f"[*] Некорректный формат значения документа (ожидалось :::): {val}")
+
         if not permits:
-            logger.warning(f"[!] Разрешительные документы для GTIN {gtin} не найдены")
-            # Продолжаем или нет? Обычно они нужны. В примере они есть.
+            error_msg = "отсутсвует разрешительная документация"
+            logger.error(f"[!] {error_msg} для GTIN {gtin}")
+            # Присваиваем тег ошибке
+            storage_kodes.set_tags(kodes_file_path, {"статусСообщенияВводаВОборот": "Error"})
+            return None
 
         # 4. Формируем сообщение
         introduce_products = []

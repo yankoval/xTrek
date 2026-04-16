@@ -56,10 +56,24 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
 
     mock_nk_inst = mock_nk.return_value
     # Test with result as a list
-    mock_nk_inst.get_set_by_gtin.return_value = {"result": [{"tnved_code": "3305900009"}]}
-    mock_nk_inst.get_permit_document_by_gtin.return_value = [
-        GtinDocument("2024-09-27", "CERT123", "CONFORMITY_DECLARATION")
-    ]
+    mock_nk_inst.feedProduct.return_value = {
+        "result": [{
+            "good_attrs": [
+                {
+                    "attr_group_id": 22,
+                    "attr_id": 13933,
+                    "attr_name": "Код ТНВЭД",
+                    "attr_value": "3305900009"
+                },
+                {
+                    "attr_group_id": 1065,
+                    "attr_id": 23557,
+                    "attr_name": "Декларация о соответствии",
+                    "attr_value": "CERT123:::2024-09-27"
+                }
+            ]
+        }]
+    }
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 
