@@ -1331,7 +1331,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         CERT_TYPE_MAP = {
             23557: "CONFORMITY_DECLARATION",
             23561: "CONFORMITY_CERTIFICATE",
-            23890: "STATE_REGISTRATION_CERTIFICATE"
+            23765: "STATE_REGISTRATION_CERTIFICATE"
         }
 
         if 'good_attrs' in f_res:
@@ -1341,7 +1341,18 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
                     cert_type = CERT_TYPE_MAP.get(attr_id)
                     if cert_type:
                         val = attr.get('attr_value', '')
-                        if ':::' in val:
+
+                        if cert_type == "STATE_REGISTRATION_CERTIFICATE":
+                            cert_num = val
+                            published_date = attr.get('published_date', '')
+                            # Преобразуем 2025-07-22T13:10:26+03:00 -> 2025-07-22
+                            cert_date = published_date.split('T')[0] if 'T' in published_date else published_date
+                            permits.append(GtinDocument(
+                                certificate_number=cert_num,
+                                certificate_date=cert_date,
+                                certificate_type=cert_type
+                            ))
+                        elif ':::' in val:
                             parts = val.split(':::')
                             cert_num = parts[0]
                             cert_date = parts[1]
