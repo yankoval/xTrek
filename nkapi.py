@@ -123,6 +123,9 @@ class NK:
         documents = []
         try:
             result = data.get("result", {})
+            if isinstance(result, list) and len(result) > 0:
+                result = result[0]
+
             docs = result.get("documents", [])
             errors = result.get("errors", [])
             logger.info(f'Gtin:{gtin} error:{errors}')

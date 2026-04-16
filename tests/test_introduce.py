@@ -55,7 +55,8 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
     mock_get_inn.return_value = "7733154124"
 
     mock_nk_inst = mock_nk.return_value
-    mock_nk_inst.get_set_by_gtin.return_value = {"tnved_code": "3305900009"}
+    # Test with result as a list
+    mock_nk_inst.get_set_by_gtin.return_value = {"result": [{"tnved_code": "3305900009"}]}
     mock_nk_inst.get_permit_document_by_gtin.return_value = [
         GtinDocument("2024-09-27", "CERT123", "CONFORMITY_DECLARATION")
     ]

@@ -1298,12 +1298,40 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             logger.error(f"[!] Не удалось получить информацию о товаре из НК для GTIN {gtin}")
             return None
 
-        tnved = product_info.get('tnved_code') or product_info.get('result', {}).get('tnvedCode')
+        # Обработка того, что result может быть списком
+        p_res = product_info.get('result', {})
+        if isinstance(p_res, list) and len(p_res) > 0:
+            p_res = p_res[0]
+
+        tnved = product_info.get('tnved_code') or p_res.get('tnvedCode') or p_res.get('tnved_code')
+
         if not tnved:
             # Попробуем из feedProduct
             feed = nk.feedProduct(gtin)
             if feed:
-                tnved = feed.get('tnved_code') or feed.get('result', {}).get('tnvedCode')
+                f_res = feed.get('result', {})
+                if isinstance(f_res, list) and len(f_res) > 0:
+                    f_res = f_res[0]
+
+                tnved = feed.get('tnved_code') or f_res.get('tnvedCode') or f_res.get('tnved_code')
+
+                # Если все еще нет, ищем в good_attrs (attr_id 13933 - Код ТНВЭД)
+                if not tnved and 'good_attrs' in f_res:
+                    for attr in f_res['good_attrs']:
+                        if attr.get('attr_id') == 13933 or attr.get('attr_name') == 'Код ТНВЭД':
+                            tnved = attr.get('attr_value')
+                            break
+
+                # Или в категориях
+                if not tnved and 'categories' in f_res:
+                    for cat in f_res['categories']:
+                        cat_name = cat.get('cat_name', '')
+                        # Обычно начинается с 10 цифр кода
+                        if cat_name and cat_name[0].isdigit():
+                            potential_tnved = cat_name.split(' ')[0]
+                            if len(potential_tnved) >= 4:
+                                tnved = potential_tnved
+                                break
 
         if not tnved:
             logger.error(f"[!] Не удалось получить код ТН ВЭД для GTIN {gtin}")
