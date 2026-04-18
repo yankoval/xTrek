@@ -1627,6 +1627,347 @@ def update_aggregation_status(task_uuid: str, group: str):
         logger.error(f"[!] Ошибка в update_aggregation_status: {e}")
         return str(e)
 
+def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str = None):
+    """
+    Создает отчет об агрегации наборов (SET) для ЛК на основе отчета оборудования.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        equipment_set_reports_path = config.get('equipment_set_reports')
+        agg_set_tasks_path = config.get('agg_set_tasks')
+
+        if not all([equipment_set_reports_path, agg_set_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (equipment_set_reports, agg_set_tasks)")
+            return None
+
+        storage_reports = get_storage(equipment_set_reports_path, s3_config)
+
+        # 1. Загружаем отчет оборудования
+        report_path = f"{equipment_set_reports_path.rstrip('/')}/{task_uuid}.json"
+        if not storage_reports.exists(report_path):
+            logger.error(f"[!] Отчет оборудования не найден: {report_path}")
+            return None
+
+        report_content = storage_reports.read_text(report_path)
+        report_data = json.loads(report_content)
+        if not report_data.get('readyBox'):
+            logger.info(f"[*] Отчет {task_uuid} содержит пустой readyBox. Завершение без ошибки.")
+            return None
+
+        # Фильтрация полей для отчета
+        sig_report = inspect.signature(EquipmentAggTaskReport.__init__)
+        valid_fields_report = {k for k, v in sig_report.parameters.items() if k != 'self'}
+
+        boxes_raw = report_data.get('readyBox', [])
+        boxes_objs = []
+        sig_box = inspect.signature(EquipmentAggBox.__init__)
+        valid_fields_box = {k for k, v in sig_box.parameters.items() if k != 'self'}
+        for b_dict in boxes_raw:
+            filtered_box_data = {k: v for k, v in b_dict.items() if k in valid_fields_box}
+            boxes_objs.append(EquipmentAggBox(**filtered_box_data))
+
+        filtered_report_data = {k: v for k, v in report_data.items() if k in valid_fields_report}
+        filtered_report_data['readyBox'] = boxes_objs
+        report_obj = EquipmentAggTaskReport(**filtered_report_data)
+
+        # 2. Определяем ИНН. Берем GTIN из первого кода набора (boxNumber)
+        inn = inn_override
+        if not inn:
+            first_box = report_obj.readyBox[0]
+            box_number = first_box.boxNumber
+            # Очищаем код набора от криптохвоста
+            clean_box_number = box_number.split('\u001d')[0]
+            # Извлекаем GTIN (позиции 3-16 для формата 01...)
+            if clean_box_number.startswith('01'):
+                gtin = clean_box_number[2:16]
+
+                # Ищем ИНН через NK.feedProduct
+                # Нам нужен токен для NK. Попробуем найти любой доступный JWT токен.
+                base_path = os.path.dirname(os.path.abspath(__file__))
+                org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+                token_processor = TokenProcessor(org_manager=org_manager)
+
+                # Перебираем организации, пока не найдем токен
+                token = None
+                for org in org_manager.list():
+                    token = token_processor.get_token_value_by_inn(org.inn, token_type='JWT')
+                    if token: break
+
+                if token:
+                    nk = NK(token=token)
+                    feed = nk.feedProduct(gtin)
+                    if feed:
+                        # В feedProduct обычно ИНН владельца лежит в owner_inn или в result[0].owner_inn
+                        f_res = feed.get('result', {})
+                        if isinstance(f_res, list) and len(f_res) > 0:
+                            f_res = f_res[0]
+                        inn = feed.get('owner_inn') or f_res.get('owner_inn') or feed.get('inn') or f_res.get('inn')
+
+                if not inn:
+                    # Резервный вариант через gs1_processor
+                    inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН и не задан --inn")
+            return None
+
+        logger.info(f"[*] Используется ИНН участника: {inn}")
+
+        # 3. Формируем целевой отчет AggregationReport
+        aggregation_units = []
+        for box in report_obj.readyBox:
+            # Очистка кода набора (unitSerialNumber) от криптохвоста
+            clean_unit_sn = box.boxNumber.split('\u001d')[0]
+
+            # Очистка кодов комплектующих (sntins) от криптохвоста
+            clean_sntins = []
+            codes_list = box.productNumbersFull or []
+            for code in codes_list:
+                clean_code = code.split('\u001d')[0]
+                clean_sntins.append(clean_code)
+
+            unit = AggregationUnit(
+                unitSerialNumber=clean_unit_sn,
+                aggregationType=None, # Для наборов исключаем это поле
+                sntins=clean_sntins,
+                unitSerialNumberList=None
+            )
+            aggregation_units.append(unit)
+
+        final_report = AggregationReport(
+            participantId=inn,
+            aggregationUnits=aggregation_units,
+            productGroup=group
+        )
+
+        # 4. Сохраняем итоговый отчет
+        storage_agg = get_storage(agg_set_tasks_path, s3_config)
+        output_path = f"{agg_set_tasks_path.rstrip('/')}/{task_uuid}.json"
+
+        temp_local = Path(f"temp_agg_set_{task_uuid}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(final_report.to_json())
+
+        logger.info(f"[*] Выгрузка отчета об агрегации наборов в S3: {output_path}")
+        storage_agg.upload(str(temp_local), output_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return task_uuid
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_aggregation_set_report: {e}")
+        return None
+
+def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False):
+    """
+    Загружает отчет об агрегации наборов, подписывает его и отправляет в ЛК ЧЗ.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        agg_set_tasks_path = config.get('agg_set_tasks')
+        agg_set_receipts_path = config.get('agg_set_receipts')
+
+        if not all([agg_set_tasks_path, agg_set_receipts_path]):
+            logger.error("[!] В конфигурации отсутствуют пути agg_set_tasks или agg_set_receipts")
+            return None
+
+        # 1. Загружаем отчет и проверяем ИНН
+        storage_agg = get_storage(agg_set_tasks_path, s3_config)
+        report_path = f"{agg_set_tasks_path.rstrip('/')}/{task_uuid}.json"
+
+        if not storage_agg.exists(report_path):
+            logger.error(f"[!] Файл отчета об агрегации наборов не найден: {report_path}")
+            return None
+
+        report_content = storage_agg.read_text(report_path)
+        report_data = json.loads(report_content)
+        inn = report_data.get('participantId')
+
+        if not inn:
+            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
+            return None
+
+        # 2. Токен
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+
+        token = None
+        if not refresh_token:
+            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            token = get_new_token(inn=inn, mode='jwt', timeout=timeout)
+            if token: token_processor.save_token(token)
+
+        if not token:
+            logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}")
+            return None
+
+        # 3. Подпись
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_agg_set.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
+
+        try:
+            with open(body_path, "wb") as f:
+                if isinstance(report_content, str):
+                    f.write(report_content.encode('utf-8'))
+                else:
+                    f.write(report_content)
+
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    return None
+                time.sleep(1)
+
+            with open(body_path, "rb") as f:
+                doc_bytes = f.read()
+                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+
+            with open(signature_path, "r", encoding="utf-8") as f:
+                sig_base64 = f.read().strip()
+
+            # Создаем обертку для SETS_AGGREGATION
+            wrapper = DocumentWrapper(
+                document_format="MANUAL",
+                product_document=doc_base64,
+                type="SETS_AGGREGATION",
+                signature=sig_base64
+            )
+
+            # Отправка через TrueAPI
+            api = HonestSignAPI(token=token)
+            result = api.documents_create(wrapper.to_json(), pg=group)
+
+            if result and "error" not in str(result).lower():
+                logger.info(f"[+++] Отчет об агрегации наборов успешно отправлен! ID: {result}")
+
+                storage_receipts = get_storage(agg_set_receipts_path, s3_config)
+                remote_receipt_path = f"{agg_set_receipts_path.rstrip('/')}/{task_uuid}.json"
+
+                temp_receipt = work_dir / f"receipt_agg_set_{unique_id}.json"
+                with open(temp_receipt, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=4, ensure_ascii=False)
+
+                logger.info(f"[*] Выгрузка чека агрегации наборов в S3: {remote_receipt_path}")
+                storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                try: temp_receipt.unlink()
+                except: pass
+
+                return result
+            else:
+                logger.error(f"[!] Ошибка отправки: {result}")
+                return result
+
+        finally:
+            if body_path.exists(): body_path.unlink()
+            if signature_path.exists(): signature_path.unlink()
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в sign_and_send_aggregation_set: {e}")
+        return None
+
+def update_aggregation_set_status(task_uuid: str, group: str):
+    """
+    Получает актуальный статус документа агрегации наборов из ЛК ЧЗ.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        agg_set_receipts_path = config.get('agg_set_receipts')
+        agg_set_tasks_path = config.get('agg_set_tasks')
+        agg_sets_path = config.get('agg_sets')
+
+        if not all([agg_set_receipts_path, agg_set_tasks_path, agg_sets_path]):
+            logger.error("[!] В конфигурации отсутствуют пути (agg_set_receipts, agg_set_tasks, agg_sets)")
+            return None
+
+        # 1. Загружаем чек отправки
+        storage_receipts = get_storage(agg_set_receipts_path, s3_config)
+        receipt_path = f"{agg_set_receipts_path.rstrip('/')}/{task_uuid}.json"
+
+        if not storage_receipts.exists(receipt_path):
+            logger.error(f"[!] Чек отправки агрегации наборов не найден: {receipt_path}")
+            return None
+
+        receipt_data = json.loads(storage_receipts.read_text(receipt_path))
+        doc_id = receipt_data.get('document_id')
+
+        if not doc_id:
+            logger.error(f"[!] В чеке {task_uuid} отсутствует document_id")
+            return None
+
+        # 2. Получаем ИНН из исходного отчета
+        storage_agg = get_storage(agg_set_tasks_path, s3_config)
+        report_path = f"{agg_set_tasks_path.rstrip('/')}/{task_uuid}.json"
+        if not storage_agg.exists(report_path):
+            logger.error(f"[!] Файл отчета об агрегации наборов не найден: {report_path}")
+            return None
+
+        report_data = json.loads(storage_agg.read_text(report_path))
+        inn = report_data.get('participantId')
+
+        if not inn:
+            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
+            return None
+
+        # 3. Инициализация API
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            logger.error(f"[!] JWT токен для ИНН {inn} не найден.")
+            return None
+
+        api = HonestSignAPI(token=token)
+
+        # 4. Запрос статуса
+        logger.info(f"[*] Запрос статуса документа {doc_id} для наборов {task_uuid}...")
+        status_res = api.doc(doc_id, pg=group)
+
+        if not status_res:
+            logger.error("[!] Пустой ответ от API.")
+            return None
+
+        # 5. Сохранение
+        storage_aggs = get_storage(agg_sets_path, s3_config)
+        output_status_path = f"{agg_sets_path.rstrip('/')}/{task_uuid}.json"
+
+        temp_local = Path(f"temp_agg_set_status_{task_uuid}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            json.dump(status_res, f, indent=4, ensure_ascii=False)
+
+        logger.info(f"[*] Сохранение статуса агрегации наборов в {output_status_path}")
+        storage_aggs.upload(str(temp_local), output_status_path)
+
+        # Установка тегов статуса
+        target_obj = status_res[0] if isinstance(status_res, list) and len(status_res) > 0 else status_res
+        doc_status = target_obj.get('status') if isinstance(target_obj, dict) else None
+        if doc_status:
+            storage_aggs.set_tags(output_status_path, {"status": doc_status})
+
+        try: temp_local.unlink()
+        except: pass
+
+        return status_res
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в update_aggregation_set_status: {e}")
+        return str(e)
+
 
 def update_introduce_status(order_id: str, group: str):
     """
@@ -1739,6 +2080,9 @@ def main():
     parser.add_argument("--create-aggregation", help="Создать отчет об агрегации для ЛК по UUID задания оборудования")
     parser.add_argument("--send-aggregation", help="Отправить отчет об агрегации в ЛК по UUID задания оборудования")
     parser.add_argument("--aggregation-status", help="Получить статус отчета об агрегации по UUID задания оборудования")
+    parser.add_argument("--create-aggregation-set", help="Создать отчет об агрегации наборов для ЛК по UUID отчета оборудования")
+    parser.add_argument("--send-aggregation-set", help="Отправить отчет об агрегации наборов в ЛК по UUID отчета оборудования")
+    parser.add_argument("--aggregation-set-status", help="Получить статус отчета об агрегации наборов по UUID отчета оборудования")
     parser.add_argument("--create-introduce", help="Создать задачу на ввод в оборот по orderId (UUID)")
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
     parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
@@ -1852,6 +2196,32 @@ def main():
 
     if args.aggregation_status:
         result = update_aggregation_status(args.aggregation_status, args.group)
+        if result and "error" not in str(result).lower():
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"Результат: {result}")
+        return
+
+    if args.create_aggregation_set:
+        result = create_aggregation_set_report(args.create_aggregation_set, args.group, inn_override=args.inn)
+        if result:
+            logger.info(f"[+++] Отчет об агрегации наборов успешно создан для {result}")
+        else:
+            logger.error(f"[!] Не удалось создать отчет об агрегации наборов для {args.create_aggregation_set}")
+        return
+
+    if args.send_aggregation_set:
+        result = sign_and_send_aggregation_set(args.send_aggregation_set, args.group, args.signing_dir, args.timeout,
+                                            refresh_token=args.refresh_token)
+        if result and "error" not in str(result).lower():
+            logger.info(f"[+++] Отчет об агрегации наборов успешно отправлен!")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            logger.error(f"[!] Не удалось отправить отчет об агрегации наборов.")
+        return
+
+    if args.aggregation_set_status:
+        result = update_aggregation_set_status(args.aggregation_set_status, args.group)
         if result and "error" not in str(result).lower():
             print(json.dumps(result, indent=2, ensure_ascii=False))
         else:

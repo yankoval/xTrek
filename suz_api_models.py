@@ -5,8 +5,16 @@ from typing import List, Optional, Dict, Any
 # --- Вспомогательный базовый класс ---
 class SUZBase:
     def to_dict(self):
-        # Исключаем None значения, чтобы JSON был чистым
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        def _clean_none(obj):
+            if isinstance(obj, dict):
+                return {k: _clean_none(v) for k, v in obj.items() if v is not None}
+            elif isinstance(obj, list):
+                return [_clean_none(v) for v in obj if v is not None]
+            else:
+                return obj
+
+        # Исключаем None значения рекурсивно, чтобы JSON был чистым
+        return _clean_none(asdict(self))
     
     def to_json(self):
         # Используем ensure_ascii=True, чтобы спецсимволы (ASCII 29) экранировались как \u001d
@@ -102,7 +110,7 @@ class IntroduceMessage(SUZBase):
 @dataclass
 class AggregationUnit(SUZBase):
     sntins: List[str] = field(default_factory=list) # Для товаров
-    aggregationType: str = "AGGREGATION"
+    aggregationType: Optional[str] = "AGGREGATION"
     unitSerialNumber: str = ""
     unitSerialNumberList: Optional[List[str]] = None # Для вложенных коробов
 
@@ -124,9 +132,11 @@ class DocumentWrapper(SUZBase):
 @dataclass
 class EquipmentAggBox(SUZBase):
     boxNumber: str
-    productNumbersFull: List[str]
+    productNumbersFull: Optional[List[str]] = field(default_factory=list)
     Number: Optional[int] = None
     boxTime: Optional[str] = None
+    boxAgregate: Optional[bool] = None
+    productNumbers: Optional[List[str]] = field(default_factory=list)
 
 @dataclass
 class EquipmentAggTaskReport(SUZBase):
@@ -135,8 +145,14 @@ class EquipmentAggTaskReport(SUZBase):
     startTime: Optional[str] = None
     endTime: Optional[str] = None
     operator: Optional[str] = None
+    operators: Optional[List[str]] = field(default_factory=list)
     model: Optional[str] = None
     build: Optional[str] = None
+    sampleNumbers: Optional[List[str]] = field(default_factory=list)
+    sampleNumbersFull: Optional[List[str]] = None
+    defectiveCodes: Optional[List[str]] = None
+    defectiveCodesFull: Optional[List[str]] = None
+    emptyNumbers: Optional[List[str]] = None
 
 @dataclass
 class EquipmentAggTask(SUZBase):
