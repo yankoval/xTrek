@@ -90,6 +90,35 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
 
         logger.info(f"[*] Определен ИНН: {inn} для GTIN: {gtin}")
 
+        # Получаем данные из НК для определения типа (UNIT/SET)
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            # Попробуем получить новый если нет
+            token = get_new_token(inn=inn, mode='jwt')
+            if token:
+                token_processor.save_token(token)
+
+        if not token:
+            raise ValueError(f"JWT токен для ИНН {inn} не найден, не удалось получить данные из НК")
+
+        nk = NK(token=token)
+        feed = nk.feedProduct(gtin)
+        if not feed:
+            raise ValueError(f"Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
+
+        f_res = feed.get('result', [])
+        if isinstance(f_res, list) and len(f_res) > 0:
+            f_res = f_res[0]
+        else:
+            raise ValueError(f"Пустой результат в feedProduct для GTIN {gtin}")
+
+        is_set = f_res.get('is_set', False)
+        cis_type = "SET" if is_set else "UNIT"
+        logger.info(f"[*] Для GTIN {gtin} определен тип: {cis_type} (is_set={is_set})")
+
         # Формируем структуру заказа
         attr = OrderAttributes(
             productionOrderId=production_order_id,
@@ -104,7 +133,7 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
             quantity=quantity,
             serialNumberType="OPERATOR",
             templateId=47,
-            cisType="UNIT"
+            cisType=cis_type
         )
 
         order = EmissionOrder(
