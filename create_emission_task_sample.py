@@ -7,7 +7,6 @@ import uuid
 import logging
 import inspect
 from pathlib import Path
-from typing import Any
 
 # Добавляем текущую директорию в путь поиска модулей
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,60 +37,16 @@ SIGNING_TIMEOUT = 60
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 def create_emission_task(production_order_id: str, group: str, contact: str):
     """
     Создает структуру заказа на эмиссию на основе производственного заказа из S3
     и сохраняет её обратно в S3.
     """
-def file_exchange_signing(content: Any, inn: str, signing_dir: str, timeout: int, suffix: str = "doc") -> tuple:
-    """
-    Универсальная процедура подписи через файловый обмен с демоном.
-    Записывает контент, ждет подпись и возвращает (doc_base64, sig_base64, body_path, signature_path).
-    """
-    work_dir = Path(signing_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    unique_id = uuid.uuid4()
-    body_filename = f"{inn}_{unique_id}_{suffix}.json"
-    body_path = work_dir / body_filename
-    signature_path = work_dir / f"{body_filename}.sig"
-
-    try:
-        with open(body_path, "wb") as f:
-            if isinstance(content, str):
-                f.write(content.encode("utf-8"))
-            elif isinstance(content, (dict, list)):
-                # Для СУЗ важен компактный JSON, для ЧЗ обычно тоже не вредит.
-                f.write(json.dumps(content, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
-            else:
-                f.write(content)
-
-        logger.info(f"[*] Ожидание подписи для {body_path}...")
-        start_time = time.time()
-        while not signature_path.exists():
-            if time.time() - start_time > timeout:
-                logger.error(f"[!] Таймаут ({timeout}с) ожидания подписи для {body_filename}")
-                return None, None, body_path, signature_path
-            time.sleep(1)
-
-        # Небольшая пауза, чтобы файл подписи успел дозаписаться
-        time.sleep(0.5)
-
-        with open(body_path, "rb") as f:
-            doc_bytes = f.read()
-            doc_base64 = base64.b64encode(doc_bytes).decode("utf-8")
-
-        with open(signature_path, "r", encoding="utf-8") as f:
-            sig_base64 = f.read().strip()
-
-        return doc_base64, sig_base64, body_path, signature_path
-
-    except Exception as e:
-        logger.error(f"[!] Ошибка в file_exchange_signing: {e}")
-        return None, None, body_path, signature_path
-
     try:
         config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        production_orders_path = config.get('production_orders_path')
         emission_orders_path = config.get('emission_orders_path')
 
         if not all([production_orders_path, emission_orders_path]):
@@ -255,16 +210,34 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
             storage_orders.mark_error(order_path)
             return None
 
-        # 2. Подпись
-        doc_base64, sig_base64, body_path, signature_path = file_exchange_signing(
-            order_data, inn, signing_dir, timeout, suffix="order"
-        )
+        # 2. Подготовка к подписи
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        if not doc_base64 or not sig_base64:
-            storage_orders.mark_error(order_path)
-            return None
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_order.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
 
         try:
+            with open(body_path, "w", encoding="utf-8") as f:
+                # СУЗ требует компактный JSON без пробелов между ключами.
+                # Используем ensure_ascii=True (по умолчанию) для экранирования ASCII 29 как \u001d.
+                json.dump(order_data, f, separators=(',', ':'))
+
+            logger.info(f"[*] Файл заказа сохранен в: {body_path}. Ожидание подписи...")
+
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error(f"[!] Таймаут ({timeout}с): Файл подписи {signature_path.name} не найден.")
+                    storage_orders.mark_error(order_path)
+                    return None
+                time.sleep(1)
+
+            time.sleep(0.5)
+            logger.info("[+] Подпись обнаружена!")
+
             # 3. Отправка в СУЗ
             suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
             logger.info(f"[*] Отправка заказа в СУЗ (omsId: {final_oms_id})...")
@@ -279,7 +252,7 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
                     storage_receipts = get_storage(emission_receipts_path, s3_config)
                     remote_receipt_path = f"{emission_receipts_path.rstrip('/')}/{production_order_id}.json"
 
-                    temp_receipt = Path(f"temp_receipt_order_{production_order_id}.json")
+                    temp_receipt = work_dir / f"receipt_{unique_id}.json"
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result.to_dict(), f, indent=4)
 
@@ -683,15 +656,27 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
             return None
 
         # Подпись
-        doc_base64, sig_base64, body_path, signature_path = file_exchange_signing(
-            task_data, inn, signing_dir, timeout, suffix="utilisation"
-        )
-
-        if not doc_base64 or not sig_base64:
-            storage_tasks.mark_error(task_path)
-            return None
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_utilisation.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
 
         try:
+            with open(body_path, "w", encoding="utf-8") as f:
+                # Важно: ensure_ascii=True для корректной передачи GS1-разделителей
+                json.dump(task_data, f, separators=(',', ':'))
+
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    storage_tasks.mark_error(task_path)
+                    return None
+                time.sleep(1)
+
             # Отправка
             suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
             logger.info(f"[*] Отправка отчета в СУЗ (orderId: {order_id})...")
@@ -704,7 +689,7 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
                 storage_receipts = get_storage(utilisation_receipts_path, s3_config)
                 remote_receipt_path = f"{utilisation_receipts_path.rstrip('/')}/{order_id}.json"
 
-                temp_receipt = Path(f"temp_receipt_util_{order_id}.json")
+                temp_receipt = work_dir / f"receipt_util_{unique_id}.json"
                 with open(temp_receipt, 'w', encoding='utf-8') as f:
                     json.dump({"reportId": report_id, "orderId": order_id, "omsId": final_oms_id}, f, indent=4)
 
@@ -1016,15 +1001,42 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             logger.info(f"[*] Токен участника: INN={payload.get('inn')}, PID={payload.get('pid')}, Name={payload.get('full_name')}")
         except: pass
 
-        # 3. Подпись
-        doc_base64, sig_base64, body_path, signature_path = file_exchange_signing(
-            report_content, inn, signing_dir, timeout, suffix="agg"
-        )
-
-        if not doc_base64 or not sig_base64:
-            return None
+        # 3. Подготовка к подписи
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_agg.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
 
         try:
+            with open(body_path, "wb") as f:
+                # ЧЗ крайне чувствителен к изменению тела документа после подписи.
+                # Поэтому мы используем исходные байты, загруженные из S3.
+                if isinstance(report_content, str):
+                    f.write(report_content.encode('utf-8'))
+                else:
+                    f.write(report_content)
+
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    return None
+                time.sleep(1)
+
+            # Читаем тело и подпись как байты, кодируем в Base64
+            # Мы повторно читаем файл body_path, чтобы гарантировать
+            # побайтовую идентичность с тем, что видел демон подписи.
+            with open(body_path, "rb") as f:
+                doc_bytes = f.read()
+                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+
+            with open(signature_path, "r", encoding="utf-8") as f:
+                # В данном проекте демон подписи сохраняет подпись в формате Base64.
+                # Повторное кодирование приведет к ошибке проверки подписи в ЛК.
+                sig_base64 = f.read().strip()
 
             # Создаем обертку
             wrapper = DocumentWrapper(
@@ -1051,7 +1063,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                     storage_receipts = get_storage(agg_receipts_path, s3_config)
                     remote_receipt_path = f"{agg_receipts_path.rstrip('/')}/{task_uuid}.json"
 
-                    temp_receipt = Path(f"temp_receipt_agg_{task_uuid}.json")
+                    temp_receipt = work_dir / f"receipt_agg_{unique_id}.json"
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result, f, indent=4, ensure_ascii=False)
 
@@ -1446,14 +1458,34 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             return None
 
         # Подпись
-        doc_base64, sig_base64, body_path, signature_path = file_exchange_signing(
-            task_content, inn, signing_dir, timeout, suffix="introduce"
-        )
-
-        if not doc_base64 or not sig_base64:
-            return None
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_introduce.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
 
         try:
+            with open(body_path, "wb") as f:
+                if isinstance(task_content, str):
+                    f.write(task_content.encode('utf-8'))
+                else:
+                    f.write(task_content)
+
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    return None
+                time.sleep(1)
+
+            with open(body_path, "rb") as f:
+                doc_bytes = f.read()
+                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+
+            with open(signature_path, "r", encoding="utf-8") as f:
+                sig_base64 = f.read().strip()
 
             wrapper = DocumentWrapper(
                 document_format="MANUAL",
@@ -1472,7 +1504,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                     storage_receipts = get_storage(introduce_receipts_path, s3_config)
                     remote_receipt_path = f"{introduce_receipts_path.rstrip('/')}/{order_id}.json"
 
-                    temp_receipt = Path(f"temp_receipt_intro_{order_id}.json")
+                    temp_receipt = work_dir / f"receipt_intro_{unique_id}.json"
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result, f, indent=4, ensure_ascii=False)
 
@@ -1777,14 +1809,34 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
             return None
 
         # 3. Подпись
-        doc_base64, sig_base64, body_path, signature_path = file_exchange_signing(
-            report_content, inn, signing_dir, timeout, suffix="agg_set"
-        )
-
-        if not doc_base64 or not sig_base64:
-            return None
+        work_dir = Path(signing_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_agg_set.json"
+        body_path = work_dir / body_filename
+        signature_path = work_dir / f"{body_filename}.sig"
 
         try:
+            with open(body_path, "wb") as f:
+                if isinstance(report_content, str):
+                    f.write(report_content.encode('utf-8'))
+                else:
+                    f.write(report_content)
+
+            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            start_time = time.time()
+            while not signature_path.exists():
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    return None
+                time.sleep(1)
+
+            with open(body_path, "rb") as f:
+                doc_bytes = f.read()
+                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+
+            with open(signature_path, "r", encoding="utf-8") as f:
+                sig_base64 = f.read().strip()
 
             # Создаем обертку для SETS_AGGREGATION
             wrapper = DocumentWrapper(
@@ -1804,7 +1856,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                 storage_receipts = get_storage(agg_set_receipts_path, s3_config)
                 remote_receipt_path = f"{agg_set_receipts_path.rstrip('/')}/{task_uuid}.json"
 
-                temp_receipt = Path(f"temp_receipt_agg_set_{task_uuid}.json")
+                temp_receipt = work_dir / f"receipt_agg_set_{unique_id}.json"
                 with open(temp_receipt, 'w', encoding='utf-8') as f:
                     json.dump(result, f, indent=4, ensure_ascii=False)
 
