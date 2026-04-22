@@ -1627,6 +1627,7 @@ def update_aggregation_status(task_uuid: str, group: str):
         logger.error(f"[!] Ошибка в update_aggregation_status: {e}")
         return str(e)
 
+
 def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str = None):
     """
     Создает отчет об агрегации наборов (SET) для ЛК на основе отчета оборудования.
@@ -1677,7 +1678,7 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
             first_box = report_obj.readyBox[0]
             box_number = first_box.boxNumber
             # Очищаем код набора от криптохвоста
-            clean_box_number = box_number.split('\u001d')[0]
+            clean_box_number = box_number.split('')[0]
             # Извлекаем GTIN (позиции 3-16 для формата 01...)
             if clean_box_number.startswith('01'):
                 gtin = clean_box_number[2:16]
@@ -1709,7 +1710,7 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
                     inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
 
         if not inn:
-            logger.error(f"[!] Не удалось определить ИНН и не задан --inn")
+            logger.error("[!] Не удалось определить ИНН и не задан --inn")
             return None
 
         logger.info(f"[*] Используется ИНН участника: {inn}")
@@ -1718,13 +1719,13 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
         aggregation_units = []
         for box in report_obj.readyBox:
             # Очистка кода набора (unitSerialNumber) от криптохвоста
-            clean_unit_sn = box.boxNumber.split('\u001d')[0]
+            clean_unit_sn = box.boxNumber.split('')[0]
 
             # Очистка кодов комплектующих (sntins) от криптохвоста
             clean_sntins = []
             codes_list = box.productNumbersFull or []
             for code in codes_list:
-                clean_code = code.split('\u001d')[0]
+                clean_code = code.split('')[0]
                 clean_sntins.append(clean_code)
 
             unit = AggregationUnit(
@@ -1808,7 +1809,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
             logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}")
             return None
 
-        # 3. Подпись
+        # 3. Подготовка к подписи
         work_dir = Path(signing_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
         unique_id = uuid.uuid4()
@@ -1817,7 +1818,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
         signature_path = work_dir / f"{body_filename}.sig"
 
         try:
-            with open(body_path, "wb") as f:
+            with open(body_path, 'wb') as f:
                 if isinstance(report_content, str):
                     f.write(report_content.encode('utf-8'))
                 else:
@@ -1831,11 +1832,11 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                     return None
                 time.sleep(1)
 
-            with open(body_path, "rb") as f:
+            with open(body_path, 'rb') as f:
                 doc_bytes = f.read()
                 doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
 
-            with open(signature_path, "r", encoding="utf-8") as f:
+            with open(signature_path, 'r', encoding='utf-8') as f:
                 sig_base64 = f.read().strip()
 
             # Создаем обертку для SETS_AGGREGATION
@@ -1856,7 +1857,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                 storage_receipts = get_storage(agg_set_receipts_path, s3_config)
                 remote_receipt_path = f"{agg_set_receipts_path.rstrip('/')}/{task_uuid}.json"
 
-                temp_receipt = work_dir / f"receipt_agg_set_{unique_id}.json"
+                temp_receipt = Path(f"temp_receipt_agg_set_{task_uuid}.json")
                 with open(temp_receipt, 'w', encoding='utf-8') as f:
                     json.dump(result, f, indent=4, ensure_ascii=False)
 
@@ -1957,7 +1958,7 @@ def update_aggregation_set_status(task_uuid: str, group: str):
         target_obj = status_res[0] if isinstance(status_res, list) and len(status_res) > 0 else status_res
         doc_status = target_obj.get('status') if isinstance(target_obj, dict) else None
         if doc_status:
-            storage_aggs.set_tags(output_status_path, {"status": doc_status})
+            storage_aggs.set_tags(output_status_path, {'status': doc_status})
 
         try: temp_local.unlink()
         except: pass
@@ -1967,7 +1968,6 @@ def update_aggregation_set_status(task_uuid: str, group: str):
     except Exception as e:
         logger.error(f"[!] Ошибка в update_aggregation_set_status: {e}")
         return str(e)
-
 
 def update_introduce_status(order_id: str, group: str):
     """
