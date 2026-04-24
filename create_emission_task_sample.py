@@ -38,6 +38,136 @@ SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def process_incoming_task(s3_full_key: str):
+    """
+    Принимает задание на производство, фильтрует, нормализует и сохраняет.
+    s3_full_key: bucket/folder/key
+    """
+    if not s3_full_key.startswith('s3://'):
+        s3_path = f"s3://{s3_full_key}"
+    else:
+        s3_path = s3_full_key
+
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        production_orders_path = config.get('production_orders_path')
+
+        if not production_orders_path:
+            logger.error("[!] В конфигурации отсутствует production_orders_path")
+            raise ValueError("Missing production_orders_path in config")
+
+        storage = get_storage(s3_path, s3_config)
+
+        # 1. Проверяем наличие тега status
+        tags = storage.get_tags(s3_path)
+        if 'status' in tags:
+            logger.info(f"[*] Объект {s3_path} уже имеет тег status: {tags['status']}. Завершение.")
+            return
+
+        # 2. Скачиваем/читаем файл
+        original_filename = os.path.basename(s3_path)
+        if not original_filename.lower().endswith('.json'):
+            logger.error(f"[!] Некорректное расширение файла: {original_filename}")
+            storage.set_tags(s3_path, {'status': 'error', 'error': 'format'})
+            raise ValueError(f"File {original_filename} is not JSON")
+
+        content = storage.read_text(s3_path)
+
+        # 3. Парсим и валидируем
+        try:
+            prod_data = json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"[!] Ошибка парсинга JSON: {e}")
+            storage.set_tags(s3_path, {'status': 'error', 'error': 'format'})
+            raise
+
+        mandatory_fields = ['Gtin', 'Quantity', 'PasportData']
+        for field in mandatory_fields:
+            if field not in prod_data:
+                logger.error(f"[!] В задании отсутствует обязательное поле: {field}")
+                # Для ошибок валидации в задании не указан тег, но логично поставить error
+                storage.set_tags(s3_path, {'status': 'error', 'error': 'validation'})
+                raise ValueError(f"Missing mandatory field: {field}")
+
+        # 4. Нормализация GTIN
+        gtin = str(prod_data.get('Gtin', '')).strip()
+        if len(gtin) > 14 or not gtin.isdigit():
+            logger.error(f"[!] Некорректный GTIN: {gtin}")
+            storage.set_tags(s3_path, {'status': 'error', 'error': 'gtin'})
+            raise ValueError(f"Invalid GTIN format: {gtin}")
+
+        normalized_gtin = gtin.zfill(14)
+        prod_data['Gtin'] = normalized_gtin
+
+        # 5. Запрос в NK.feedProduct
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
+        inn = get_inn_by_gtin(normalized_gtin, db_path=db_path)
+
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН для GTIN {normalized_gtin}")
+            storage.set_tags(s3_path, {'status': 'error', 'error': 'Gtin_not_found'})
+            raise ValueError(f"INN not found for GTIN {normalized_gtin}")
+
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            token = get_new_token(inn=inn, mode='jwt')
+            if token:
+                token_processor.save_token(token)
+
+        if not token:
+            raise ValueError(f"JWT токен для ИНН {inn} не найден")
+
+        nk = NK(token=token)
+        feed = nk.feedProduct(normalized_gtin)
+
+        if feed is None:
+            logger.error(f"[!] Ошибка связи с NK для GTIN {normalized_gtin}")
+            raise ValueError(f"NK API error or connection failed for GTIN {normalized_gtin}")
+
+        if not feed.get('result'):
+            logger.error(f"[!] GTIN {normalized_gtin} не найден в NK")
+            storage.set_tags(s3_path, {'status': 'error', 'error': 'Gtin_not_found'})
+            return
+
+        # Проверяем, является ли это набором (SET)
+        f_res = feed.get('result', [])
+        if isinstance(f_res, list) and len(f_res) > 0:
+            f_res = f_res[0]
+
+        # 6. Выгрузка (для SET обязательно, для UNIT по уточнению пользователя тоже)
+        article = prod_data.get('Article', 'unknown')
+        pasport = prod_data.get('PasportData', {})
+        batch_number = pasport.get('Batch_number', 'unknown')
+
+        new_filename = f"T-{article}-{batch_number}-{original_filename}"
+        target_path = f"{production_orders_path.rstrip('/')}/{new_filename}"
+
+        storage_prod = get_storage(production_orders_path, s3_config)
+
+        # Сохраняем нормализованный JSON
+        temp_file = Path(f"temp_norm_{original_filename}")
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(prod_data, f, indent=4, ensure_ascii=False)
+
+        logger.info(f"[*] Выгрузка нормализованного задания в: {target_path}")
+        storage_prod.upload(str(temp_file), target_path)
+
+        try: temp_file.unlink()
+        except: pass
+
+        # 7. Устанавливаем тег task:created
+        storage.set_tags(s3_path, {'task': 'created'})
+        logger.info(f"[+++] Задание {original_filename} успешно обработано")
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в process_incoming_task: {e}")
+        raise
+
 def create_emission_task(production_order_id: str, group: str, contact: str):
     """
     Создает структуру заказа на эмиссию на основе производственного заказа из S3
@@ -2101,6 +2231,7 @@ def update_introduce_status(order_id: str, group: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
+    parser.add_argument("--process-task", help="Обработать входящее задание на производство (S3 key)")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
     parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
@@ -2156,6 +2287,10 @@ def main():
             print(f"Успешно получено кодов: {len(result.get('codes', []))}")
         else:
             print("Не удалось получить коды.")
+        return
+
+    if args.process_task:
+        process_incoming_task(args.process_task)
         return
 
     if args.create_task:
