@@ -27,6 +27,8 @@ class BaseStorage:
         pass
     def set_tags(self, path, tags):
         pass
+    def get_tags(self, path):
+        pass
 
 class LocalStorage(BaseStorage):
     def list_files(self, path, pattern):
@@ -86,6 +88,18 @@ class LocalStorage(BaseStorage):
                 p.replace(new_path)
                 return str(new_path)
         return path
+
+    def get_tags(self, path):
+        # Для локального хранилища мы не храним теги в явном виде,
+        # но можем имитировать их по расширению файла.
+        p = Path(path)
+        if p.suffix == '.processing':
+            return {'status': 'processing'}
+        if p.suffix == '.finished':
+            return {'status': 'finished'}
+        if p.suffix == '.error':
+            return {'status': 'error'}
+        return {}
 
 class S3Storage(BaseStorage):
     def __init__(self, s3_config):
@@ -189,7 +203,11 @@ class S3Storage(BaseStorage):
 
     def set_tags(self, path, tags):
         bucket, key = self._parse_s3_url(path)
-        tag_set = [{'Key': k, 'Value': str(v)} for k, v in tags.items()]
+        # Получаем текущие теги, чтобы не перезаписать их полностью, а обновить
+        current_tags = self.get_tags(path)
+        current_tags.update(tags)
+
+        tag_set = [{'Key': k, 'Value': str(v)} for k, v in current_tags.items()]
         try:
             self.s3.put_object_tagging(
                 Bucket=bucket,
@@ -199,6 +217,15 @@ class S3Storage(BaseStorage):
         except Exception as e:
             logger.error(f"Error setting S3 tags: {e}")
         return path
+
+    def get_tags(self, path):
+        bucket, key = self._parse_s3_url(path)
+        try:
+            response = self.s3.get_object_tagging(Bucket=bucket, Key=key)
+            return {t['Key']: t['Value'] for t in response.get('TagSet', [])}
+        except Exception as e:
+            logger.error(f"Error getting S3 tags: {e}")
+            return {}
 
 def get_storage(path, s3_config=None):
     if str(path).startswith('s3://'):
