@@ -18,9 +18,9 @@ from requests import HTTPError
 import json
 import urllib3
 from typing import List, Dict, Any, Generator, Union
-from suz_api_models import EmissionOrderreceipts
-from org_manager import OrganizationManager
-from tokens import TokenProcessor
+from .suz_api_models import EmissionOrderreceipts
+from .org_manager import OrganizationManager
+from .tokens import TokenProcessor
 
 # logging
 logger = logging.getLogger(__name__)
@@ -275,7 +275,7 @@ class SUZ:
             return ""
 
 # Использование
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description='Process some parameters.',
                                      epilog=textwrap.dedent('''   additional information:
  You have to specify parameters: omsId, token, client_token. 
@@ -333,7 +333,8 @@ if __name__ == "__main__":
     if inn and (not token or not omsId or not clientToken):
         logger.info(f"Поиск параметров для ИНН: {inn}")
         base_path = os.path.dirname(os.path.abspath(__file__))
-        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        orgs_dir = os.path.join(base_path, 'my_orgs')
+        org_manager = OrganizationManager(orgs_dir)
 
         found_org = org_manager.find(inn=inn)
         if not found_org:
@@ -349,7 +350,7 @@ if __name__ == "__main__":
             clientToken = clientToken or found_org.connection_id
 
             if not token:
-                token_processor = TokenProcessor(org_manager=org_manager)
+                token_processor = TokenProcessor(orgs_dir=orgs_dir, org_manager=org_manager)
                 token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=clientToken)
                 if token:
                     logger.info("[*] Токен успешно получен из базы")
@@ -492,3 +493,6 @@ if __name__ == "__main__":
         print(f"Error: {str(e)}")
         import traceback
         traceback.print_exc()
+
+if __name__ == "__main__":
+    main()

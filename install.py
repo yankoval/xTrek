@@ -24,7 +24,7 @@ def check_dependencies():
 if __name__ == "__main__":
     if check_dependencies():
         print("Запуск GUI...")
-        from intersect_gui import main
+        from xtrek.IntersectGUI import main
         main()
     else:
         input("Нажмите Enter для выхода...")

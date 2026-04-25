@@ -9,11 +9,9 @@ import argparse
 from typing import List, Dict, Any, Generator
 
 # Настройка путей для импорта
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 try:
-    from tokens import TokenProcessor
-except ImportError:
+    from .tokens import TokenProcessor
+except (ImportError, ValueError):
     TokenProcessor = None
 
 # Отключаем предупреждения SSL
@@ -201,7 +199,10 @@ def main():
         
         token_inn = args.find_token_by_inn or os.getenv("FIND_TOKEN_BY_INN")
         if token_inn and TokenProcessor:
-            tp = TokenProcessor()
+            # Передаем путь к my_orgs внутри пакета
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            orgs_dir = os.path.join(base_path, 'my_orgs')
+            tp = TokenProcessor(orgs_dir=orgs_dir)
             token_data = tp.get_token_by_inn(token_inn)
             if token_data:
                 meta = ['user_status', 'full_name', 'scope', 'inn', 'pid', 'id', 'exp']

@@ -6,8 +6,8 @@ import logging
 from typing import Dict, List, Optional, Any
 from botocore.exceptions import ClientError
 from pathlib import Path
-from storage import get_storage
-from config_loader import load_config
+from .storage import get_storage
+from .config_loader import load_config
 
 # Настройка логирования
 logger = logging.getLogger("OrganizationManager")

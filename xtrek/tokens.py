@@ -6,9 +6,9 @@ import re
 import os
 import logging
 from pathlib import Path
-from org_manager import OrganizationManager
-from storage import get_storage
-from config_loader import load_config
+from .org_manager import OrganizationManager
+from .storage import get_storage
+from .config_loader import load_config
 
 # Настройка логирования
 logger = logging.getLogger("TokenProcessor")
@@ -48,7 +48,10 @@ class TokenProcessor:
         if org_manager:
             self.org_manager = org_manager
         else:
-            self.org_manager = OrganizationManager(orgs_dir or 'my_orgs')
+            if not os.path.isabs(orgs_dir):
+                base_path = os.path.dirname(os.path.abspath(__file__))
+                orgs_dir = os.path.join(base_path, orgs_dir)
+            self.org_manager = OrganizationManager(orgs_dir)
 
         self.tokens = []
         self.processed_tokens = []

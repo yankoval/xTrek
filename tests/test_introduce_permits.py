@@ -1,16 +1,16 @@
 import json
 import pytest
 from unittest.mock import MagicMock, patch
-from suz_api_models import GtinDocument
+from xtrek.suz_api_models import GtinDocument
 
-@patch("create_emission_task_sample.load_config")
-@patch("create_emission_task_sample.get_storage")
-@patch("create_emission_task_sample.get_inn_by_gtin")
-@patch("create_emission_task_sample.NK")
-@patch("create_emission_task_sample.OrganizationManager")
-@patch("create_emission_task_sample.TokenProcessor")
+@patch("xtrek.create_emission_task_sample.load_config")
+@patch("xtrek.create_emission_task_sample.get_storage")
+@patch("xtrek.create_emission_task_sample.get_inn_by_gtin")
+@patch("xtrek.create_emission_task_sample.NK")
+@patch("xtrek.create_emission_task_sample.OrganizationManager")
+@patch("xtrek.create_emission_task_sample.TokenProcessor")
 def test_create_introduce_task_with_new_permits_logic(mock_token_proc, mock_org_man, mock_nk, mock_get_inn, mock_get_storage, mock_load_config):
-    from create_emission_task_sample import create_introduce_task
+    from xtrek.create_emission_task_sample import create_introduce_task
 
     mock_load_config.return_value = {
         "kodes": "s3://bucket/kodes",
@@ -72,14 +72,14 @@ def test_create_introduce_task_with_new_permits_logic(mock_token_proc, mock_org_
     # but here we can just use a side effect on upload to read the file before it's deleted.
     pass
 
-@patch("create_emission_task_sample.load_config")
-@patch("create_emission_task_sample.get_storage")
-@patch("create_emission_task_sample.get_inn_by_gtin")
-@patch("create_emission_task_sample.NK")
-@patch("create_emission_task_sample.OrganizationManager")
-@patch("create_emission_task_sample.TokenProcessor")
+@patch("xtrek.create_emission_task_sample.load_config")
+@patch("xtrek.create_emission_task_sample.get_storage")
+@patch("xtrek.create_emission_task_sample.get_inn_by_gtin")
+@patch("xtrek.create_emission_task_sample.NK")
+@patch("xtrek.create_emission_task_sample.OrganizationManager")
+@patch("xtrek.create_emission_task_sample.TokenProcessor")
 def test_create_introduce_task_with_new_permits_logic_verified(mock_token_proc, mock_org_man, mock_nk, mock_get_inn, mock_get_storage, mock_load_config):
-    from create_emission_task_sample import create_introduce_task
+    from xtrek.create_emission_task_sample import create_introduce_task
 
     mock_load_config.return_value = {
         "kodes": "s3://bucket/kodes",
@@ -148,14 +148,14 @@ def test_create_introduce_task_with_new_permits_logic_verified(mock_token_proc, 
     assert cert['certificate_date'] == "2024-10-11"
     assert cert['certificate_type'] == "CONFORMITY_DECLARATION"
 
-@patch("create_emission_task_sample.load_config")
-@patch("create_emission_task_sample.get_storage")
-@patch("create_emission_task_sample.get_inn_by_gtin")
-@patch("create_emission_task_sample.NK")
-@patch("create_emission_task_sample.OrganizationManager")
-@patch("create_emission_task_sample.TokenProcessor")
+@patch("xtrek.create_emission_task_sample.load_config")
+@patch("xtrek.create_emission_task_sample.get_storage")
+@patch("xtrek.create_emission_task_sample.get_inn_by_gtin")
+@patch("xtrek.create_emission_task_sample.NK")
+@patch("xtrek.create_emission_task_sample.OrganizationManager")
+@patch("xtrek.create_emission_task_sample.TokenProcessor")
 def test_create_introduce_task_error_no_permits(mock_token_proc, mock_org_man, mock_nk, mock_get_inn, mock_get_storage, mock_load_config):
-    from create_emission_task_sample import create_introduce_task
+    from xtrek.create_emission_task_sample import create_introduce_task
 
     mock_load_config.return_value = {
         "kodes": "s3://bucket/kodes",

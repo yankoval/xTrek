@@ -1,18 +1,18 @@
 import pytest
 import json
 from unittest.mock import MagicMock, patch
-from create_emission_task_sample import create_emission_task
+from xtrek.create_emission_task_sample import create_emission_task
 
 @pytest.fixture
 def mock_dependencies():
-    with patch('create_emission_task_sample.load_config') as mock_load_config, \
-         patch('create_emission_task_sample.get_storage') as mock_get_storage, \
-         patch('create_emission_task_sample.get_inn_by_gtin') as mock_get_inn, \
-         patch('create_emission_task_sample.OrganizationManager') as mock_om, \
-         patch('create_emission_task_sample.TokenProcessor') as mock_tp, \
-         patch('create_emission_task_sample.get_new_token') as mock_get_new_token, \
-         patch('create_emission_task_sample.NK') as mock_nk, \
-         patch('create_emission_task_sample.Path.unlink'):
+    with patch('xtrek.create_emission_task_sample.load_config') as mock_load_config, \
+         patch('xtrek.create_emission_task_sample.get_storage') as mock_get_storage, \
+         patch('xtrek.create_emission_task_sample.get_inn_by_gtin') as mock_get_inn, \
+         patch('xtrek.create_emission_task_sample.OrganizationManager') as mock_om, \
+         patch('xtrek.create_emission_task_sample.TokenProcessor') as mock_tp, \
+         patch('xtrek.create_emission_task_sample.get_new_token') as mock_get_new_token, \
+         patch('xtrek.create_emission_task_sample.NK') as mock_nk, \
+         patch('xtrek.create_emission_task_sample.Path.unlink'):
 
         yield {
             'load_config': mock_load_config,

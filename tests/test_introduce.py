@@ -1,7 +1,7 @@
 import json
 import pytest
 from unittest.mock import MagicMock, patch
-from suz_api_models import IntroduceMessage, IntroduceProduct, GtinDocument
+from xtrek.suz_api_models import IntroduceMessage, IntroduceProduct, GtinDocument
 
 def test_introduce_message_serialization():
     doc = GtinDocument(
@@ -31,14 +31,14 @@ def test_introduce_message_serialization():
     assert data["products"][0]["tnved_code"] == "3305900009"
     assert data["products"][0]["certificate_document_data"][0]["certificate_number"] == "CERT123"
 
-@patch("create_emission_task_sample.load_config")
-@patch("create_emission_task_sample.get_storage")
-@patch("create_emission_task_sample.get_inn_by_gtin")
-@patch("create_emission_task_sample.NK")
-@patch("create_emission_task_sample.OrganizationManager")
-@patch("create_emission_task_sample.TokenProcessor")
+@patch("xtrek.create_emission_task_sample.load_config")
+@patch("xtrek.create_emission_task_sample.get_storage")
+@patch("xtrek.create_emission_task_sample.get_inn_by_gtin")
+@patch("xtrek.create_emission_task_sample.NK")
+@patch("xtrek.create_emission_task_sample.OrganizationManager")
+@patch("xtrek.create_emission_task_sample.TokenProcessor")
 def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, mock_get_inn, mock_get_storage, mock_load_config):
-    from create_emission_task_sample import create_introduce_task
+    from xtrek.create_emission_task_sample import create_introduce_task
 
     mock_load_config.return_value = {
         "kodes": "s3://bucket/kodes",
@@ -80,7 +80,7 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
     # Mock for emission receipts search
     mock_storage.list_objects_v2.return_value = {"Contents": []}
 
-    with patch("create_emission_task_sample.Path") as mock_path:
+    with patch("xtrek.create_emission_task_sample.Path") as mock_path:
         mock_path.return_value.stem = "receipt_uuid"
 
         # We need to mock more for the loop over files if it's local, but let's assume S3 for simplicity or mock the loop

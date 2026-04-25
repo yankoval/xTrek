@@ -1,7 +1,7 @@
 import json
 import os
 import pytest
-from kinGenerator import generate_kin_report_from_files, KinReportGenerator
+from xtrek.kinGenerator import generate_kin_report_from_files, KinReportGenerator
 
 @pytest.mark.parametrize("test_dir_name", ["test1", "test2"])
 def test_generate_kin_report_logic_and_format(tmp_path, monkeypatch, test_dir_name):

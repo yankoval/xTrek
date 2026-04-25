@@ -36,7 +36,7 @@ curl -X POST "https://markirovka.crpt.ru/api/v3/true-api/auth/simpleSignIn/"%con
  -d @%USERPROFILE%"\get_token.json" >  %USERPROFILE%\token_%conId%.json
  
 REM Шаг 2 Скачеваем предворительно эметированные коды с помощью библиотеки хТрек  
-REM python suz.py --token %token% --omsid 3b1ed9ae-a5d9-4458-9f02-596781bd1e41 --client_token 02099dd7-e0ac-4ae0-8807-049e8577d995  --eorder a107c8be-e084-4497-8fae-8752c7c4d096 --qty=0
+REM python -m xtrek.suz --token %token% --omsid 3b1ed9ae-a5d9-4458-9f02-596781bd1e41 --client_token 02099dd7-e0ac-4ae0-8807-049e8577d995  --eorder a107c8be-e084-4497-8fae-8752c7c4d096 --qty=0
 
 REM  ШАГ 3 Преобразовываем полученные данные в CSV
 REM  ШАГ 3 Преобразовываем полученные данные в CSV

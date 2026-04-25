@@ -3,7 +3,7 @@ from unittest.mock import patch, MagicMock, mock_open
 import json
 import os
 from pathlib import Path
-from create_emission_task_sample import get_emission_kodes
+from xtrek.create_emission_task_sample import get_emission_kodes
 
 class TestGetEmissionKodes(unittest.TestCase):
     def setUp(self):
@@ -17,11 +17,11 @@ class TestGetEmissionKodes(unittest.TestCase):
         self.oms_id = "test-oms-id"
         self.inn = "1234567890"
 
-    @patch('create_emission_task_sample.load_config')
-    @patch('create_emission_task_sample.get_storage')
-    @patch('create_emission_task_sample.OrganizationManager')
-    @patch('create_emission_task_sample.TokenProcessor')
-    @patch('create_emission_task_sample.SUZ')
+    @patch('xtrek.create_emission_task_sample.load_config')
+    @patch('xtrek.create_emission_task_sample.get_storage')
+    @patch('xtrek.create_emission_task_sample.OrganizationManager')
+    @patch('xtrek.create_emission_task_sample.TokenProcessor')
+    @patch('xtrek.create_emission_task_sample.SUZ')
     def test_get_emission_kodes_success(self, mock_suz, mock_token_processor, mock_org_manager, mock_get_storage, mock_load_config):
         mock_load_config.return_value = self.config
 
@@ -76,9 +76,9 @@ class TestGetEmissionKodes(unittest.TestCase):
         mock_storage_kodes.upload.assert_called()
         mock_storage_emissions.mark_finished.assert_called()
 
-    @patch('create_emission_task_sample.load_config')
-    @patch('create_emission_task_sample.get_storage')
-    @patch('create_emission_task_sample.SUZ')
+    @patch('xtrek.create_emission_task_sample.load_config')
+    @patch('xtrek.create_emission_task_sample.get_storage')
+    @patch('xtrek.create_emission_task_sample.SUZ')
     def test_get_emission_kodes_too_many_codes(self, mock_suz, mock_get_storage, mock_load_config):
         mock_load_config.return_value = self.config
 
@@ -98,9 +98,9 @@ class TestGetEmissionKodes(unittest.TestCase):
         }]
 
         # We need to ensure SUZ init works in the function
-        with patch('create_emission_task_sample.OrganizationManager') as mock_om, \
-             patch('create_emission_task_sample.TokenProcessor') as mock_tp, \
-             patch('create_emission_task_sample.SUZ', return_value=mock_suz_instance):
+        with patch('xtrek.create_emission_task_sample.OrganizationManager') as mock_om, \
+             patch('xtrek.create_emission_task_sample.TokenProcessor') as mock_tp, \
+             patch('xtrek.create_emission_task_sample.SUZ', return_value=mock_suz_instance):
 
             mock_org = MagicMock()
             mock_org.oms_id = self.oms_id
