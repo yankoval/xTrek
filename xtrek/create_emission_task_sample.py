@@ -161,6 +161,8 @@ def process_incoming_task(s3_full_key: str):
         storage.set_tags(s3_path, {'task': 'created'})
         logger.info(f"[+++] Задание {original_filename} успешно обработано")
 
+        return Path(new_filename).stem
+
     except Exception as e:
         logger.error(f"[!] Ошибка в process_incoming_task: {e}")
         raise
@@ -2155,7 +2157,9 @@ def create_equipment_aggregation_task(production_order_id: str):
 
         # Сохранение в S3 (equipment-tasks)
         storage_tasks = get_storage(equipment_tasks_path, s3_config)
-        target_path = f"{equipment_tasks_path.rstrip('/')}/{task_uuid}.json"
+        # Выгружаем в S3 с именем равным production_order_id + расширение json
+        target_filename = production_order_id if production_order_id.lower().endswith('.json') else f"{production_order_id}.json"
+        target_path = f"{equipment_tasks_path.rstrip('/')}/{target_filename}"
 
         temp_local = Path(f"temp_eq_task_{task_uuid}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
@@ -2167,7 +2171,7 @@ def create_equipment_aggregation_task(production_order_id: str):
         try: temp_local.unlink()
         except: pass
 
-        return task_uuid
+        return production_order_id
 
     except Exception as e:
         logger.error(f"[!] Ошибка в create_equipment_aggregation_task: {e}")
@@ -2426,7 +2430,9 @@ def main():
         return
 
     if args.process_task:
-        process_incoming_task(args.process_task)
+        result = process_incoming_task(args.process_task)
+        if result:
+            print(result)
         return
 
     if args.create_equipment_task:
