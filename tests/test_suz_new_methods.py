@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import json
 import os
-from suz import SUZ
+from xtrek.suz import SUZ
 
 class TestSUZMethods(unittest.TestCase):
     def setUp(self):

@@ -2,16 +2,14 @@ import os
 import sys
 
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import argparse
 import logging
 import csv
 from datetime import datetime
 from openpyxl import load_workbook, Workbook
 from slugify import slugify
-from nkapi import NK
-from tokens import TokenProcessor
+from .nkapi import NK
+from .tokens import TokenProcessor
 
 
 # ---------------------------
@@ -216,9 +214,9 @@ def log_product_status(item: dict, gtin: str):
 # ---------------------------
 # CLI: запуск проверки
 # ---------------------------
-if __name__ == "__main__":
+def main():
     # Определяем имя файла лога по умолчанию
-    default_log_file = os.path.splitext(__file__)[0] + ".log"
+    default_log_file = os.path.splitext(os.path.abspath(__file__))[0] + ".log"
 
     parser = argparse.ArgumentParser(
         description="Получение данных из Национального Каталога Честный Знак через True API"
@@ -368,3 +366,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.exception(f"Критическая ошибка: {e}")
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()

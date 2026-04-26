@@ -6,7 +6,7 @@ import uuid
 import requests
 import urllib3
 from pathlib import Path
-from tokens import TokenProcessor
+from .tokens import TokenProcessor
 
 # Отключаем лишние предупреждения в консоли
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

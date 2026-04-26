@@ -9,7 +9,7 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 try:
-    from trueapi import HonestSignAPI
+    from xtrek.trueapi import HonestSignAPI
 except ImportError as e:
     print(f"Ошибка импорта trueapi: {e}")
     sys.exit(1)

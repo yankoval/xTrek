@@ -4,7 +4,7 @@ import os
 import shutil
 import base64
 from pathlib import Path
-from tokens import TokenProcessor
+from xtrek.tokens import TokenProcessor
 from datetime import datetime, timedelta
 
 @pytest.fixture

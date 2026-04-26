@@ -3,7 +3,7 @@ import json
 import logging
 import requests
 from datetime import datetime
-from suz_api_models import GtinDocument
+from .suz_api_models import GtinDocument
 
 logger = logging.getLogger(__name__)
 

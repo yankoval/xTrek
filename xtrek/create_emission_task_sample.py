@@ -8,26 +8,23 @@ import logging
 import inspect
 from pathlib import Path
 
-# Добавляем текущую директорию в путь поиска модулей
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import base64
-from suz_api_models import (
+from .suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
     EmissionOrderStatus, ProductionOrder, PasportData,
     UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
     EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
 )
-from suz import SUZ
-from trueapi import HonestSignAPI
-from nkapi import NK
-from gs1_processor import get_inn_by_gtin
-from tokens import TokenProcessor
-from crpt_auth import get_new_token
-from org_manager import OrganizationManager
-from storage import get_storage, LocalStorage, S3Storage
-from config_loader import load_config
+from .suz import SUZ
+from .trueapi import HonestSignAPI
+from .nkapi import NK
+from .gs1_processor import get_inn_by_gtin
+from .tokens import TokenProcessor
+from .crpt_auth import get_new_token
+from .org_manager import OrganizationManager
+from .storage import get_storage, LocalStorage, S3Storage
+from .config_loader import load_config
 
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
 SIGNING_DIR = os.path.join(os.path.expanduser("~"), "tst")

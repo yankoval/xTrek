@@ -46,8 +46,10 @@ def extract_inn_from_filename(filename):
     match = re.search(r'(\d{10,12})', filename)
     return match.group(1) if match else "unknown"
 
-def get_inn_by_gtin(gtin, db_path='gs1prefix_inn_db.json'):
+def get_inn_by_gtin(gtin, db_path=None):
     """Выдает ИНН из базы JSON по номеру GTIN."""
+    if db_path is None:
+        db_path = os.path.join(os.path.dirname(__file__), 'gs1prefix_inn_db.json')
     if not os.path.exists(db_path):
         return None
     try:

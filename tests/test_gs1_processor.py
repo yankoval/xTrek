@@ -7,7 +7,7 @@ from unittest.mock import patch, mock_open
 # Добавляем путь для импорта основного модуля
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-import gs1_processor
+from xtrek import gs1_processor
 
 class TestGS1Processor(unittest.TestCase):
 
@@ -24,7 +24,7 @@ class TestGS1Processor(unittest.TestCase):
         """Тест извлечения ИНН из имени"""
         self.assertEqual(gs1_processor.extract_inn_from_filename("owned_gtins_7733154124.xlsx"), "7733154124")
 
-    @patch("gs1_processor.os.path.exists", return_value=True)
+    @patch("xtrek.gs1_processor.os.path.exists", return_value=True)
     def test_get_inn_by_gtin(self, mock_exists):
         """Тест функции поиска ИНН в базе"""
         fake_db = json.dumps({
@@ -34,7 +34,7 @@ class TestGS1Processor(unittest.TestCase):
         })
 
         # Используем mock_open правильно импортированным
-        with patch("gs1_processor.open", mock_open(read_data=fake_db)):
+        with patch("xtrek.gs1_processor.open", mock_open(read_data=fake_db)):
             # Проверка существующего 7-значного
             self.assertEqual(gs1_processor.get_inn_by_gtin("4610117000000"), "7733154124")
             # Проверка 7-значного с ведущим нулем
@@ -50,7 +50,7 @@ class TestGS1Processor(unittest.TestCase):
         """Проверка парсинга CSV структуры"""
         csv_content = "gtin,name\n4610117633945,Product1\n4670017921234,Product2"
         prefix_map = {}
-        with patch("gs1_processor.open", mock_open(read_data=csv_content)):
+        with patch("xtrek.gs1_processor.open", mock_open(read_data=csv_content)):
             gs1_processor.parse_csv("fake.csv", "12345", prefix_map)
 
         self.assertEqual(prefix_map.get("4610117"), "12345")

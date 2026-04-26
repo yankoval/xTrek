@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xtrek"
+version = "0.1.1"
+authors = [
+  { name="Ivan Kiselev", email="yankoval@gmail.com" },
+]
+description = "Utilities for xTrek"
+readme = "README.txt"
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "coloredlogs>=15.0.0",
+    "openpyxl",
+    "python-slugify",
+    "requests",
+    "pyperclip",
+    "boto3",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yankoval/xTrek"
+
+[project.scripts]
+nk = "xtrek.nk:main"
+suz = "xtrek.suz:main"
+intersect = "xtrek.intersect:main"
+intersect-gui = "xtrek.IntersectGUI:main"
+trueapi = "xtrek.trueapi:main"
+gs1-processor = "xtrek.gs1_processor:main"
+kiz-from-rep = "xtrek.kiz_from_rep:main"
+crpt-auth = "xtrek.crpt_auth:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xtrek*"]
+
+[tool.setuptools.package-data]
+xtrek = ["*.json", "my_orgs/*.json"]

@@ -5,13 +5,13 @@ import json
 from pathlib import Path
 
 # Импорты ваших модулей
-from tokens import TokenProcessor
-from org_manager import OrganizationManager
-from config_loader import load_config
+from .tokens import TokenProcessor
+from .org_manager import OrganizationManager
+from .config_loader import load_config
 
 # Импортируем ваш метод получения токена
 try:
-    from crpt_auth import get_new_token as refresh_token
+    from .crpt_auth import get_new_token as refresh_token
 except ImportError as e:
     logging.error(f"Критическая ошибка импорта crpt_auth: {e}")
     raise e

@@ -2,7 +2,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
-from create_emission_task_sample import create_aggregation_report
+from xtrek.create_emission_task_sample import create_aggregation_report
 
 @pytest.fixture
 def mock_config():
@@ -37,9 +37,9 @@ def test_create_aggregation_report_success(mock_config):
         ]
     }
 
-    with patch('create_emission_task_sample.load_config', return_value=mock_config), \
-         patch('create_emission_task_sample.get_storage') as mock_get_storage, \
-         patch('create_emission_task_sample.get_inn_by_gtin', return_value=inn):
+    with patch('xtrek.create_emission_task_sample.load_config', return_value=mock_config), \
+         patch('xtrek.create_emission_task_sample.get_storage') as mock_get_storage, \
+         patch('xtrek.create_emission_task_sample.get_inn_by_gtin', return_value=inn):
 
         mock_storage_tasks = MagicMock()
         mock_storage_reports = MagicMock()
@@ -90,8 +90,8 @@ def test_create_aggregation_report_no_report(mock_config):
     task_uuid = "task-123"
     task_data = {"id": "report-456", "gtin": "123"}
 
-    with patch('create_emission_task_sample.load_config', return_value=mock_config), \
-         patch('create_emission_task_sample.get_storage') as mock_get_storage:
+    with patch('xtrek.create_emission_task_sample.load_config', return_value=mock_config), \
+         patch('xtrek.create_emission_task_sample.get_storage') as mock_get_storage:
 
         mock_storage = MagicMock()
         mock_get_storage.return_value = mock_storage
