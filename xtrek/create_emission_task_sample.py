@@ -136,7 +136,12 @@ def process_incoming_task(s3_full_key: str):
         if isinstance(f_res, list) and len(f_res) > 0:
             f_res = f_res[0]
 
-        # 6. Выгрузка (для SET обязательно, для UNIT по уточнению пользователя тоже)
+        is_set = f_res.get('is_set', False)
+        if not is_set:
+            logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False). Пропуск.")
+            return None
+
+        # 6. Выгрузка (только для SET)
         article = prod_data.get('Article', 'unknown')
         pasport = prod_data.get('PasportData', {})
         batch_number = pasport.get('Batch_number', 'unknown')
