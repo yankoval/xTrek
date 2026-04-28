@@ -386,7 +386,12 @@ def process_incoming_task(s3_full_key: str):
         if isinstance(f_res, list) and len(f_res) > 0:
             f_res = f_res[0]
 
-        # 6. Выгрузка (для SET обязательно, для UNIT по уточнению пользователя тоже)
+        is_set = f_res.get('is_set', False)
+        if not is_set:
+            logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False). Пропуск.")
+            return None
+
+        # 6. Выгрузка (только для SET)
         article = prod_data.get('Article', 'unknown')
         pasport = prod_data.get('PasportData', {})
         batch_number = pasport.get('Batch_number', 'unknown')
@@ -410,6 +415,8 @@ def process_incoming_task(s3_full_key: str):
         # 7. Устанавливаем тег task:created
         storage.set_tags(s3_path, {'task': 'created'})
         logger.info(f"[+++] Задание {original_filename} успешно обработано")
+
+        return Path(new_filename).stem
 
     except Exception as e:
         logger.error(f"[!] Ошибка в process_incoming_task: {e}")
@@ -2285,6 +2292,146 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
         logger.error(f"[!] Ошибка в sign_and_send_aggregation_set: {e}")
         return None
 
+def create_equipment_aggregation_task(production_order_id: str):
+    """
+    Создает задание для оборудования на агрегацию по заданию на производство.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        production_orders_path = config.get('production_orders_path')
+        equipment_tasks_path = config.get('equipment-tasks')
+        equipment_reports_path = config.get('equipment-reports')
+
+        if not all([production_orders_path, equipment_tasks_path, equipment_reports_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (production_orders_path, equipment-tasks, equipment-reports)")
+            return None
+
+        storage_prod = get_storage(production_orders_path, s3_config)
+        # Если production_order_id передается без .json, добавляем его
+        prod_filename = production_order_id if production_order_id.lower().endswith('.json') else f"{production_order_id}.json"
+        prod_order_path = f"{production_orders_path.rstrip('/')}/{prod_filename}"
+
+        if not storage_prod.exists(prod_order_path):
+            logger.error(f"[!] Файл производственного заказа не найден: {prod_order_path}")
+            return None
+
+        prod_data = json.loads(storage_prod.read_text(prod_order_path))
+        pasport = prod_data.get('PasportData', {})
+
+        # Поле id это uuid его нужно создать.
+        task_uuid = str(uuid.uuid4())
+
+        # expDate используй Batch_date_expired и YYMMDD
+        batch_date_expired = pasport.get('Batch_date_expired', '') # dd.mm.yyyy
+        exp_date = ""
+        if batch_date_expired and len(batch_date_expired) == 10:
+            parts = batch_date_expired.split('.')
+            if len(parts) == 3:
+                # YYMMDD
+                exp_date = f"{parts[2][2:]}{parts[1]}{parts[0]}"
+
+        # lotNo используй Batch_number
+        lot_no = pasport.get('Batch_number', '')
+
+        # numРacksInBox (с кириллической 'р'): Это PasportData.Product_PackQty
+        try:
+            num_packs_in_box = int(pasport.get('Product_PackQty', 0))
+        except (ValueError, TypeError):
+            num_packs_in_box = 0
+
+        # productName: Собирать из Product_name_part1, part2, part3
+        product_name = " ".join(filter(None, [
+            pasport.get('Product_name_part1'),
+            pasport.get('Product_name_part2'),
+            pasport.get('Product_name_part3')
+        ])).strip()
+
+        # Generate presigned URL
+        # Название объекта это поле "id" и расширение json
+        report_filename = f"{task_uuid}.json"
+
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        presigned_url = ""
+        if isinstance(storage_reports, S3Storage):
+            bucket, prefix = storage_reports._parse_s3_url(equipment_reports_path)
+            report_key = f"{prefix.rstrip('/')}/{report_filename}"
+            try:
+                presigned_url = storage_reports.s3.generate_presigned_url(
+                    'put_object',
+                    Params={
+                        'Bucket': bucket,
+                        'Key': report_key
+                    },
+                    ExpiresIn=604800 # 7 days
+                )
+            except Exception as e:
+                logger.error(f"Error generating presigned URL: {e}")
+        else:
+            # Для локального хранилища
+            presigned_url = str(Path(equipment_reports_path).absolute() / report_filename)
+
+        # lineNum используй константу
+        line_num = "75f3d435-8582-11f0-bfdc-dcf401e5df3f"
+
+        task_data = {
+            "addProdInfo": "",
+            "boxLabelFields": [
+                {
+                    "FieldData": product_name,
+                    "FieldName": "#productName#"
+                },
+                {
+                    "FieldData": prod_data.get('Gtin', ''),
+                    "FieldName": "#productGTIN#"
+                },
+                {
+                    "FieldData": "",
+                    "FieldName": "#productKIGU#"
+                }
+            ],
+            "boxNumbers": [],
+            "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "expDate": exp_date,
+            "gtin": prod_data.get('Gtin', ''),
+            "id": task_uuid,
+            "isGroup": False,
+            "lengthBox": 0.04,
+            "lineNum": line_num,
+            "lotNo": lot_no,
+            "maxNoRead": 0,
+            "numLabelAtBox": 1,
+            "numLayersInBox": 1,
+            "numPacksInParcel": 0,
+            "numРacksInBox": num_packs_in_box,
+            "productNumbers": [],
+            "task-export-signed-link": presigned_url,
+            "urlLabelBoxTemplate": "1",
+            "urlLabelProductTemplate": "1"
+        }
+
+        # Сохранение в S3 (equipment-tasks)
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        # Выгружаем в S3 с именем равным production_order_id + расширение json
+        target_filename = production_order_id if production_order_id.lower().endswith('.json') else f"{production_order_id}.json"
+        target_path = f"{equipment_tasks_path.rstrip('/')}/{target_filename}"
+
+        temp_local = Path(f"temp_eq_task_{task_uuid}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            json.dump(task_data, f, indent=3, ensure_ascii=False)
+
+        logger.info(f"[*] Выгрузка задания для оборудования в: {target_path}")
+        storage_tasks.upload(str(temp_local), target_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return production_order_id
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_equipment_aggregation_task: {e}")
+        return None
+
 def update_aggregation_set_status(task_uuid: str, group: str):
     """
     Получает актуальный статус документа агрегации наборов из ЛК ЧЗ.
@@ -2481,6 +2628,7 @@ def main():
     parser.add_argument("--process-task", help="Обработать входящее задание на производство (S3 key)")
     parser.add_argument("--create-virtual-tasks", help="Создать виртуальные задания на производство по исходному заданию (productionOrderId)")
     parser.add_argument("--create-virtual-tasks-from-report", help="Создать виртуальные задания на производство по отчету оборудования (productionOrderId)")
+    parser.add_argument("--create-equipment-task", help="Создать задание для оборудования на агрегацию по productionOrderId")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
     parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
@@ -2540,7 +2688,17 @@ def main():
         return
 
     if args.process_task:
-        process_incoming_task(args.process_task)
+        result = process_incoming_task(args.process_task)
+        if result:
+            print(result)
+        return
+
+    if args.create_equipment_task:
+        result = create_equipment_aggregation_task(args.create_equipment_task)
+        if result:
+            logger.info(f"[+++] Задание для оборудования успешно создано: {result}")
+        else:
+            logger.error(f"[!] Не удалось создать задание для оборудования для {args.create_equipment_task}")
         return
 
     if args.create_virtual_tasks:
