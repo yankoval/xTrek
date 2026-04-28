@@ -152,7 +152,7 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
             if token:
                 token_processor.save_token(token)
         if not token:
-            raise ValueError(f"JWT token for INН {inn} not found")
+            raise ValueError(f"JWT token for INN {inn} not found")
 
         nk = NK(token=token)
 
@@ -221,26 +221,48 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
                  if temp_feed and temp_feed.get('result'):
                      good_name = temp_feed['result'][0].get('good_name')
 
-            comp_article = comp_item.get('article', comp_item.get('Article', 'unknown'))
-
             # Номер партии и даты берем из исходного задания на производство.
-            # Копируем исходные данные
-            virtual_data = json.loads(json.dumps(source_data))
-            virtual_data['virtual'] = True
-            virtual_data['Gtin'] = comp_gtin
-            virtual_data['Quantity'] = str(new_qty)
-            virtual_data['Article'] = comp_article
+            # Создаем новое задание на основе ProductionOrder (только обязательные поля)
+            source_pasport = source_data.get('PasportData', {})
 
-            if 'PasportData' in virtual_data:
-                pasport = virtual_data['PasportData']
-                pasport['Product_gtin'] = comp_gtin
-                pasport['Product_name_part1'] = good_name or "Unknown"
-                pasport['Product_name_part2'] = ""
-                pasport['Product_name_part3'] = ""
-                pasport['Product_article'] = comp_article
-                # Product_id можно тоже обновить если есть
-                if comp_item.get('product_id'):
-                    pasport['Product_id'] = str(comp_item.get('product_id'))
+            virtual_data = {
+                "virtual": True,
+                "Article": comp_gtin,
+                "Gtin": comp_gtin,
+                "Quantity": str(new_qty),
+                "PasportData": {
+                    "Format": "",
+                    "LabelLanguage": "",
+                    "Manufacturer_inn": "",
+                    "Manufacturer_name": "",
+                    "Manufacturer_address": "",
+                    "Manufacturer_phone": "",
+                    "Product_id": str(comp_item.get('product_id', '')),
+                    "Product_article": comp_gtin,
+                    "Product_gtin": comp_gtin,
+                    "Product_ShowArticle": "",
+                    "Product_name_part1": good_name or "",
+                    "Product_name_part2": "",
+                    "Product_name_part3": "",
+                    "Product_gost": "",
+                    "Product_PackInfo": "1",
+                    "Product_PackQty": "1",
+                    "Product_PackBarcode": "",
+                    "Product_PackIcons1": "",
+                    "Product_PackIcons2": "",
+                    "Product_ClientBarcode": "",
+                    "Batch_id": "",
+                    "Batch_number": source_pasport.get('Batch_number', ''),
+                    "Batch_BN_1С": "",
+                    "Batch_BN_1С_full": "",
+                    "Batch_date_production": source_pasport.get('Batch_date_production', ''),
+                    "Batch_date_packing": source_pasport.get('Batch_date_packing', ''),
+                    "Batch_date_expired": source_pasport.get('Batch_date_expired', ''),
+                    "Batch_date_packing_descr": "",
+                    "Batch_date_expired_descr": "",
+                    "client_AdditionalInfo": ""
+                }
+            }
 
             # Название файла задания создаем по следующей маске
             new_filename = f"V-{source_stem}-{comp_gtin}.json"
