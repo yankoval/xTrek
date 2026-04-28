@@ -40,10 +40,11 @@ def test_create_virtual_production_tasks(mock_nk_class, mock_token_processor_cla
     mock_nk = mock_nk_class.return_value
 
     # NK response for the SET
+    # GTINs in NK will be normalized
     mock_nk.feedProduct.side_effect = [
         {"result": [{"is_set": True}]}, # for source GTIN
-        {"result": [{"is_set": False, "good_name": "Comp 1", "article": "ART1"}]}, # for component 1
-        {"result": [{"is_set": False, "good_name": "Comp 2", "article": "ART2"}]}  # for component 2
+        {"result": [{"is_set": False, "good_name": "Comp 1", "article": "ART1"}]}, # for component 00000000000111
+        {"result": [{"is_set": False, "good_name": "Comp 2", "article": "ART2"}]}  # for component 00000000000222
     ]
 
     mock_nk.get_set_by_gtin.return_value = {
@@ -64,25 +65,28 @@ def test_create_virtual_production_tasks(mock_nk_class, mock_token_processor_cla
 
     mock_storage.upload.side_effect = mock_upload
 
-    # Run
-    create_virtual_production_tasks("source_order.json")
+    # Run - using production_order_id instead of filename
+    create_virtual_production_tasks("source_order")
+
+    # Verify file path used for check
+    mock_storage.exists.assert_called_with("s3://bucket/prod_orders/source_order.json")
 
     # Verify
     assert len(uploaded_contents) == 2
 
-    target_path_1 = "s3://bucket/prod_orders/V-source_order-111.json"
+    target_path_1 = "s3://bucket/prod_orders/V-source_order-00000000000111.json"
     assert target_path_1 in uploaded_contents
     data1 = uploaded_contents[target_path_1]
     assert data1['virtual'] is True
-    assert data1['Gtin'] == "111"
+    assert data1['Gtin'] == "00000000000111"
     assert data1['Quantity'] == "20" # 10 * 2
-    assert data1['PasportData']['Product_gtin'] == "111"
+    assert data1['PasportData']['Product_gtin'] == "00000000000111"
     assert data1['PasportData']['Product_name_part1'] == "Comp 1"
     assert data1['PasportData']['Batch_number'] == "B1"
 
-    target_path_2 = "s3://bucket/prod_orders/V-source_order-222.json"
+    target_path_2 = "s3://bucket/prod_orders/V-source_order-00000000000222.json"
     assert target_path_2 in uploaded_contents
     data2 = uploaded_contents[target_path_2]
     assert data2['virtual'] is True
-    assert data2['Gtin'] == "222"
+    assert data2['Gtin'] == "00000000000222"
     assert data2['Quantity'] == "30" # 10 * 3

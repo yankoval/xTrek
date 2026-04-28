@@ -35,10 +35,10 @@ SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def create_virtual_production_tasks(production_order_filename: str):
+def create_virtual_production_tasks(production_order_id: str):
     """
     Создает виртуальные задания на производство для вложений набора (SET).
-    production_order_filename: имя файла задания в папке production_orders_path
+    production_order_id: ID задания (имя файла без .json) в папке production_orders_path
     """
     try:
         config = load_config('suz_worker_config')
@@ -50,7 +50,7 @@ def create_virtual_production_tasks(production_order_filename: str):
             raise ValueError("Missing production_orders_path in config")
 
         storage = get_storage(production_orders_path, s3_config)
-        source_path = f"{production_orders_path.rstrip('/')}/{production_order_filename}"
+        source_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
 
         if not storage.exists(source_path):
             logger.error(f"[!] Исходный файл задания не найден: {source_path}")
@@ -59,12 +59,12 @@ def create_virtual_production_tasks(production_order_filename: str):
         content = storage.read_text(source_path)
         source_data = json.loads(content)
 
-        source_gtin = source_data.get('Gtin')
-        if not source_gtin:
-            raise ValueError(f"Gtin not found in source file {production_order_filename}")
+        source_gtin = str(source_data.get('Gtin', '')).strip().zfill(14)
+        if not source_gtin or source_gtin == '00000000000000':
+            raise ValueError(f"Gtin not found in source file {production_order_id}.json")
 
         source_qty = int(source_data.get('Quantity', 0))
-        source_stem = Path(production_order_filename).stem
+        source_stem = production_order_id
 
         # Получаем ИНН и токен для NK
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +117,7 @@ def create_virtual_production_tasks(production_order_filename: str):
 
         # 3. Проверяем количество разных gtin входящих в набор. И для каждого gtin вложения:
         for s in set_gtins:
-            comp_gtin = s['gtin']
+            comp_gtin = str(s['gtin']).strip().zfill(14)
             comp_qty_in_set = s['quantity']
 
             logger.info(f"[*] Обработка вложения: GTIN {comp_gtin}, кол-во в наборе: {comp_qty_in_set}")
@@ -186,7 +186,7 @@ def create_virtual_production_tasks(production_order_filename: str):
             try: temp_file.unlink()
             except: pass
 
-        logger.info(f"[+++] Виртуальные задания для {production_order_filename} успешно созданы")
+        logger.info(f"[+++] Виртуальные задания для {production_order_id} успешно созданы")
 
     except Exception as e:
         logger.error(f"[!] Ошибка в create_virtual_production_tasks: {e}")
@@ -2386,7 +2386,7 @@ def update_introduce_status(order_id: str, group: str):
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--process-task", help="Обработать входящее задание на производство (S3 key)")
-    parser.add_argument("--create-virtual-tasks", help="Создать виртуальные задания на производство по исходному заданию (S3 filename)")
+    parser.add_argument("--create-virtual-tasks", help="Создать виртуальные задания на производство по исходному заданию (productionOrderId)")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
     parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
