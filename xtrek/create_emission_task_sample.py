@@ -38,24 +38,53 @@ logger = logging.getLogger(__name__)
 def create_virtual_tasks_from_equipment_report(production_order_id: str):
     """
     Обертка для create_virtual_production_tasks, которая берет количество из отчета оборудования.
+    Находит отчет в два этапа: через задание на оборудование и ссылку в нем.
     """
     try:
+        from urllib.parse import urlparse
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
+        equipment_tasks_path = config.get('equipment-tasks')
         equipment_reports_path = config.get('equipment-reports')
 
-        if not equipment_reports_path:
-            logger.error("[!] В конфигурации отсутствует equipment-reports")
-            raise ValueError("Missing equipment-reports in config")
+        if not equipment_tasks_path or not equipment_reports_path:
+            logger.error("[!] В конфигурации отсутствуют пути equipment-tasks или equipment-reports")
+            raise ValueError("Missing equipment paths in config")
 
-        storage = get_storage(equipment_reports_path, s3_config)
-        report_path = f"{equipment_reports_path.rstrip('/')}/{production_order_id}.json"
+        # 1. Сначала находим задание на оборудование
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        task_path = f"{equipment_tasks_path.rstrip('/')}/{production_order_id}.json"
 
-        if not storage.exists(report_path):
+        if not storage_tasks.exists(task_path):
+            logger.error(f"[!] Задание на оборудование не найдено: {task_path}")
+            raise FileNotFoundError(f"Equipment task {task_path} not found")
+
+        task_content = storage_tasks.read_text(task_path)
+        task_data = json.loads(task_content)
+
+        # По ключу task-export-signed-link получаем ссылку
+        signed_link = task_data.get('task-export-signed-link') or task_data.get('task_export_signed_link')
+        if not signed_link:
+            logger.error(f"[!] В задании {production_order_id} не найден ключ task-export-signed-link")
+            raise ValueError(f"Missing task-export-signed-link in task {production_order_id}")
+
+        # Распарсить ссылку и получить ключ (имя файла)
+        parsed_url = urlparse(signed_link)
+        report_filename = os.path.basename(parsed_url.path)
+
+        if not report_filename:
+             logger.error(f"[!] Не удалось извлечь имя файла из ссылки: {signed_link}")
+             raise ValueError(f"Could not parse report filename from link {signed_link}")
+
+        # 2. Получаем отчет оборудования по извлеченному имени файла
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        report_path = f"{equipment_reports_path.rstrip('/')}/{report_filename}"
+
+        if not storage_reports.exists(report_path):
             logger.error(f"[!] Отчет оборудования не найден: {report_path}")
             raise FileNotFoundError(f"Equipment report {report_path} not found")
 
-        content = storage.read_text(report_path)
+        content = storage_reports.read_text(report_path)
         report_data = json.loads(content)
 
         total_qty = 0
