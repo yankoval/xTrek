@@ -35,6 +35,256 @@ SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def create_virtual_tasks_from_equipment_report(production_order_id: str):
+    """
+    Обертка для create_virtual_production_tasks, которая берет количество из отчета оборудования.
+    Находит отчет в два этапа: через задание на оборудование и ссылку в нем.
+    """
+    try:
+        from urllib.parse import urlparse
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        equipment_tasks_path = config.get('equipment-tasks')
+        equipment_reports_path = config.get('equipment-reports')
+
+        if not equipment_tasks_path or not equipment_reports_path:
+            logger.error("[!] В конфигурации отсутствуют пути equipment-tasks или equipment-reports")
+            raise ValueError("Missing equipment paths in config")
+
+        # 1. Сначала находим задание на оборудование
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        task_path = f"{equipment_tasks_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage_tasks.exists(task_path):
+            logger.error(f"[!] Задание на оборудование не найдено: {task_path}")
+            raise FileNotFoundError(f"Equipment task {task_path} not found")
+
+        task_content = storage_tasks.read_text(task_path)
+        task_data = json.loads(task_content)
+
+        # По ключу task-export-signed-link получаем ссылку
+        signed_link = task_data.get('task-export-signed-link') or task_data.get('task_export_signed_link')
+        if not signed_link:
+            logger.error(f"[!] В задании {production_order_id} не найден ключ task-export-signed-link")
+            raise ValueError(f"Missing task-export-signed-link in task {production_order_id}")
+
+        # Распарсить ссылку и получить ключ (имя файла)
+        parsed_url = urlparse(signed_link)
+        report_filename = os.path.basename(parsed_url.path)
+
+        if not report_filename:
+             logger.error(f"[!] Не удалось извлечь имя файла из ссылки: {signed_link}")
+             raise ValueError(f"Could not parse report filename from link {signed_link}")
+
+        # 2. Получаем отчет оборудования по извлеченному имени файла
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        report_path = f"{equipment_reports_path.rstrip('/')}/{report_filename}"
+
+        if not storage_reports.exists(report_path):
+            logger.error(f"[!] Отчет оборудования не найден: {report_path}")
+            raise FileNotFoundError(f"Equipment report {report_path} not found")
+
+        content = storage_reports.read_text(report_path)
+        report_data = json.loads(content)
+
+        total_qty = 0
+        ready_boxes = report_data.get('readyBox', [])
+        for box in ready_boxes:
+            codes = box.get('productNumbersFull', [])
+            total_qty += len(codes)
+
+        logger.info(f"[*] Из отчета оборудования {production_order_id} извлечено количество: {total_qty}")
+
+        if total_qty == 0:
+            logger.warning(f"[*] Отчет {production_order_id} не содержит кодов. Виртуальные задания не будут созданы.")
+            return
+
+        return create_virtual_production_tasks(production_order_id, qty=total_qty)
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_virtual_tasks_from_equipment_report: {e}")
+        raise
+
+def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
+    """
+    Создает виртуальные задания на производство для вложений набора (SET).
+    production_order_id: ID задания (имя файла без .json) в папке production_orders_path
+    qty: принудительное исходное количество наборов (если > 0)
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        production_orders_path = config.get('production_orders_path')
+
+        if not production_orders_path:
+            logger.error("[!] В конфигурации отсутствует production_orders_path")
+            raise ValueError("Missing production_orders_path in config")
+
+        storage = get_storage(production_orders_path, s3_config)
+        source_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage.exists(source_path):
+            logger.error(f"[!] Исходный файл задания не найден: {source_path}")
+            raise FileNotFoundError(f"Source file {source_path} not found")
+
+        content = storage.read_text(source_path)
+        source_data = json.loads(content)
+
+        source_gtin = str(source_data.get('Gtin', '')).strip().zfill(14)
+        if not source_gtin or source_gtin == '00000000000000':
+            raise ValueError(f"Gtin not found in source file {production_order_id}.json")
+
+        source_qty = qty if qty > 0 else int(source_data.get('Quantity', 0))
+        source_stem = production_order_id
+
+        # Получаем ИНН и токен для NK
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
+        inn = get_inn_by_gtin(source_gtin, db_path=db_path)
+        if not inn:
+            raise ValueError(f"INN not found for GTIN {source_gtin}")
+
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        if not token:
+            token = get_new_token(inn=inn, mode='jwt')
+            if token:
+                token_processor.save_token(token)
+        if not token:
+            raise ValueError(f"JWT token for INN {inn} not found")
+
+        nk = NK(token=token)
+
+        # 1. Получаем информацию о gtin из исходного задания на производство с помощью NK.feedproduct
+        feed = nk.feedProduct(source_gtin)
+        if not feed or not feed.get('result'):
+            # Попробуем резервный метод
+            feed = nk.get_set_by_gtin(source_gtin)
+
+        if not feed or not feed.get('result'):
+            raise ValueError(f"Product info for {source_gtin} not found in NK")
+
+        item = feed['result'][0]
+
+        # 2. Проверяем что это набор SET. Если нет то вызываем исключение.
+        if not item.get('is_set'):
+            raise ValueError(f"GTIN {source_gtin} is not a SET")
+
+        # Получаем состав набора. По инструкции пользователя, вызываем nk.get_set_by_gtin(gtin)
+        # для надежности получения состава.
+        set_feed = nk.get_set_by_gtin(source_gtin)
+        if not set_feed or not set_feed.get('result'):
+             raise ValueError(f"Failed to get set composition for {source_gtin}")
+
+        set_item = set_feed['result'][0]
+        set_gtins = set_item.get('set_gtins', [])
+
+        if not set_gtins:
+            logger.warning(f"[*] Набор {source_gtin} не содержит вложений (set_gtins пуст)")
+            return
+
+        logger.info(f"[*] Найдено вложений в наборе: {len(set_gtins)}")
+
+        # 3. Проверяем количество разных gtin входящих в набор. И для каждого gtin вложения:
+        for s in set_gtins:
+            comp_gtin = str(s['gtin']).strip().zfill(14)
+            comp_qty_in_set = s['quantity']
+
+            logger.info(f"[*] Обработка вложения: GTIN {comp_gtin}, кол-во в наборе: {comp_qty_in_set}")
+
+            # 3.1 получаем NK.feedproduct для этого вложения.
+            comp_feed = nk.feedProduct(comp_gtin)
+            if not comp_feed or not comp_feed.get('result'):
+                # Резерв для названия, как просил пользователь
+                comp_feed = nk.get_set_by_gtin(comp_gtin)
+
+            if not comp_feed or not comp_feed.get('result'):
+                raise ValueError(f"Component GTIN {comp_gtin} not found in NK")
+
+            comp_item = comp_feed['result'][0]
+
+            # 3.2 проверяем что это не набор SET Если набор то вызываем исключение.
+            if comp_item.get('is_set'):
+                raise ValueError(f"Component GTIN {comp_gtin} is also a SET. Nested sets are not allowed.")
+
+            # 3.3 создаем заказ на производство с количеством равным количеству в исходном задании
+            # умноженному на количество указанное в этом вложении .
+            new_qty = source_qty * comp_qty_in_set
+
+            # Названия из данных NK.feedproduct для вложения.
+            # Пользователь уточнил: Название берем из NK.get_set_by_gtin из поля good_name
+            good_name = comp_item.get('good_name')
+            if not good_name:
+                 # Если в feedProduct не было, пробуем get_set_by_gtin
+                 temp_feed = nk.get_set_by_gtin(comp_gtin)
+                 if temp_feed and temp_feed.get('result'):
+                     good_name = temp_feed['result'][0].get('good_name')
+
+            # Номер партии и даты берем из исходного задания на производство.
+            # Создаем новое задание на основе ProductionOrder (только обязательные поля)
+            source_pasport = source_data.get('PasportData', {})
+
+            virtual_data = {
+                "virtual": True,
+                "Article": comp_gtin,
+                "Gtin": comp_gtin,
+                "Quantity": str(new_qty),
+                "PasportData": {
+                    "Format": "",
+                    "LabelLanguage": "",
+                    "Manufacturer_inn": "",
+                    "Manufacturer_name": "",
+                    "Manufacturer_address": "",
+                    "Manufacturer_phone": "",
+                    "Product_id": str(comp_item.get('product_id', '')),
+                    "Product_article": comp_gtin,
+                    "Product_gtin": comp_gtin,
+                    "Product_ShowArticle": "",
+                    "Product_name_part1": good_name or "",
+                    "Product_name_part2": "",
+                    "Product_name_part3": "",
+                    "Product_gost": "",
+                    "Product_PackInfo": "1",
+                    "Product_PackQty": "1",
+                    "Product_PackBarcode": "",
+                    "Product_PackIcons1": "",
+                    "Product_PackIcons2": "",
+                    "Product_ClientBarcode": "",
+                    "Batch_id": "",
+                    "Batch_number": source_pasport.get('Batch_number', ''),
+                    "Batch_BN_1С": "",
+                    "Batch_BN_1С_full": "",
+                    "Batch_date_production": source_pasport.get('Batch_date_production', ''),
+                    "Batch_date_packing": source_pasport.get('Batch_date_packing', ''),
+                    "Batch_date_expired": source_pasport.get('Batch_date_expired', ''),
+                    "Batch_date_packing_descr": "",
+                    "Batch_date_expired_descr": "",
+                    "client_AdditionalInfo": ""
+                }
+            }
+
+            # Название файла задания создаем по следующей маске
+            new_filename = f"V-{source_stem}-{comp_gtin}.json"
+            target_path = f"{production_orders_path.rstrip('/')}/{new_filename}"
+
+            # Сохранение
+            temp_file = Path(f"temp_v_{new_filename}")
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(virtual_data, f, indent=4, ensure_ascii=False)
+
+            logger.info(f"[*] Выгрузка виртуального задания в: {target_path}")
+            storage.upload(str(temp_file), target_path)
+
+            try: temp_file.unlink()
+            except: pass
+
+        logger.info(f"[+++] Виртуальные задания для {production_order_id} успешно созданы")
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_virtual_production_tasks: {e}")
+        raise
+
 def process_incoming_task(s3_full_key: str):
     """
     Принимает задание на производство, фильтрует, нормализует и сохраняет.
@@ -2376,6 +2626,8 @@ def update_introduce_status(order_id: str, group: str):
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--process-task", help="Обработать входящее задание на производство (S3 key)")
+    parser.add_argument("--create-virtual-tasks", help="Создать виртуальные задания на производство по исходному заданию (productionOrderId)")
+    parser.add_argument("--create-virtual-tasks-from-report", help="Создать виртуальные задания на производство по отчету оборудования (productionOrderId)")
     parser.add_argument("--create-equipment-task", help="Создать задание для оборудования на агрегацию по productionOrderId")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
@@ -2392,6 +2644,7 @@ def main():
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
     parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
 
+    parser.add_argument("--qty", default=0, type=int, help="Количество для создания виртуальных заданий (переопределяет количество в исходном задании)")
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
     parser.add_argument("--oms_id", help="OMS ID (если не задан, будет найден в my_orgs по ИНН)")
@@ -2446,6 +2699,14 @@ def main():
             logger.info(f"[+++] Задание для оборудования успешно создано: {result}")
         else:
             logger.error(f"[!] Не удалось создать задание для оборудования для {args.create_equipment_task}")
+        return
+
+    if args.create_virtual_tasks:
+        create_virtual_production_tasks(args.create_virtual_tasks, qty=args.qty)
+        return
+
+    if args.create_virtual_tasks_from_report:
+        create_virtual_tasks_from_equipment_report(args.create_virtual_tasks_from_report)
         return
 
     if args.create_task:
