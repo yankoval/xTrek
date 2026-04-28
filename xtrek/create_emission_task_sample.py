@@ -35,10 +35,11 @@ SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def create_virtual_production_tasks(production_order_id: str):
+def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
     """
     Создает виртуальные задания на производство для вложений набора (SET).
     production_order_id: ID задания (имя файла без .json) в папке production_orders_path
+    qty: принудительное исходное количество наборов (если > 0)
     """
     try:
         config = load_config('suz_worker_config')
@@ -63,7 +64,7 @@ def create_virtual_production_tasks(production_order_id: str):
         if not source_gtin or source_gtin == '00000000000000':
             raise ValueError(f"Gtin not found in source file {production_order_id}.json")
 
-        source_qty = int(source_data.get('Quantity', 0))
+        source_qty = qty if qty > 0 else int(source_data.get('Quantity', 0))
         source_stem = production_order_id
 
         # Получаем ИНН и токен для NK
@@ -2402,6 +2403,7 @@ def main():
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
     parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
 
+    parser.add_argument("--qty", default=0, type=int, help="Количество для создания виртуальных заданий (переопределяет количество в исходном задании)")
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
     parser.add_argument("--contact", default="хТрек 2.5.11.6", help="Контактное лицо в заказе")
     parser.add_argument("--oms_id", help="OMS ID (если не задан, будет найден в my_orgs по ИНН)")
@@ -2449,7 +2451,7 @@ def main():
         return
 
     if args.create_virtual_tasks:
-        create_virtual_production_tasks(args.create_virtual_tasks)
+        create_virtual_production_tasks(args.create_virtual_tasks, qty=args.qty)
         return
 
     if args.create_task:
