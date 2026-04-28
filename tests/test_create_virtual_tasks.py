@@ -145,3 +145,32 @@ def test_create_virtual_production_tasks_with_qty_override(mock_nk_class, mock_t
     assert target_path in uploaded_contents
     data = uploaded_contents[target_path]
     assert data['Quantity'] == "100" # 50 * 2
+
+@patch('xtrek.create_emission_task_sample.load_config')
+@patch('xtrek.create_emission_task_sample.get_storage')
+@patch('xtrek.create_emission_task_sample.create_virtual_production_tasks')
+def test_create_virtual_tasks_from_equipment_report(mock_create_virtual, mock_get_storage, mock_load_config):
+    # Setup mocks
+    mock_load_config.return_value = {
+        'equipment-reports': 's3://bucket/reports/',
+        's3_config': {}
+    }
+
+    mock_storage = MagicMock()
+    mock_get_storage.return_value = mock_storage
+    mock_storage.exists.return_value = True
+
+    report_data = {
+        "readyBox": [
+            {"productNumbersFull": ["1", "2", "3"]},
+            {"productNumbersFull": ["4", "5"]}
+        ]
+    }
+    mock_storage.read_text.return_value = json.dumps(report_data)
+
+    # Run
+    from xtrek.create_emission_task_sample import create_virtual_tasks_from_equipment_report
+    create_virtual_tasks_from_equipment_report("test_order_id")
+
+    # Verify
+    mock_create_virtual.assert_called_with("test_order_id", qty=5)

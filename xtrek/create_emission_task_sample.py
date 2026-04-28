@@ -35,6 +35,47 @@ SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def create_virtual_tasks_from_equipment_report(production_order_id: str):
+    """
+    Обертка для create_virtual_production_tasks, которая берет количество из отчета оборудования.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        equipment_reports_path = config.get('equipment-reports')
+
+        if not equipment_reports_path:
+            logger.error("[!] В конфигурации отсутствует equipment-reports")
+            raise ValueError("Missing equipment-reports in config")
+
+        storage = get_storage(equipment_reports_path, s3_config)
+        report_path = f"{equipment_reports_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage.exists(report_path):
+            logger.error(f"[!] Отчет оборудования не найден: {report_path}")
+            raise FileNotFoundError(f"Equipment report {report_path} not found")
+
+        content = storage.read_text(report_path)
+        report_data = json.loads(content)
+
+        total_qty = 0
+        ready_boxes = report_data.get('readyBox', [])
+        for box in ready_boxes:
+            codes = box.get('productNumbersFull', [])
+            total_qty += len(codes)
+
+        logger.info(f"[*] Из отчета оборудования {production_order_id} извлечено количество: {total_qty}")
+
+        if total_qty == 0:
+            logger.warning(f"[*] Отчет {production_order_id} не содержит кодов. Виртуальные задания не будут созданы.")
+            return
+
+        return create_virtual_production_tasks(production_order_id, qty=total_qty)
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_virtual_tasks_from_equipment_report: {e}")
+        raise
+
 def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
     """
     Создает виртуальные задания на производство для вложений набора (SET).
@@ -2388,6 +2429,7 @@ def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--process-task", help="Обработать входящее задание на производство (S3 key)")
     parser.add_argument("--create-virtual-tasks", help="Создать виртуальные задания на производство по исходному заданию (productionOrderId)")
+    parser.add_argument("--create-virtual-tasks-from-report", help="Создать виртуальные задания на производство по отчету оборудования (productionOrderId)")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
     parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
@@ -2452,6 +2494,10 @@ def main():
 
     if args.create_virtual_tasks:
         create_virtual_production_tasks(args.create_virtual_tasks, qty=args.qty)
+        return
+
+    if args.create_virtual_tasks_from_report:
+        create_virtual_tasks_from_equipment_report(args.create_virtual_tasks_from_report)
         return
 
     if args.create_task:
