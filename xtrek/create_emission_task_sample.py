@@ -953,30 +953,37 @@ def create_virtual_utilisation_task(order_id: str, group: str, production_date: 
 
         prod_data = json.loads(storage_prod.read_text(prod_path))
 
-        # 3. Проверка на виртуальность
-        is_virtual = prod_data.get('virtual') is True
+        # 3. Десериализация и проверка на виртуальность
+        pasport_raw = prod_data.get('PasportData', {})
+        # Фильтруем поля для PasportData
+        sig_pasport = inspect.signature(PasportData.__init__)
+        valid_fields_pasport = {k for k, v in sig_pasport.parameters.items() if k != 'self'}
+        pasport_data_filtered = {k: v for k, v in pasport_raw.items() if k in valid_fields_pasport}
+        # Для обязательных полей, которых нет в JSON, подставляем пустую строку, чтобы избежать TypeError
+        for field_name in valid_fields_pasport:
+            if field_name not in pasport_data_filtered:
+                pasport_data_filtered[field_name] = ""
 
-        if is_virtual:
+        pasport_obj = PasportData(**pasport_data_filtered)
+
+        # Собираем ProductionOrder
+        po_obj = ProductionOrder(
+            Article=prod_data.get('Article', ''),
+            Gtin=prod_data.get('Gtin', ''),
+            Quantity=str(prod_data.get('Quantity', '0')),
+            PasportData=pasport_obj,
+            virtual=prod_data.get('virtual', False)
+        )
+
+        if po_obj.virtual:
             logger.info(f"[*] Заказ {production_order_id} является виртуальным. Продолжаем создание задачи утилизации.")
-            return create_utilisation_task(order_id, group, production_date, expiration_date, production_order_id=production_order_id)
+            res = create_utilisation_task(order_id, group, production_date, expiration_date, production_order_id=production_order_id)
+            if res is None:
+                return None
         else:
             logger.info(f"[*] Заказ {production_order_id} НЕ является виртуальным. Пропуск создания задачи утилизации.")
-            # Возвращаем экземпляр класса производственного заказа с свойством virtual:False
-            # Фильтруем данные для dataclass
-            pasport_raw = prod_data.get('PasportData', {})
-            sig_pasport = inspect.signature(PasportData.__init__)
-            valid_fields_pasport = {k for k, v in sig_pasport.parameters.items() if k != 'self'}
-            # Заполняем недостающие обязательные поля пустыми строками
-            complete_pasport = {k: pasport_raw.get(k, "") for k in valid_fields_pasport}
-            pasport_obj = PasportData(**complete_pasport)
 
-            return ProductionOrder(
-                Article=prod_data.get('Article', ''),
-                Gtin=prod_data.get('Gtin', ''),
-                Quantity=prod_data.get('Quantity', '0'),
-                PasportData=pasport_obj,
-                virtual=False
-            )
+        return po_obj
 
     except Exception as e:
         logger.error(f"[!] Ошибка в create_virtual_utilisation_task: {e}")
@@ -2843,13 +2850,11 @@ def main():
         return
 
     if args.create_utilisation:
-        result = create_virtual_utilisation_task(args.create_utilisation, args.group,
+        result = create_utilisation_task(args.create_utilisation, args.group,
                                        production_date=args.production_date,
                                        expiration_date=args.expiration_date)
-        if isinstance(result, str):
+        if result:
             logger.info(f"[+++] Задача на отчет о нанесении успешно создана для {result}")
-        elif isinstance(result, ProductionOrder):
-            logger.info(f"[*] Пропуск создания задачи утилизации для невиртуального заказа (Article: {result.Article})")
         else:
             logger.error(f"[!] Не удалось создать задачу для {args.create_utilisation}")
         return

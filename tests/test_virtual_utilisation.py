@@ -35,7 +35,9 @@ def test_create_virtual_utilisation_task_virtual_true(mock_config, mock_storage)
             "Article": "ART1",
             "Gtin": "GTIN1",
             "Quantity": "10",
-            "PasportData": {}
+            "PasportData": {
+                "Format": "F"
+            }
         })
 
         # Mock create_utilisation_task
@@ -44,7 +46,8 @@ def test_create_virtual_utilisation_task_virtual_true(mock_config, mock_storage)
 
             result = create_virtual_utilisation_task(order_id, "group1")
 
-            assert result == order_id
+            assert isinstance(result, ProductionOrder)
+            assert result.virtual is True
             mock_create.assert_called_once()
 
 def test_create_virtual_utilisation_task_virtual_false(mock_config, mock_storage):
