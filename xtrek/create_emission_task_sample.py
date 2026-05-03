@@ -856,51 +856,43 @@ def get_emission_kodes(order_id: str):
 
 def _find_production_order_id_by_suz_order_id(order_id: str):
     """
-    Вспомогательная функция для поиска productionOrderId по orderId из чеков эмиссии.
+    Вспомогательная функция для поиска productionOrderId по orderId из файлов статуса эмиссии.
     """
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
-        emission_receipts_path = config.get('emission_receipts')
+        emissions_path = config.get('emissions_path')
 
-        if not emission_receipts_path:
+        if not emissions_path:
+            logger.error("[!] В конфигурации отсутствует emissions_path")
             return None
 
-        storage_receipts = get_storage(emission_receipts_path, s3_config)
+        storage_emissions = get_storage(emissions_path, s3_config)
 
-        if isinstance(storage_receipts, LocalStorage):
-            for f in Path(emission_receipts_path).glob("*.json"):
-                try:
-                    content = f.read_text(encoding='utf-8')
-                    data = json.loads(content)
-                    if data.get('orderId') == order_id:
-                        production_order_id = data.get('productionOrderId')
-                        if not production_order_id:
-                            production_order_id = f.stem
-                            if production_order_id.startswith('receipt_'):
-                                production_order_id = production_order_id[len('receipt_'):]
-                        logger.info(f"  -> Совпадение найдено в локальном файле: {f.name}, productionOrderId={production_order_id}")
-                        return production_order_id
-                except:
-                    continue
+        # Пытаемся найти файл статуса {order_id}.json
+        target_path = None
+        if isinstance(storage_emissions, LocalStorage):
+            p = Path(emissions_path)
+            if p.exists():
+                # Ищем по маске, так как могут быть суффиксы .processing / .finished
+                matches = list(p.glob(f"{order_id}.*"))
+                if matches:
+                    target_path = str(matches[0])
         else:
+            target_path = f"{emissions_path.rstrip('/')}/{order_id}.json"
+            if not storage_emissions.exists(target_path):
+                target_path = None
+
+        if target_path:
             try:
-                bucket, prefix = storage_receipts._parse_s3_url(emission_receipts_path)
-                res = storage_receipts.s3.list_objects_v2(Bucket=bucket, Prefix=prefix.strip('/') + '/')
-                for obj in res.get('Contents', []):
-                    if obj['Key'].endswith('.json'):
-                        content = storage_receipts.read_text(f"s3://{bucket}/{obj['Key']}")
-                        data = json.loads(content)
-                        if data.get('orderId') == order_id:
-                            production_order_id = data.get('productionOrderId')
-                            if not production_order_id:
-                                production_order_id = Path(obj['Key']).stem
-                                if production_order_id.startswith('receipt_'):
-                                    production_order_id = production_order_id[len('receipt_'):]
-                            logger.info(f"  -> Совпадение найдено в S3: {obj['Key']}, productionOrderId={production_order_id}")
-                            return production_order_id
+                content = storage_emissions.read_text(target_path)
+                data = json.loads(content)
+                production_order_id = data.get('productionOrderId')
+                if production_order_id:
+                    logger.info(f"[*] Для orderId {order_id} найден productionOrderId: {production_order_id}")
+                    return production_order_id
             except Exception as e:
-                logger.error(f"Ошибка при поиске в S3: {e}")
+                logger.error(f"Ошибка при чтении файла статуса {target_path}: {e}")
 
         return None
     except Exception as e:

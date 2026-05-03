@@ -9,7 +9,7 @@ def mock_config():
     with patch('xtrek.create_emission_task_sample.load_config') as m:
         m.return_value = {
             'production_orders_path': 'local://prod_orders',
-            'emission_receipts': 'local://receipts'
+            'emissions_path': 'local://emissions'
         }
         yield m
 
