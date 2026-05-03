@@ -50,6 +50,7 @@ class EmissionOrderreceipts(SUZBase):
     orderId: str
     expectedCompleteTimestamp: int
     omsId: str
+    productionOrderId: Optional[str] = None
 
 # --- Блок получения кодов ---
 
@@ -69,11 +70,13 @@ class UtilisationReport(SUZBase):
     attributes: Dict[str, Any] = field(default_factory=dict)
     productGroup: str = ""
     usageType: Optional[str] = None
+    productionOrderId: Optional[str] = None
 
 @dataclass
 class UtilisationReportReceipt(SUZBase):
     """Ответ на отправку отчета о нанесении"""
     reportId: str
+    productionOrderId: Optional[str] = None
 
 @dataclass
 class UtilisationReportStatus(SUZBase):
@@ -82,6 +85,7 @@ class UtilisationReportStatus(SUZBase):
     reportId: str
     reportStatus: str
     errorReason: Optional[str] = None
+    productionOrderId: Optional[str] = None
 
 @dataclass
 class GtinDocument(SUZBase):
@@ -104,6 +108,7 @@ class IntroduceMessage(SUZBase):
     producer_inn: str = ""
     participant_inn: str = ""
     products: List[IntroduceProduct] = field(default_factory=list)
+    productionOrderId: Optional[str] = None
 
 # --- Блок Агрегации ---
 
@@ -119,6 +124,7 @@ class AggregationReport(SUZBase):
     aggregationUnits: List[AggregationUnit]
     participantId: str
     productGroup: Optional[str] = None
+    productionOrderId: Optional[str] = None
 
 @dataclass
 class DocumentWrapper(SUZBase):
@@ -232,3 +238,4 @@ class EmissionOrderStatus(SUZBase):
     poolsExhausted: bool
     templateId: Optional[int] = None
     expiredDate: Optional[str] = None
+    productionOrderId: Optional[str] = None
