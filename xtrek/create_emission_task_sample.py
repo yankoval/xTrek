@@ -736,7 +736,7 @@ def get_emission_kodes(order_id: str):
                     is_processing = True
                 if tags.get('status') == 'finished':
                     logger.info(f"[*] Заказ {order_id} уже обработан (status:finished).")
-                    return None
+                    return {'bufferStatus': 'EXHAUSTED'}  # Возвращаем статус, как если бы он был скачен, чтобы не пытаться снова
             except Exception as e:
                 logger.error(f"Ошибка при проверке тегов S3: {e}")
         elif isinstance(storage_emissions, LocalStorage):
@@ -795,6 +795,9 @@ def get_emission_kodes(order_id: str):
             return None
 
         api_status = api_status_res[0]
+        if api_status.get('bufferStatus') == 'EXHAUSTED':
+            logger.info(f"[*] Заказ {order_id} имеет статус {api_status.get('bufferStatus')}, он уже скачен. Пропуск.")
+            return api_status
         if api_status.get('bufferStatus') != 'ACTIVE':
             logger.info(f"[*] Заказ {order_id} имеет статус {api_status.get('bufferStatus')}, а не ACTIVE. Пропуск.")
             return None
@@ -1122,7 +1125,7 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
             else:
                 logger.error(f"[!] Ошибка СУЗ: {report_id}")
                 storage_tasks.mark_error(task_path)
-                return report_id
+                return None
 
         finally:
             if body_path.exists(): body_path.unlink()
