@@ -666,6 +666,7 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
                     remote_receipt_path = f"{emission_receipts_path.rstrip('/')}/{production_order_id}.json"
 
                     temp_receipt = work_dir / f"receipt_{unique_id}.json"
+                    result.productionOrderId = production_order_id
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result.to_dict(), f, indent=4)
 
@@ -971,7 +972,8 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         report = UtilisationReport(
             productGroup=group,
             sntins=codes,
-            attributes=attributes
+            attributes=attributes,
+            productionOrderId=production_order_id
         )
 
         # Сохраняем в S3
@@ -1021,6 +1023,7 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
 
         task_content = storage_tasks.read_text(task_path)
         task_data = json.loads(task_content)
+        production_order_id = task_data.pop('productionOrderId', None)
 
         # Получаем ИНН из атрибутов или по GTIN
         inn = task_data.get('attributes', {}).get('participantId')
@@ -1104,7 +1107,12 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
 
                 temp_receipt = work_dir / f"receipt_util_{unique_id}.json"
                 with open(temp_receipt, 'w', encoding='utf-8') as f:
-                    json.dump({"reportId": report_id, "orderId": order_id, "omsId": final_oms_id}, f, indent=4)
+                    json.dump({
+                        "reportId": report_id,
+                        "orderId": order_id,
+                        "omsId": final_oms_id,
+                        "productionOrderId": production_order_id
+                    }, f, indent=4)
 
                 storage_receipts.upload(str(temp_receipt), remote_receipt_path)
                 try: temp_receipt.unlink()
@@ -1210,6 +1218,7 @@ def update_emission_order_status(production_order_id: str):
         filtered_data = {k: v for k, v in status_data.items() if k in valid_fields}
 
         status_obj = EmissionOrderStatus(**filtered_data)
+        status_obj.productionOrderId = production_order_id
 
         # 4. Сохранение результата
         storage_emissions = get_storage(emissions_path, s3_config)
@@ -1336,7 +1345,8 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
 
         final_report = AggregationReport(
             participantId=inn,
-            aggregationUnits=aggregation_units
+            aggregationUnits=aggregation_units,
+            productionOrderId=task_uuid
         )
 
         # 5. Сохраняем итоговый отчет
@@ -1477,6 +1487,11 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                     remote_receipt_path = f"{agg_receipts_path.rstrip('/')}/{task_uuid}.json"
 
                     temp_receipt = work_dir / f"receipt_agg_{unique_id}.json"
+                    # Если result это строка UUID, оборачиваем её (как в trueapi.py)
+                    if isinstance(result, str):
+                        result = {"document_id": result}
+                    result["productionOrderId"] = task_uuid
+
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result, f, indent=4, ensure_ascii=False)
 
@@ -1525,6 +1540,7 @@ def update_utilisation_report_status(order_id: str):
         receipt_data = json.loads(storage_receipts.read_text(receipt_path))
         report_id = receipt_data.get('reportId')
         oms_id = receipt_data.get('omsId')
+        production_order_id = receipt_data.get('productionOrderId')
 
         if not report_id or not oms_id:
             logger.error(f"[!] Недостаточно данных в чеке для {order_id}: reportId={report_id}, omsId={oms_id}")
@@ -1571,6 +1587,7 @@ def update_utilisation_report_status(order_id: str):
         filtered_data = {k: v for k, v in status_res.items() if k in valid_fields}
 
         status_obj = UtilisationReportStatus(**filtered_data)
+        status_obj.productionOrderId = production_order_id
 
         # 4. Сохранение
         storage_reports = get_storage(utilisation_reports_path, s3_config)
@@ -1800,7 +1817,8 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             owner_inn=inn,
             producer_inn=inn,
             participant_inn=inn,
-            products=introduce_products
+            products=introduce_products,
+            productionOrderId=production_order_id
         )
 
         # 5. Сохраняем
@@ -1847,6 +1865,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         # Читаем задачу
         task_content = storage_intro.read_text(task_path)
         task_data = json.loads(task_content)
+        production_order_id = task_data.pop('productionOrderId', None)
         inn = task_data.get('owner_inn')
 
         if not inn:
@@ -1918,6 +1937,10 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                     remote_receipt_path = f"{introduce_receipts_path.rstrip('/')}/{order_id}.json"
 
                     temp_receipt = work_dir / f"receipt_intro_{unique_id}.json"
+                    if isinstance(result, str):
+                        result = {"document_id": result}
+                    result["productionOrderId"] = production_order_id
+
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result, f, indent=4, ensure_ascii=False)
 
@@ -1964,6 +1987,7 @@ def update_aggregation_status(task_uuid: str, group: str):
 
         receipt_data = json.loads(storage_receipts.read_text(receipt_path))
         doc_id = receipt_data.get('document_id')
+        production_order_id = receipt_data.get('productionOrderId')
 
         # Если в чеке нет doc_id, возможно это старая версия или ошибка
         if not doc_id:
@@ -1979,6 +2003,7 @@ def update_aggregation_status(task_uuid: str, group: str):
 
         report_data = json.loads(storage_agg.read_text(report_path))
         inn = report_data.get('participantId')
+        production_order_id = report_data.get('productionOrderId')
 
         if not inn:
             logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
@@ -2011,6 +2036,11 @@ def update_aggregation_status(task_uuid: str, group: str):
         # 5. Сохранение актуального статуса
         storage_aggs = get_storage(aggs_path, s3_config)
         output_status_path = f"{aggs_path.rstrip('/')}/{task_uuid}.json"
+
+        if isinstance(status_res, dict):
+            status_res["productionOrderId"] = production_order_id
+        elif isinstance(status_res, list) and len(status_res) > 0:
+            status_res[0]["productionOrderId"] = production_order_id
 
         temp_local = Path(f"temp_agg_status_{task_uuid}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
@@ -2152,7 +2182,8 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
         final_report = AggregationReport(
             participantId=inn,
             aggregationUnits=aggregation_units,
-            productGroup=group
+            productGroup=group,
+            productionOrderId=task_uuid
         )
 
         # 4. Сохраняем итоговый отчет
@@ -2271,6 +2302,10 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                 remote_receipt_path = f"{agg_set_receipts_path.rstrip('/')}/{task_uuid}.json"
 
                 temp_receipt = Path(f"temp_receipt_agg_set_{task_uuid}.json")
+                if isinstance(result, str):
+                    result = {"document_id": result}
+                result["productionOrderId"] = task_uuid
+
                 with open(temp_receipt, 'w', encoding='utf-8') as f:
                     json.dump(result, f, indent=4, ensure_ascii=False)
 
@@ -2457,6 +2492,7 @@ def update_aggregation_set_status(task_uuid: str, group: str):
 
         receipt_data = json.loads(storage_receipts.read_text(receipt_path))
         doc_id = receipt_data.get('document_id')
+        production_order_id = receipt_data.get('productionOrderId')
 
         if not doc_id:
             logger.error(f"[!] В чеке {task_uuid} отсутствует document_id")
@@ -2471,6 +2507,8 @@ def update_aggregation_set_status(task_uuid: str, group: str):
 
         report_data = json.loads(storage_agg.read_text(report_path))
         inn = report_data.get('participantId')
+        if not production_order_id:
+            production_order_id = report_data.get('productionOrderId')
 
         if not inn:
             logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
@@ -2499,6 +2537,11 @@ def update_aggregation_set_status(task_uuid: str, group: str):
         # 5. Сохранение
         storage_aggs = get_storage(agg_sets_path, s3_config)
         output_status_path = f"{agg_sets_path.rstrip('/')}/{task_uuid}.json"
+
+        if isinstance(status_res, dict):
+            status_res["productionOrderId"] = production_order_id
+        elif isinstance(status_res, list) and len(status_res) > 0:
+            status_res[0]["productionOrderId"] = production_order_id
 
         temp_local = Path(f"temp_agg_set_status_{task_uuid}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
@@ -2547,6 +2590,7 @@ def update_introduce_status(order_id: str, group: str):
 
         receipt_data = json.loads(storage_receipts.read_text(receipt_path))
         doc_id = receipt_data.get('document_id')
+        production_order_id = receipt_data.get('productionOrderId')
 
         if not doc_id:
             logger.error(f"[!] В чеке {order_id} отсутствует document_id")
@@ -2593,6 +2637,11 @@ def update_introduce_status(order_id: str, group: str):
         # 5. Сохранение актуального статуса
         storage_introduces = get_storage(introduces_path, s3_config)
         output_status_path = f"{introduces_path.rstrip('/')}/{order_id}.json"
+
+        if isinstance(status_res, dict):
+            status_res["productionOrderId"] = production_order_id
+        elif isinstance(status_res, list) and len(status_res) > 0:
+            status_res[0]["productionOrderId"] = production_order_id
 
         temp_local = Path(f"temp_intro_status_{order_id}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
