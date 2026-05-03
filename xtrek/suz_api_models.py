@@ -223,6 +223,7 @@ class ProductionOrder(SUZBase):
     Gtin: str
     Quantity: str
     PasportData: PasportData
+    virtual: bool = False
 
 @dataclass
 class EmissionOrderStatus(SUZBase):

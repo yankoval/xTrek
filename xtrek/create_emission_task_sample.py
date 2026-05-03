@@ -854,6 +854,59 @@ def get_emission_kodes(order_id: str):
         logger.error(f"[!] Ошибка в get_emission_kodes: {e}")
         return None
 
+def _find_production_order_id_by_suz_order_id(order_id: str):
+    """
+    Вспомогательная функция для поиска productionOrderId по orderId из чеков эмиссии.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        emission_receipts_path = config.get('emission_receipts')
+
+        if not emission_receipts_path:
+            return None
+
+        storage_receipts = get_storage(emission_receipts_path, s3_config)
+
+        if isinstance(storage_receipts, LocalStorage):
+            for f in Path(emission_receipts_path).glob("*.json"):
+                try:
+                    content = f.read_text(encoding='utf-8')
+                    data = json.loads(content)
+                    if data.get('orderId') == order_id:
+                        production_order_id = data.get('productionOrderId')
+                        if not production_order_id:
+                            production_order_id = f.stem
+                            if production_order_id.startswith('receipt_'):
+                                production_order_id = production_order_id[len('receipt_'):]
+                        logger.info(f"  -> Совпадение найдено в локальном файле: {f.name}, productionOrderId={production_order_id}")
+                        return production_order_id
+                except:
+                    continue
+        else:
+            try:
+                bucket, prefix = storage_receipts._parse_s3_url(emission_receipts_path)
+                res = storage_receipts.s3.list_objects_v2(Bucket=bucket, Prefix=prefix.strip('/') + '/')
+                for obj in res.get('Contents', []):
+                    if obj['Key'].endswith('.json'):
+                        content = storage_receipts.read_text(f"s3://{bucket}/{obj['Key']}")
+                        data = json.loads(content)
+                        if data.get('orderId') == order_id:
+                            production_order_id = data.get('productionOrderId')
+                            if not production_order_id:
+                                production_order_id = Path(obj['Key']).stem
+                                if production_order_id.startswith('receipt_'):
+                                    production_order_id = production_order_id[len('receipt_'):]
+                            logger.info(f"  -> Совпадение найдено в S3: {obj['Key']}, productionOrderId={production_order_id}")
+                            return production_order_id
+            except Exception as e:
+                logger.error(f"Ошибка при поиске в S3: {e}")
+
+        return None
+    except Exception as e:
+        logger.error(f"[!] Ошибка в _find_production_order_id_by_suz_order_id: {e}")
+        return None
+
 def format_date_suz(date_str: str) -> str:
     """Преобразует дату из dd.mm.yyyy в yyyy-MM-dd"""
     if not date_str:
@@ -868,7 +921,68 @@ def format_date_suz(date_str: str) -> str:
     except:
         return date_str
 
-def create_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None):
+def create_virtual_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None):
+    """
+    Обертка для create_utilisation_task.
+    Делает заказ на утилизацию только в том случае, если коды были эмитированы
+    в рамках виртуального заказа на производство.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        production_orders_path = config.get('production_orders_path')
+
+        if not production_orders_path:
+            logger.error("[!] В конфигурации отсутствует production_orders_path")
+            return None
+
+        # 1. Находим production_order_id через чек эмиссии
+        production_order_id = _find_production_order_id_by_suz_order_id(order_id)
+
+        if not production_order_id:
+            logger.error(f"[!] Не удалось найти production_order_id для orderId: {order_id}")
+            return None
+
+        # 2. Загружаем производственный заказ
+        storage_prod = get_storage(production_orders_path, s3_config)
+        prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage_prod.exists(prod_path):
+            logger.error(f"[!] Файл производственного заказа {production_order_id} не найден.")
+            return None
+
+        prod_data = json.loads(storage_prod.read_text(prod_path))
+
+        # 3. Проверка на виртуальность
+        is_virtual = prod_data.get('virtual') is True
+
+        if is_virtual:
+            logger.info(f"[*] Заказ {production_order_id} является виртуальным. Продолжаем создание задачи утилизации.")
+            return create_utilisation_task(order_id, group, production_date, expiration_date, production_order_id=production_order_id)
+        else:
+            logger.info(f"[*] Заказ {production_order_id} НЕ является виртуальным. Пропуск создания задачи утилизации.")
+            # Возвращаем экземпляр класса производственного заказа с свойством virtual:False
+            # Фильтруем данные для dataclass
+            pasport_raw = prod_data.get('PasportData', {})
+            sig_pasport = inspect.signature(PasportData.__init__)
+            valid_fields_pasport = {k for k, v in sig_pasport.parameters.items() if k != 'self'}
+            # Заполняем недостающие обязательные поля пустыми строками
+            complete_pasport = {k: pasport_raw.get(k, "") for k in valid_fields_pasport}
+            pasport_obj = PasportData(**complete_pasport)
+
+            return ProductionOrder(
+                Article=prod_data.get('Article', ''),
+                Gtin=prod_data.get('Gtin', ''),
+                Quantity=prod_data.get('Quantity', '0'),
+                PasportData=pasport_obj,
+                virtual=False
+            )
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_virtual_utilisation_task: {e}")
+        return None
+
+def create_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None, production_order_id: str = None):
     """
     Создает задачу на отчет о нанесении на основе полученных кодов.
     Пытается автоматически найти даты в исходном производственном заказе.
@@ -905,39 +1019,8 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
 
         if not auto_prod_date or not auto_exp_date:
             logger.info(f"[*] Поиск дат в исходном заказе для orderId: {order_id}")
-            storage_receipts = get_storage(emission_receipts_path, s3_config)
-            production_order_id = None
-
-            # Ищем во всех файлах чеков
-            if isinstance(storage_receipts, LocalStorage):
-                for f in Path(emission_receipts_path).glob("*.json"):
-                    try:
-                        content = f.read_text(encoding='utf-8')
-                        data = json.loads(content)
-                        if data.get('orderId') == order_id:
-                            production_order_id = f.stem
-                            if production_order_id.startswith('receipt_'):
-                                production_order_id = production_order_id[len('receipt_'):]
-                            logger.info(f"  -> Совпадение найдено в локальном файле: {f.name}, productionOrderId={production_order_id}")
-                            break
-                    except: continue
-            else:
-                # В S3 перебираем объекты в папке чеков
-                try:
-                    bucket, prefix = storage_receipts._parse_s3_url(emission_receipts_path)
-                    res = storage_receipts.s3.list_objects_v2(Bucket=bucket, Prefix=prefix.strip('/') + '/')
-                    for obj in res.get('Contents', []):
-                        if obj['Key'].endswith('.json'):
-                            content = storage_receipts.read_text(f"s3://{bucket}/{obj['Key']}")
-                            data = json.loads(content)
-                            if data.get('orderId') == order_id:
-                                production_order_id = Path(obj['Key']).stem
-                                if production_order_id.startswith('receipt_'):
-                                    production_order_id = production_order_id[len('receipt_'):]
-                                logger.info(f"  -> Совпадение найдено в S3: {obj['Key']}, productionOrderId={production_order_id}")
-                                break
-                except Exception as e:
-                    logger.error(f"Ошибка при поиске в S3: {e}")
+            if not production_order_id:
+                production_order_id = _find_production_order_id_by_suz_order_id(order_id)
 
             if production_order_id:
                 storage_prod = get_storage(production_orders_path, s3_config)
@@ -1659,30 +1742,8 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             logger.error(f"[!] Не удалось определить GTIN из кода: {first_code}")
             return None
 
-        storage_receipts = get_storage(emission_receipts_path, s3_config)
-        production_order_id = None
+        production_order_id = _find_production_order_id_by_suz_order_id(order_id)
         found_group = group
-
-        # Ищем в чеках для получения productionOrderId
-        if isinstance(storage_receipts, LocalStorage):
-            for f in Path(emission_receipts_path).glob("*.json"):
-                try:
-                    data = json.loads(f.read_text(encoding='utf-8'))
-                    if data.get('orderId') == order_id:
-                        production_order_id = f.stem.replace('receipt_', '')
-                        break
-                except: continue
-        else:
-            try:
-                bucket, prefix = storage_receipts._parse_s3_url(emission_receipts_path)
-                res = storage_receipts.s3.list_objects_v2(Bucket=bucket, Prefix=prefix.strip('/') + '/')
-                for obj in res.get('Contents', []):
-                    if obj['Key'].endswith('.json'):
-                        data = json.loads(storage_receipts.read_text(f"s3://{bucket}/{obj['Key']}"))
-                        if data.get('orderId') == order_id:
-                            production_order_id = Path(obj['Key']).stem.replace('receipt_', '')
-                            break
-            except: pass
 
         if production_order_id:
             # Пытаемся получить группу из заказа на эмиссию
@@ -2782,11 +2843,13 @@ def main():
         return
 
     if args.create_utilisation:
-        result = create_utilisation_task(args.create_utilisation, args.group,
+        result = create_virtual_utilisation_task(args.create_utilisation, args.group,
                                        production_date=args.production_date,
                                        expiration_date=args.expiration_date)
-        if result:
+        if isinstance(result, str):
             logger.info(f"[+++] Задача на отчет о нанесении успешно создана для {result}")
+        elif isinstance(result, ProductionOrder):
+            logger.info(f"[*] Пропуск создания задачи утилизации для невиртуального заказа (Article: {result.Article})")
         else:
             logger.error(f"[!] Не удалось создать задачу для {args.create_utilisation}")
         return
