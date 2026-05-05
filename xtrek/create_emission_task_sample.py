@@ -981,6 +981,74 @@ def create_virtual_utilisation_task(order_id: str, group: str, production_date: 
         logger.error(f"[!] Ошибка в create_virtual_utilisation_task: {e}")
         return None
 
+def create_virtual_introduce_task(order_id: str, group: str, production_date: str = None):
+    """
+    Обертка для create_introduce_task.
+    Делает заказ на ввод в оборот только в том случае, если коды были эмитированы
+    в рамках виртуального заказа на производство.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        production_orders_path = config.get('production_orders_path')
+
+        if not production_orders_path:
+            logger.error("[!] В конфигурации отсутствует production_orders_path")
+            return None
+
+        # 1. Находим production_order_id через чек эмиссии
+        production_order_id = _find_production_order_id_by_suz_order_id(order_id)
+
+        if not production_order_id:
+            logger.error(f"[!] Не удалось найти production_order_id для orderId: {order_id}")
+            return None
+
+        # 2. Загружаем производственный заказ
+        storage_prod = get_storage(production_orders_path, s3_config)
+        prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage_prod.exists(prod_path):
+            logger.error(f"[!] Файл производственного заказа {production_order_id} не найден.")
+            return None
+
+        prod_data = json.loads(storage_prod.read_text(prod_path))
+
+        # 3. Десериализация и проверка на виртуальность
+        pasport_raw = prod_data.get('PasportData', {})
+        # Фильтруем поля для PasportData
+        sig_pasport = inspect.signature(PasportData.__init__)
+        valid_fields_pasport = {k for k, v in sig_pasport.parameters.items() if k != 'self'}
+        pasport_data_filtered = {k: v for k, v in pasport_raw.items() if k in valid_fields_pasport}
+        # Для обязательных полей, которых нет в JSON, подставляем пустую строку, чтобы избежать TypeError
+        for field_name in valid_fields_pasport:
+            if field_name not in pasport_data_filtered:
+                pasport_data_filtered[field_name] = ""
+
+        pasport_obj = PasportData(**pasport_data_filtered)
+
+        # Собираем ProductionOrder
+        po_obj = ProductionOrder(
+            Article=prod_data.get('Article', ''),
+            Gtin=prod_data.get('Gtin', ''),
+            Quantity=str(prod_data.get('Quantity', '0')),
+            PasportData=pasport_obj,
+            virtual=prod_data.get('virtual', False)
+        )
+
+        if po_obj.virtual:
+            logger.info(f"[*] Заказ {production_order_id} является виртуальным. Продолжаем создание задачи ввода в оборот.")
+            res = create_introduce_task(order_id, group, production_date)
+            if res is None:
+                return None
+        else:
+            logger.info(f"[*] Заказ {production_order_id} НЕ является виртуальным. Пропуск создания задачи ввода в оборот.")
+
+        return po_obj
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_virtual_introduce_task: {e}")
+        return None
+
 def create_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None, production_order_id: str = None):
     """
     Создает задачу на отчет о нанесении на основе полученных кодов.
