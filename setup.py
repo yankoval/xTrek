@@ -21,6 +21,7 @@ setup(
             'gs1-processor=xtrek.gs1_processor:main',
             'kiz-from-rep=xtrek.kiz_from_rep:main',
             'crpt-auth=xtrek.crpt_auth:main',
+            'prn=xtrek.prn:main',
         ],
     },
     package_data={
