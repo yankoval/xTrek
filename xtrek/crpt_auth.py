@@ -17,7 +17,8 @@ def get_new_token(inn, conid=None, mode='auth', timeout=60):
     Возвращает строку токена или None в случае ошибки.
     """
     user_profile = os.environ.get('USERPROFILE', os.path.expanduser('~'))
-    work_dir = Path(user_profile) / "tst"
+    #work_dir = Path(user_profile) / "tst"
+    work_dir = Path(r"Y:\BatchPassToPrint\tst")
     work_dir.mkdir(parents=True, exist_ok=True)
 
     unique_id = uuid.uuid4()
