@@ -134,7 +134,10 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
         if not source_gtin or source_gtin == '00000000000000':
             raise ValueError(f"Gtin not found in source file {production_order_id}.json")
 
-        source_qty = qty if qty > 0 else int(source_data.get('Quantity', 0))
+        source_qty = qty if qty > 0 else int(source_data.get('Quantity', 0))\
+                        * int(source_data.get('PasportData', {}).get('Product_PackQty',1))
+        logger.info(f"source_qty :{source_qty} Quantity {source_data.get('Quantity', 0)}"
+        +f"* Product_PackQty {source_data.get('PasportData', {}).get('Product_PackQty',1)}")
         source_stem = production_order_id
 
         # Получаем ИНН и токен для NK
@@ -211,6 +214,7 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
             # 3.3 создаем заказ на производство с количеством равным количеству в исходном задании
             # умноженному на количество указанное в этом вложении .
             new_qty = source_qty * comp_qty_in_set
+            logger.info(f"[+++] new_qty {new_qty}, source_qty:{source_qty} * comp_qty_in_set:{comp_qty_in_set}")
 
             # Названия из данных NK.feedproduct для вложения.
             # Пользователь уточнил: Название берем из NK.get_set_by_gtin из поля good_name
@@ -310,7 +314,7 @@ def process_incoming_task(s3_full_key: str):
         tags = storage.get_tags(s3_path)
         if 'status' in tags:
             logger.info(f"[*] Объект {s3_path} уже имеет тег status: {tags['status']}. Завершение.")
-            return
+            #return
 
         # 2. Скачиваем/читаем файл
         original_filename = os.path.basename(s3_path)
@@ -1755,7 +1759,7 @@ def update_utilisation_report_status(order_id: str):
             status_res = suz_api.report_info(report_id)
         except Exception as e:
             logger.error(f"[!] Ошибка API: {e}")
-            return str(e)
+            return None
 
         if not status_res:
             logger.error("[!] Пустой ответ от СУЗ.")
@@ -1790,7 +1794,7 @@ def update_utilisation_report_status(order_id: str):
 
     except Exception as e:
         logger.error(f"[!] Ошибка в update_utilisation_report_status: {e}")
-        return str(e)
+        return None
 
 
 def create_introduce_task(order_id: str, group: str = None, production_date: str = None):
