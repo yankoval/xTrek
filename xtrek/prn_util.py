@@ -62,11 +62,11 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
 
         # Пути из конфигурации
         kodes_path = config.get('kodes')
-        prn_tasks_path = config.get('prn tasks')
-        prn_templates_path = config.get('prn templates')
+        prn_tasks_path = config.get('prn_tasks')
+        prn_templates_path = config.get('prn_templates')
 
         if not all([kodes_path, prn_tasks_path, prn_templates_path]):
-            logger.error("[!] В конфигурации отсутствуют необходимые пути (kodes, prn tasks, prn templates)")
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (kodes, prn_tasks, prn_templates)")
             return None
 
         # Инициализация хранилищ
