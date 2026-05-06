@@ -9,7 +9,7 @@ setup(
     author='Ivan Kiselev',
     author_email='yankoval@gmail.com',
     description='utilities for xTrek',
-    packages=find_packages(include=['xtrek', 'xtrek.*']),
+    packages=find_packages(include=['xtrek', 'xtrek.*', 'amica', 'amica.*']),
     install_requires=requirements,
     entry_points={
         'console_scripts': [
@@ -21,6 +21,7 @@ setup(
             'gs1-processor=xtrek.gs1_processor:main',
             'kiz-from-rep=xtrek.kiz_from_rep:main',
             'crpt-auth=xtrek.crpt_auth:main',
+            'prn=xtrek.prn_util:main',
         ],
     },
     package_data={

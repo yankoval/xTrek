@@ -37,10 +37,11 @@ trueapi = "xtrek.trueapi:main"
 gs1-processor = "xtrek.gs1_processor:main"
 kiz-from-rep = "xtrek.kiz_from_rep:main"
 crpt-auth = "xtrek.crpt_auth:main"
+prn = "xtrek.prn_util:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["xtrek*"]
+include = ["xtrek*", "amica*"]
 
 [tool.setuptools.package-data]
 xtrek = ["*.json", "my_orgs/*.json"]
