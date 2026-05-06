@@ -8,7 +8,9 @@ import shutil
 
 from .storage import get_storage
 from .config_loader import load_config
-from .amica_generator import generate_amica_vdf
+import amica.amica_generator as amica_generator
+
+generate_amica_vdf = amica_generator.generate_amica_vdf
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
