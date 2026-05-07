@@ -121,6 +121,22 @@ def test_auto_inn_detection(mock_get_storage, mock_tp_class, mock_get_inn, tmp_p
                     # Verify API was initialized with the auto token
                     mock_api_class.assert_called_with(token="AUTO_TOKEN")
 
+def test_path_resolution():
+    from xtrek.utils import resolve_file_path
+    s3_config = {
+        "bucket": "test-bucket",
+        "equipment-reports": "reports"
+    }
+
+    # Cases where it should resolve
+    assert resolve_file_path("uuid-123", s3_config) == "s3://test-bucket/reports/uuid-123.json"
+
+    # Cases where it should NOT resolve
+    assert resolve_file_path("s3://bucket/path", s3_config) == "s3://bucket/path"
+    assert resolve_file_path("file.json", s3_config) == "file.json"
+    assert resolve_file_path("folder/file", s3_config) == "folder/file"
+    assert resolve_file_path("uuid-123", None) == "uuid-123"
+
 def test_status_logic(analyzer, tmp_path):
     file1 = tmp_path / "file1.json"
     # 01 + 14 digits + ...

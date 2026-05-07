@@ -185,6 +185,20 @@ class AggregationAnalyzer:
 
         return errors if errors else None
 
+def resolve_file_path(path: str, s3_config: Optional[Dict]) -> str:
+    """Разрешает путь к файлу, добавляя префикс из конфига если нужно."""
+    if not s3_config:
+        return path
+
+    # Если путь не содержит s3://, не имеет расширения и не содержит разделителей папок
+    if not path.startswith('s3://') and '.' not in os.path.basename(path) and '/' not in path and '\\' not in path:
+        bucket = s3_config.get('bucket')
+        prefix = s3_config.get('equipment-reports')
+        if bucket and prefix:
+            return f"s3://{bucket}/{prefix}/{path}.json"
+
+    return path
+
 def main():
     parser = argparse.ArgumentParser(description="Анализ отчетов оборудования об агрегации")
     parser.add_argument('files', nargs='+', help="Список JSON файлов (локальных или S3)")
@@ -206,6 +220,9 @@ def main():
         except Exception as e:
             logger.error(f"Ошибка загрузки конфигурации S3: {e}")
 
+    # Разрешение путей к файлам
+    resolved_files = [resolve_file_path(f, s3_config) for f in args.files]
+
     # Авторизация
     token = args.token
     if not token and args.inn:
@@ -224,7 +241,7 @@ def main():
     if not token and not args.inn:
         logger.info("Попытка автоматического определения ИНН по GTIN из файлов...")
         detected_inn = None
-        for path in args.files:
+        for path in resolved_files:
             storage = get_storage(path, s3_config)
             try:
                 content = storage.read_text(path)
@@ -263,7 +280,7 @@ def main():
     nk = NK(token=token)
     analyzer = AggregationAnalyzer(api, nk)
 
-    errors = analyzer.analyze(args.files, s3_config=s3_config)
+    errors = analyzer.analyze(resolved_files, s3_config=s3_config)
 
     if errors:
         logger.error("--- ОБНАРУЖЕНЫ ОШИБКИ ---")
