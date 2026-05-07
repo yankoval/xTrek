@@ -225,6 +225,11 @@ def main():
 
     # Авторизация
     token = args.token
+
+    # Если токен не задан, попробуем поискать в переменных окружения
+    if not token:
+        token = os.getenv("TRUE_API_TOKEN")
+
     if not token and args.inn:
         base_path = os.path.dirname(os.path.abspath(__file__))
         orgs_dir = os.path.join(base_path, 'my_orgs')
@@ -233,9 +238,6 @@ def main():
         if token_data:
             token = token_data.get('Токен')
             logger.info(f"Получен токен для ИНН {args.inn}")
-
-    if not token:
-        token = os.getenv("TRUE_API_TOKEN")
 
     # Если токен не задан, попробуем определить ИНН по первому найденному GTIN в файлах
     if not token and not args.inn:
