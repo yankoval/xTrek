@@ -9,6 +9,7 @@ from .storage import get_storage
 from .trueapi import HonestSignAPI
 from .nkapi import NK
 from .tokens import TokenProcessor
+from .gs1_processor import get_inn_by_gtin
 
 # Setup logging
 logger = logging.getLogger("xtrek.utils")
@@ -218,6 +219,41 @@ def main():
 
     if not token:
         token = os.getenv("TRUE_API_TOKEN")
+
+    # Если токен не задан, попробуем определить ИНН по первому найденному GTIN в файлах
+    if not token and not args.inn:
+        logger.info("Попытка автоматического определения ИНН по GTIN из файлов...")
+        detected_inn = None
+        for path in args.files:
+            storage = get_storage(path, s3_config)
+            try:
+                content = storage.read_text(path)
+                data = json.loads(content)
+                ready_boxes = data.get('readyBox', [])
+                for box in ready_boxes:
+                    # Пробуем извлечь GTIN из коробки или вложений
+                    codes_to_check = [box.get('boxNumber')] + (box.get('productNumbersFull') or [])
+                    for code in codes_to_check:
+                        if code:
+                            gtin = get_gtin_from_code(cut_crypto_tail(code))
+                            if gtin:
+                                detected_inn = get_inn_by_gtin(gtin)
+                                if detected_inn:
+                                    logger.info(f"Автоматически определен ИНН: {detected_inn} (по GTIN {gtin})")
+                                    break
+                    if detected_inn: break
+            except Exception:
+                continue
+            if detected_inn: break
+
+        if detected_inn:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            orgs_dir = os.path.join(base_path, 'my_orgs')
+            tp = TokenProcessor(orgs_dir=orgs_dir)
+            token_data = tp.get_token_by_inn(detected_inn)
+            if token_data:
+                token = token_data.get('Токен')
+                logger.info(f"Получен токен для автоматически определенного ИНН {detected_inn}")
 
     if not token:
         logger.error("Не указан токен. Используйте --inn, --token или переменную TRUE_API_TOKEN")

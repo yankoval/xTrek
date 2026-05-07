@@ -80,6 +80,47 @@ def test_sscc_normalization(analyzer, tmp_path):
     assert errors is not None
     assert any(f"Код агрегации 00{sscc_18} уже зарегистрирован" in e for e in errors)
 
+@patch('xtrek.utils.get_inn_by_gtin')
+@patch('xtrek.utils.TokenProcessor')
+@patch('xtrek.utils.get_storage')
+def test_auto_inn_detection(mock_get_storage, mock_tp_class, mock_get_inn, tmp_path):
+    # Setup mock storage to return a file with a GTIN
+    mock_storage = MagicMock()
+    mock_get_storage.return_value = mock_storage
+
+    gtin = "04640286999931"
+    data = {
+        "readyBox": [
+            {
+                "boxNumber": f"01{gtin}21SERIAL\u001d93tail",
+                "productNumbersFull": []
+            }
+        ]
+    }
+    mock_storage.read_text.return_value = json.dumps(data)
+
+    # Mock GS1 processor and TokenProcessor
+    mock_get_inn.return_value = "1234567890"
+    mock_tp = mock_tp_class.return_value
+    mock_tp.get_token_by_inn.return_value = {"Токен": "AUTO_TOKEN"}
+
+    from xtrek.utils import main
+    import sys
+    from unittest.mock import patch as patch_args
+
+    with patch_args.object(sys, 'argv', ['utils.py', str(tmp_path / "dummy.json")]):
+        with patch('xtrek.utils.HonestSignAPI') as mock_api_class:
+            with patch('xtrek.utils.NK') as mock_nk_class:
+                with patch('xtrek.utils.AggregationAnalyzer') as mock_analyzer_class:
+                    main()
+
+                    # Verify auto detection was called
+                    mock_get_inn.assert_called_with(gtin)
+                    mock_tp.get_token_by_inn.assert_called_with("1234567890")
+
+                    # Verify API was initialized with the auto token
+                    mock_api_class.assert_called_with(token="AUTO_TOKEN")
+
 def test_status_logic(analyzer, tmp_path):
     file1 = tmp_path / "file1.json"
     # 01 + 14 digits + ...
