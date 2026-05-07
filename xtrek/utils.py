@@ -186,17 +186,22 @@ class AggregationAnalyzer:
 
         return errors if errors else None
 
-def resolve_file_path(path: str, s3_config: Optional[Dict]) -> str:
+def resolve_file_path(path: str, config: Dict) -> str:
     """Разрешает путь к файлу, добавляя префикс из конфига если нужно."""
-    if not s3_config:
+    if not config:
         return path
 
     # Если путь не содержит s3://, не имеет расширения и не содержит разделителей папок
     if not path.startswith('s3://') and '.' not in os.path.basename(path) and '/' not in path and '\\' not in path:
-        bucket = s3_config.get('bucket')
-        prefix = s3_config.get('equipment-reports')
-        if bucket and prefix:
-            return f"s3://{bucket}/{prefix}/{path}.json"
+        reports_path = config.get('equipment-reports')
+        if reports_path:
+            if reports_path.startswith('s3://'):
+                return f"{reports_path.rstrip('/')}/{path}.json"
+
+            s3_config = config.get('s3_config', {})
+            bucket = s3_config.get('bucket')
+            if bucket:
+                return f"s3://{bucket}/{reports_path.lstrip('/')}/{path}.json"
 
     return path
 
@@ -220,7 +225,7 @@ def main():
     s3_config = config.get('s3_config')
 
     # Разрешение путей к файлам
-    resolved_files = [resolve_file_path(f, s3_config) for f in args.files]
+    resolved_files = [resolve_file_path(f, config) for f in args.files]
 
     # Авторизация
     token = args.token

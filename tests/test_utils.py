@@ -123,18 +123,24 @@ def test_auto_inn_detection(mock_get_storage, mock_tp_class, mock_get_inn, tmp_p
 
 def test_path_resolution():
     from xtrek.utils import resolve_file_path
-    s3_config = {
-        "bucket": "test-bucket",
+    config = {
+        "s3_config": {"bucket": "test-bucket"},
         "equipment-reports": "reports"
     }
 
     # Cases where it should resolve
-    assert resolve_file_path("uuid-123", s3_config) == "s3://test-bucket/reports/uuid-123.json"
+    assert resolve_file_path("uuid-123", config) == "s3://test-bucket/reports/uuid-123.json"
+
+    # S3 path in reports_path
+    config_s3 = {
+        "equipment-reports": "s3://other-bucket/other-reports"
+    }
+    assert resolve_file_path("uuid-123", config_s3) == "s3://other-bucket/other-reports/uuid-123.json"
 
     # Cases where it should NOT resolve
-    assert resolve_file_path("s3://bucket/path", s3_config) == "s3://bucket/path"
-    assert resolve_file_path("file.json", s3_config) == "file.json"
-    assert resolve_file_path("folder/file", s3_config) == "folder/file"
+    assert resolve_file_path("s3://bucket/path", config) == "s3://bucket/path"
+    assert resolve_file_path("file.json", config) == "file.json"
+    assert resolve_file_path("folder/file", config) == "folder/file"
     assert resolve_file_path("uuid-123", None) == "uuid-123"
 
 def test_status_logic(analyzer, tmp_path):
