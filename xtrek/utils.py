@@ -10,6 +10,7 @@ from .trueapi import HonestSignAPI
 from .nkapi import NK
 from .tokens import TokenProcessor
 from .gs1_processor import get_inn_by_gtin
+from .config_loader import load_config
 
 # Setup logging
 logger = logging.getLogger("xtrek.utils")
@@ -212,13 +213,11 @@ def main():
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
-    s3_config = None
     if args.suz_worker_config:
-        try:
-            with open(args.suz_worker_config, 'r', encoding='utf-8') as f:
-                s3_config = json.load(f).get('s3_config')
-        except Exception as e:
-            logger.error(f"Ошибка загрузки конфигурации S3: {e}")
+        os.environ['suz_worker_config'] = args.suz_worker_config
+
+    config = load_config('suz_worker_config')
+    s3_config = config.get('s3_config')
 
     # Разрешение путей к файлам
     resolved_files = [resolve_file_path(f, s3_config) for f in args.files]
