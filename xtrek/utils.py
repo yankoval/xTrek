@@ -23,6 +23,12 @@ def cut_crypto_tail(code: str) -> str:
     """Обрезает криптохвост кода (разделитель \u001d)."""
     return code.split('\u001d')[0]
 
+def normalize_sscc(code: str) -> str:
+    """Добавляет префикс 00 к 18-значным SSCC кодам."""
+    if len(code) == 18 and code.isdigit():
+        return '00' + code
+    return code
+
 def get_gtin_from_code(code: str) -> Optional[str]:
     """Извлекает GTIN из кода (01 + 14 цифр)."""
     if code.startswith('01') and len(code) >= 16:
@@ -93,7 +99,7 @@ class AggregationAnalyzer:
             for box in ready_boxes:
                 box_code = box.get('boxNumber')
                 if box_code:
-                    clean_box = cut_crypto_tail(box_code)
+                    clean_box = normalize_sscc(cut_crypto_tail(box_code))
                     all_box_codes[clean_box] += 1
                     file_boxes.append(clean_box)
 

@@ -49,6 +49,37 @@ def test_uniqueness_check(analyzer, tmp_path):
     assert any("Дубликат кода агрегации: BOX1" in e for e in errors)
     assert any("Дубликат кода вложения: CHILD2" in e for e in errors)
 
+def test_sscc_normalization(analyzer, tmp_path):
+    file1 = tmp_path / "file1.json"
+    # 18 digits SSCC
+    sscc_18 = "123456789012345678"
+    data = {
+        "readyBox": [
+            {
+                "boxNumber": sscc_18,
+                "productNumbersFull": []
+            }
+        ]
+    }
+    file1.write_text(json.dumps(data))
+
+    # Mock API to return status for normalized SSCC
+    def mock_check(codes):
+        results = []
+        for c in codes:
+            if c == "00" + sscc_18:
+                results.append({"cisInfo": {"cis": c, "status": "EMITTED"}})
+            else:
+                results.append({"cisInfo": {}})
+        return results
+
+    analyzer.check_statuses = MagicMock(side_effect=mock_check)
+
+    errors = analyzer.analyze([str(file1)])
+
+    assert errors is not None
+    assert any(f"Код агрегации 00{sscc_18} уже зарегистрирован" in e for e in errors)
+
 def test_status_logic(analyzer, tmp_path):
     file1 = tmp_path / "file1.json"
     # 01 + 14 digits + ...
