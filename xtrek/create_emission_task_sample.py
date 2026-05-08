@@ -16,6 +16,7 @@ from .suz_api_models import (
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
     EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
 )
+from .kiz_from_rep import extract_and_flatten
 from .suz import SUZ
 from .trueapi import HonestSignAPI
 from .nkapi import NK
@@ -2667,6 +2668,208 @@ def create_equipment_set_report(production_order_id: str):
             try: tf.unlink()
             except: pass
 
+def create_equipment_set_report_from_report(production_order_id: str):
+    """
+    Создает отчет об агрегации наборов на основании отчета оборудования об агрегации.
+    Извлекает коды наборов из отчета оборудования и собирает наборы из кодов вложений виртуальных заданий.
+    """
+    temp_files = []
+    try:
+        from .kinGenerator import KinReportGenerator
+        from urllib.parse import urlparse
+
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        production_orders_path = config.get('production_orders_path')
+        kodes_path = config.get('kodes')
+        equipment_set_reports_path = config.get('equipment_set_reports')
+        equipment_tasks_path = config.get('equipment-tasks')
+        equipment_reports_path = config.get('equipment-reports')
+
+        if not all([production_orders_path, kodes_path, equipment_set_reports_path, equipment_tasks_path, equipment_reports_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути")
+            return None
+
+        # 1. Находим и загружаем отчет оборудования
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        task_path = f"{equipment_tasks_path.rstrip('/')}/{production_order_id}.json"
+        if not storage_tasks.exists(task_path):
+            logger.error(f"[!] Задание на оборудование не найдено: {task_path}")
+            return None
+
+        task_data = json.loads(storage_tasks.read_text(task_path))
+        signed_link = task_data.get('task-export-signed-link') or task_data.get('task_export_signed_link')
+        if not signed_link:
+            logger.error(f"[!] В задании {production_order_id} не найден ключ task-export-signed-link")
+            return None
+
+        parsed_url = urlparse(signed_link)
+        report_filename = os.path.basename(parsed_url.path)
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        report_path = f"{equipment_reports_path.rstrip('/')}/{report_filename}"
+
+        if not storage_reports.exists(report_path):
+            logger.error(f"[!] Отчет оборудования не найден: {report_path}")
+            return None
+
+        eq_report_data = json.loads(storage_reports.read_text(report_path))
+        # Извлекаем коды наборов (kigu)
+        eq_set_codes = extract_and_flatten(eq_report_data)
+        if not eq_set_codes:
+            logger.error(f"[!] В отчете оборудования {production_order_id} не найдено кодов")
+            return None
+
+        set_codes_count = len(eq_set_codes)
+        logger.info(f"[*] Из отчета оборудования извлечено {set_codes_count} кодов наборов")
+
+        # 2. Загружаем производственный заказ
+        storage_prod = get_storage(production_orders_path, s3_config)
+        prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+        if not storage_prod.exists(prod_path):
+            logger.error(f"[!] Файл производственного заказа {production_order_id} не найден")
+            return None
+
+        prod_data = json.loads(storage_prod.read_text(prod_path))
+        main_gtin = str(prod_data.get('Gtin', '')).strip().zfill(14)
+        pasport = prod_data.get('PasportData', {})
+
+        # 3. Получаем информацию из NK
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        inn = get_inn_by_gtin(main_gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        if not inn:
+             raise ValueError(f"INN not found for GTIN {main_gtin}")
+
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        if not token:
+            token = get_new_token(inn=inn, mode='jwt')
+            if token: token_processor.save_token(token)
+        if not token:
+            raise ValueError(f"JWT token for INN {inn} not found")
+
+        nk = NK(token=token)
+        set_feed = nk.get_set_by_gtin(main_gtin)
+        if not set_feed or not set_feed.get('result'):
+             raise ValueError(f"Failed to get set composition for {main_gtin}")
+
+        set_item = set_feed['result'][0]
+        set_gtins = set_item.get('set_gtins', [])
+        good_name = set_item.get('good_name', '')
+
+        if not set_gtins:
+             raise ValueError(f"GTIN {main_gtin} has no components in NK")
+
+        # 4. Создаем файл рецепта (Hierarchy)
+        kits_packs = []
+        for s in set_gtins:
+            comp_gtin = str(s['gtin']).strip().zfill(14)
+            comp_feed = nk.feedProduct(comp_gtin)
+            comp_name = ""
+            if comp_feed and comp_feed.get('result'):
+                comp_name = comp_feed['result'][0].get('good_name', '')
+
+            for _ in range(s['quantity']):
+                kits_packs.append({
+                    "GTIN": comp_gtin,
+                    "PackName": comp_name
+                })
+
+        serial_number = ""
+        batch_date_expired = pasport.get('Batch_date_expired', '')
+        if batch_date_expired and len(batch_date_expired) == 10:
+             parts = batch_date_expired.split('.')
+             if len(parts) == 3:
+                 serial_number = f"{parts[1]}.{parts[2]}"
+
+        recipe = {
+            "Hierarchy": [
+                {
+                    "LevelType": "Kit",
+                    "Packs": kits_packs
+                },
+                {
+                    "LevelType": "Kigu",
+                    "Packs": [
+                        {
+                            "CountLayers": 0,
+                            "CountPacksInside": len(kits_packs),
+                            "GTIN": main_gtin,
+                            "PackName": good_name
+                        }
+                    ]
+                }
+            ],
+            "id": str(uuid.uuid4()),
+            "SerialNumber": serial_number
+        }
+
+        recipe_file = Path(f"temp_recipe_{production_order_id}.json")
+        with open(recipe_file, 'w', encoding='utf-8') as f:
+            json.dump(recipe, f, ensure_ascii=False, indent=3)
+        temp_files.append(recipe_file)
+
+        # 5. Собираем файлы кодов
+        storage_kodes = get_storage(kodes_path, s3_config)
+
+        # Файл с кодами наборов (берем из отчета оборудования)
+        set_codes_file = Path(f"temp_set_codes_{production_order_id}.json")
+        with open(set_codes_file, 'w', encoding='utf-8') as f:
+            json.dump({"codes": eq_set_codes}, f, ensure_ascii=False, indent=3)
+        temp_files.append(set_codes_file)
+
+        # Файлы с кодами компонентов (из виртуальных заданий)
+        for s in set_gtins:
+            comp_gtin = str(s['gtin']).strip().zfill(14)
+            comp_prod_order_id = f"V-{production_order_id}-{comp_gtin}"
+            comp_order_id = _get_order_id_from_receipt(comp_prod_order_id)
+            if not comp_order_id:
+                 raise ValueError(f"Order ID not found for component {comp_prod_order_id}")
+
+            comp_kodes_path = f"{kodes_path.rstrip('/')}/{comp_order_id}.json"
+            if not storage_kodes.exists(comp_kodes_path):
+                 raise ValueError(f"Codes not found for component {comp_prod_order_id}")
+
+            comp_codes_file = Path(f"temp_codes_{comp_order_id}.json")
+            with open(comp_codes_file, 'w', encoding='utf-8') as f:
+                 f.write(storage_kodes.read_text(comp_kodes_path))
+            temp_files.append(comp_codes_file)
+
+        # 6. Генерируем отчет
+        generator = KinReportGenerator()
+        file_paths = [str(tf) for tf in temp_files]
+
+        report_local_name = generator.generate_kin_report(file_paths, num_kits=set_codes_count)
+
+        if not report_local_name or not os.path.exists(report_local_name):
+             raise ValueError("Failed to generate KIN report")
+
+        # Проверка, что сгенерировано нужное количество
+        with open(report_local_name, 'r', encoding='utf-8') as f:
+             report_res_data = json.load(f)
+             generated_kits_count = len(report_res_data.get('readyBox', []))
+             if generated_kits_count < set_codes_count:
+                  raise ValueError(f"Недостаточно кодов для создания {set_codes_count} наборов (создано только {generated_kits_count})")
+
+        # 7. Загружаем в S3
+        storage_reports = get_storage(equipment_set_reports_path, s3_config)
+        target_report_path = f"{equipment_set_reports_path.rstrip('/')}/{production_order_id}.json"
+        logger.info(f"[*] Загрузка отчета агрегации наборов в: {target_report_path}")
+        storage_reports.upload(report_local_name, target_report_path)
+
+        try: os.unlink(report_local_name)
+        except: pass
+
+        return production_order_id
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_equipment_set_report_from_report: {e}")
+        raise
+    finally:
+        for tf in temp_files:
+            try: tf.unlink()
+            except: pass
+
 def create_equipment_aggregation_task(production_order_id: str):
     """
     Создает задание для оборудования на агрегацию по заданию на производство.
@@ -3018,6 +3221,7 @@ def main():
     parser.add_argument("--create-virtual-tasks", help="Создать виртуальные задания на производство по исходному заданию (productionOrderId)")
     parser.add_argument("--create-virtual-tasks-from-report", help="Создать виртуальные задания на производство по отчету оборудования (productionOrderId)")
     parser.add_argument("--create-equipment-set-report", help="Создать виртуальный отчет оборудования об агрегации в наборы SET по productionOrderId")
+    parser.add_argument("--create-equipment-set-report-from-report", help="Создать отчет об агрегации наборов на основании отчета оборудования по productionOrderId")
     parser.add_argument("--create-equipment-task", help="Создать задание для оборудования на агрегацию по productionOrderId")
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
@@ -3097,6 +3301,14 @@ def main():
             logger.info(f"[+++] Виртуальный отчет оборудования успешно создан: {result}")
         else:
             logger.error(f"[!] Не удалось создать виртуальный отчет оборудования для {args.create_equipment_set_report}")
+        return
+
+    if args.create_equipment_set_report_from_report:
+        result = create_equipment_set_report_from_report(args.create_equipment_set_report_from_report)
+        if result:
+            logger.info(f"[+++] Отчет об агрегации наборов успешно создан: {result}")
+        else:
+            logger.error(f"[!] Не удалось создать отчет об агрегации наборов для {args.create_equipment_set_report_from_report}")
         return
 
     if args.create_virtual_tasks:
