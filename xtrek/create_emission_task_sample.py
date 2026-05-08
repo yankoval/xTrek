@@ -847,9 +847,9 @@ def get_emission_kodes(order_id: str):
         logger.info(f"[*] Выгрузка кодов в: {output_path}")
         storage_kodes.upload(str(temp_file), output_path)
 
-        # Устанавливаем тег print-ststus:not-printed
-        logger.info(f"[*] Установка тега print-ststus:not-printed для {output_path}")
-        kodes_tags = {"print-ststus": "not-printed"}
+        # Устанавливаем тег print-status:not-printed
+        logger.info(f"[*] Установка тега print-status:not-printed для {output_path}")
+        kodes_tags = {"print-status": "not-printed"}
         if production_order_id:
             kodes_tags["productionOrderId"] = production_order_id
         storage_kodes.set_tags(output_path, kodes_tags)

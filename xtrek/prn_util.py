@@ -79,11 +79,11 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
 
         # 0. Проверка тегов управления печатью
         tags = storage_kodes.get_tags(json_s3_path)
-        print_status = tags.get('print-ststus')
+        print_status = tags.get('print-status')
         production_order_id = tags.get('productionOrderId')
 
         if print_status == 'processing':
-            logger.info(f"[*] Файл {key} уже в обработке (print-ststus:processing). Пропуск.")
+            logger.info(f"[*] Файл {key} уже в обработке (print-status:processing). Пропуск.")
             return None
 
         # Проверка на виртуальность
@@ -108,8 +108,8 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             return key
 
         # Устанавливаем статус processing
-        logger.info(f"[*] Установка статуса print-ststus:processing для {key}")
-        storage_kodes.set_tags(json_s3_path, {'print-ststus': 'processing'})
+        logger.info(f"[*] Установка статуса print-status:processing для {key}")
+        storage_kodes.set_tags(json_s3_path, {'print-status': 'processing'})
 
         vdf_template_s3_path = f"{prn_templates_path.rstrip('/')}/{vdf_template_name}"
         amica_json_s3_path = f"{prn_templates_path.rstrip('/')}/amica.json"
@@ -192,8 +192,8 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             storage_tasks.upload(str(local_vdf), dest_vdf_s3)
 
             # 6. Устанавливаем статус printed
-            logger.info(f"[*] Установка статуса print-ststus:printed для {key}")
-            storage_kodes.set_tags(json_s3_path, {'print-ststus': 'printed'})
+            logger.info(f"[*] Установка статуса print-status:printed для {key}")
+            storage_kodes.set_tags(json_s3_path, {'print-status': 'printed'})
 
             logger.info(f"[+++] Процедура успешно завершена для {key}")
             return key
@@ -201,7 +201,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
     except Exception as e:
         # В случае ошибки сбрасываем статус в not-printed, чтобы можно было попробовать снова
         try:
-            storage_kodes.set_tags(json_s3_path, {'print-ststus': 'not-printed'})
+            storage_kodes.set_tags(json_s3_path, {'print-status': 'not-printed'})
         except:
             pass
         logger.error(f"[!] Ошибка в generate_prn_files: {e}")
