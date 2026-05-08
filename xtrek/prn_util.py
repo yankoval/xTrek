@@ -80,15 +80,14 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
         # 0. Проверка тегов управления печатью
         tags = storage_kodes.get_tags(json_s3_path)
         print_status = tags.get('print-ststus')
-        if print_status == 'printed':
-            logger.info(f"[*] Файл {key} уже напечатан (print-ststus:printed). Пропуск.")
-            return key
+
         if print_status == 'processing':
             logger.info(f"[*] Файл {key} уже в обработке (print-ststus:processing). Пропуск.")
             return None
+
         if print_status != 'not-printed':
-             logger.warning(f"[*] Файл {key} имеет некорректный статус печати: {print_status}. Ожидалось not-printed.")
-             #return None # Можно раскомментировать если нужно строгое следование
+            logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
+            return key
 
         # Устанавливаем статус processing
         logger.info(f"[*] Установка статуса print-ststus:processing для {key}")
