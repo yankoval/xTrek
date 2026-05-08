@@ -80,10 +80,28 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
         # 0. Проверка тегов управления печатью
         tags = storage_kodes.get_tags(json_s3_path)
         print_status = tags.get('print-ststus')
+        production_order_id = tags.get('productionOrderId')
 
         if print_status == 'processing':
             logger.info(f"[*] Файл {key} уже в обработке (print-ststus:processing). Пропуск.")
             return None
+
+        # Проверка на виртуальность
+        if not ignore_duplicate and production_order_id:
+            try:
+                storage_prod = get_storage(kodes_path, s3_config) # get_storage generic enough
+                # Wait, kodes_path is for codes. We need production_orders_path.
+                prod_orders_path = config.get('production_orders_path')
+                if prod_orders_path:
+                    storage_prod = get_storage(prod_orders_path, s3_config)
+                    prod_path = f"{prod_orders_path.rstrip('/')}/{production_order_id}.json"
+                    if storage_prod.exists(prod_path):
+                        prod_data = json.loads(storage_prod.read_text(prod_path))
+                        if prod_data.get('virtual'):
+                            logger.info(f"Попытка напечатать коды созданные для виртуального заказа {production_order_id}")
+                            return key
+            except Exception as e:
+                logger.warning(f"Ошибка при проверке виртуальности заказа {production_order_id}: {e}")
 
         if not ignore_duplicate and print_status != 'not-printed':
             logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")

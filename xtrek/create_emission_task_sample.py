@@ -760,6 +760,7 @@ def get_emission_kodes(order_id: str):
         status_data = json.loads(status_content)
         gtin = status_data.get('gtin')
         oms_id = status_data.get('omsId')
+        production_order_id = status_data.get('productionOrderId')
 
         if not gtin or not oms_id:
             logger.error(f"[!] Не удалось получить gtin или omsId из файла {target_path}")
@@ -848,7 +849,10 @@ def get_emission_kodes(order_id: str):
 
         # Устанавливаем тег print-ststus:not-printed
         logger.info(f"[*] Установка тега print-ststus:not-printed для {output_path}")
-        storage_kodes.set_tags(output_path, {"print-ststus": "not-printed"})
+        kodes_tags = {"print-ststus": "not-printed"}
+        if production_order_id:
+            kodes_tags["productionOrderId"] = production_order_id
+        storage_kodes.set_tags(output_path, kodes_tags)
 
         # Пометка как finished
         logger.info(f"[*] Пометка заказа {order_id} как finished")
