@@ -51,7 +51,7 @@ def convert_json_to_raw_csv(input_path, output_path=None):
         logger.error(f"Ошибка при конвертации JSON в CSV: {e}")
         return None
 
-def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
+def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ignore_duplicate: bool = False):
     """
     Основная процедура создания файлов задания на печать.
     key: имя файла эмиссии без расширения .json
@@ -85,7 +85,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
             logger.info(f"[*] Файл {key} уже в обработке (print-ststus:processing). Пропуск.")
             return None
 
-        if print_status != 'not-printed':
+        if not ignore_duplicate and print_status != 'not-printed':
             logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
             return key
 
@@ -196,13 +196,14 @@ def main():
     parser.add_argument("key", help="Ключ объекта эмиссии (имя файла без .json)")
     parser.add_argument("--template", default="32x32_20x20.VDF", help="Имя файла шаблона VDF")
     parser.add_argument("--config", help="Путь к файлу конфигурации suz_worker_config")
+    parser.add_argument("--ignore-duplicate", action="store_true", help="Игнорировать проверку на повторную печать")
 
     args = parser.parse_args()
 
     if args.config:
         os.environ['suz_worker_config'] = args.config
 
-    result = generate_prn_files(args.key, args.template)
+    result = generate_prn_files(args.key, args.template, ignore_duplicate=args.ignore_duplicate)
     if result:
         print(f"Success: {result}")
     else:
