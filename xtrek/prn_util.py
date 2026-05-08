@@ -8,6 +8,7 @@ import shutil
 
 from .storage import get_storage
 from .config_loader import load_config
+from .create_emission_task_sample import _find_production_order_id_by_suz_order_id
 import amica.amica_generator as amica_generator
 
 generate_amica_vdf = amica_generator.generate_amica_vdf
@@ -82,6 +83,9 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
         print_status = tags.get('print-status')
         production_order_id = tags.get('productionOrderId')
 
+        if not production_order_id:
+             production_order_id = _find_production_order_id_by_suz_order_id(key)
+
         if print_status == 'processing':
             logger.info(f"[*] Файл {key} уже в обработке (print-status:processing). Пропуск.")
             return None
@@ -89,17 +93,27 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
         # Проверка на виртуальность
         if not ignore_duplicate and production_order_id:
             try:
-                storage_prod = get_storage(kodes_path, s3_config) # get_storage generic enough
-                # Wait, kodes_path is for codes. We need production_orders_path.
                 prod_orders_path = config.get('production_orders_path')
                 if prod_orders_path:
                     storage_prod = get_storage(prod_orders_path, s3_config)
-                    prod_path = f"{prod_orders_path.rstrip('/')}/{production_order_id}.json"
+                    # Проверяем как с .json так и без
+                    if production_order_id.lower().endswith('.json'):
+                        p_id = production_order_id
+                    else:
+                        p_id = f"{production_order_id}.json"
+
+                    prod_path = f"{prod_orders_path.rstrip('/')}/{p_id}"
+                    logger.debug(f"[*] Проверка виртуальности заказа по пути: {prod_path}")
+
                     if storage_prod.exists(prod_path):
                         prod_data = json.loads(storage_prod.read_text(prod_path))
-                        if prod_data.get('virtual'):
+                        is_virtual = prod_data.get('virtual')
+                        # Обрабатываем и bool и строку
+                        if is_virtual is True or str(is_virtual).lower() == 'true':
                             logger.info(f"Попытка напечатать коды созданные для виртуального заказа {production_order_id}")
                             return key
+                    else:
+                        logger.warning(f"[!] Файл производственного заказа не найден: {prod_path}")
             except Exception as e:
                 logger.warning(f"Ошибка при проверке виртуальности заказа {production_order_id}: {e}")
 

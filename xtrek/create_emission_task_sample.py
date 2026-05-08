@@ -762,6 +762,9 @@ def get_emission_kodes(order_id: str):
         oms_id = status_data.get('omsId')
         production_order_id = status_data.get('productionOrderId')
 
+        if not production_order_id:
+             production_order_id = _find_production_order_id_by_suz_order_id(order_id)
+
         if not gtin or not oms_id:
             logger.error(f"[!] Не удалось получить gtin или omsId из файла {target_path}")
             return None
