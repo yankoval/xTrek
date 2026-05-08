@@ -846,6 +846,10 @@ def get_emission_kodes(order_id: str):
         logger.info(f"[*] Выгрузка кодов в: {output_path}")
         storage_kodes.upload(str(temp_file), output_path)
 
+        # Устанавливаем тег print-ststus:not-printed
+        logger.info(f"[*] Установка тега print-ststus:not-printed для {output_path}")
+        storage_kodes.set_tags(output_path, {"print-ststus": "not-printed"})
+
         # Пометка как finished
         logger.info(f"[*] Пометка заказа {order_id} как finished")
         storage_emissions.mark_finished(target_path)

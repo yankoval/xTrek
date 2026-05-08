@@ -76,6 +76,24 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
 
         # Пути к файлам в S3
         json_s3_path = f"{kodes_path.rstrip('/')}/{key}.json"
+
+        # 0. Проверка тегов управления печатью
+        tags = storage_kodes.get_tags(json_s3_path)
+        print_status = tags.get('print-ststus')
+        if print_status == 'printed':
+            logger.info(f"[*] Файл {key} уже напечатан (print-ststus:printed). Пропуск.")
+            return key
+        if print_status == 'processing':
+            logger.info(f"[*] Файл {key} уже в обработке (print-ststus:processing). Пропуск.")
+            return None
+        if print_status != 'not-printed':
+             logger.warning(f"[*] Файл {key} имеет некорректный статус печати: {print_status}. Ожидалось not-printed.")
+             #return None # Можно раскомментировать если нужно строгое следование
+
+        # Устанавливаем статус processing
+        logger.info(f"[*] Установка статуса print-ststus:processing для {key}")
+        storage_kodes.set_tags(json_s3_path, {'print-ststus': 'processing'})
+
         vdf_template_s3_path = f"{prn_templates_path.rstrip('/')}/{vdf_template_name}"
         amica_json_s3_path = f"{prn_templates_path.rstrip('/')}/amica.json"
         mapping_json_s3_path = f"{prn_templates_path.rstrip('/')}/mapping-empty.json"
@@ -156,10 +174,19 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
             logger.info(f"[*] Загрузка VDF в {dest_vdf_s3}...")
             storage_tasks.upload(str(local_vdf), dest_vdf_s3)
 
+            # 6. Устанавливаем статус printed
+            logger.info(f"[*] Установка статуса print-ststus:printed для {key}")
+            storage_kodes.set_tags(json_s3_path, {'print-ststus': 'printed'})
+
             logger.info(f"[+++] Процедура успешно завершена для {key}")
             return key
 
     except Exception as e:
+        # В случае ошибки сбрасываем статус в not-printed, чтобы можно было попробовать снова
+        try:
+            storage_kodes.set_tags(json_s3_path, {'print-ststus': 'not-printed'})
+        except:
+            pass
         logger.error(f"[!] Ошибка в generate_prn_files: {e}")
         import traceback
         logger.error(traceback.format_exc())
