@@ -1,4 +1,5 @@
 import os
+import json
 import boto3
 import fnmatch
 import logging
@@ -47,30 +48,41 @@ class LocalStorage(BaseStorage):
             Path(remote_path).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(local_path, remote_path)
 
+    def _rename_with_tags(self, old_path, new_path):
+        old_p = Path(old_path)
+        new_p = Path(new_path)
+        old_p.rename(new_p)
+
+        old_tags = old_p.parent / (old_p.name + '.tags')
+        new_tags = new_p.parent / (new_p.name + '.tags')
+        if old_tags.exists():
+            if new_tags.exists():
+                new_tags.unlink()
+            old_tags.rename(new_tags)
+
     def mark_processing(self, path):
         p = Path(path)
         processing_path = p.with_suffix('.processing')
-        p.rename(processing_path)
+        self._rename_with_tags(path, processing_path)
         return str(processing_path)
 
     def mark_finished(self, path, delete_source=False):
         p = Path(path)
         if delete_source:
+            tags_path = p.parent / (p.name + '.tags')
+            if tags_path.exists():
+                tags_path.unlink()
             p.unlink()
             return None
         else:
             finished_path = p.with_suffix('.finished')
-            if finished_path.exists():
-                finished_path.unlink()
-            p.rename(finished_path)
+            self._rename_with_tags(path, finished_path)
             return str(finished_path)
 
     def mark_error(self, path):
         p = Path(path)
         error_path = p.with_suffix('.error')
-        if error_path.exists():
-            error_path.unlink()
-        p.rename(error_path)
+        self._rename_with_tags(path, error_path)
         return str(error_path)
 
     def exists(self, path):
@@ -81,25 +93,40 @@ class LocalStorage(BaseStorage):
             return f.read()
 
     def set_tags(self, path, tags):
+        p = Path(path)
+        tags_path = p.parent / (p.name + '.tags')
+        current_tags = self.get_tags(path)
+        current_tags.update(tags)
+        with open(tags_path, 'w', encoding='utf-8') as f:
+            json.dump(current_tags, f, ensure_ascii=False, indent=2)
+
         if 'bufferStatus' in tags:
-            p = Path(path)
             new_path = p.with_suffix('.' + tags['bufferStatus'])
             if p.exists():
-                p.replace(new_path)
+                self._rename_with_tags(path, new_path)
                 return str(new_path)
         return path
 
     def get_tags(self, path):
-        # Для локального хранилища мы не храним теги в явном виде,
-        # но можем имитировать их по расширению файла.
         p = Path(path)
+        tags = {}
+        # Имитация тегов по расширению для обратной совместимости
         if p.suffix == '.processing':
-            return {'status': 'processing'}
-        if p.suffix == '.finished':
-            return {'status': 'finished'}
-        if p.suffix == '.error':
-            return {'status': 'error'}
-        return {}
+            tags['status'] = 'processing'
+        elif p.suffix == '.finished':
+            tags['status'] = 'finished'
+        elif p.suffix == '.error':
+            tags['status'] = 'error'
+
+        tags_path = p.parent / (p.name + '.tags')
+        if tags_path.exists():
+            try:
+                with open(tags_path, 'r', encoding='utf-8') as f:
+                    file_tags = json.load(f)
+                    tags.update(file_tags)
+            except Exception as e:
+                logger.error(f"Error reading tags file {tags_path}: {e}")
+        return tags
 
 class S3Storage(BaseStorage):
     def __init__(self, s3_config):

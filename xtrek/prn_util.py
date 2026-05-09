@@ -8,6 +8,7 @@ import shutil
 
 from .storage import get_storage
 from .config_loader import load_config
+from .create_emission_task_sample import _find_production_order_id_by_suz_order_id
 import amica.amica_generator as amica_generator
 
 generate_amica_vdf = amica_generator.generate_amica_vdf
@@ -51,7 +52,7 @@ def convert_json_to_raw_csv(input_path, output_path=None):
         logger.error(f"Ошибка при конвертации JSON в CSV: {e}")
         return None
 
-def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
+def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ignore_duplicate: bool = False):
     """
     Основная процедура создания файлов задания на печать.
     key: имя файла эмиссии без расширения .json
@@ -76,6 +77,54 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
 
         # Пути к файлам в S3
         json_s3_path = f"{kodes_path.rstrip('/')}/{key}.json"
+
+        # 0. Проверка тегов управления печатью
+        tags = storage_kodes.get_tags(json_s3_path)
+        print_status = tags.get('print-status')
+        production_order_id = tags.get('productionOrderId')
+
+        if not production_order_id:
+             production_order_id = _find_production_order_id_by_suz_order_id(key)
+
+        if print_status == 'processing':
+            logger.info(f"[*] Файл {key} уже в обработке (print-status:processing). Пропуск.")
+            return None
+
+        # Проверка на виртуальность
+        if not ignore_duplicate and production_order_id:
+            try:
+                prod_orders_path = config.get('production_orders_path')
+                if prod_orders_path:
+                    storage_prod = get_storage(prod_orders_path, s3_config)
+                    # Проверяем как с .json так и без
+                    if production_order_id.lower().endswith('.json'):
+                        p_id = production_order_id
+                    else:
+                        p_id = f"{production_order_id}.json"
+
+                    prod_path = f"{prod_orders_path.rstrip('/')}/{p_id}"
+                    logger.debug(f"[*] Проверка виртуальности заказа по пути: {prod_path}")
+
+                    if storage_prod.exists(prod_path):
+                        prod_data = json.loads(storage_prod.read_text(prod_path))
+                        is_virtual = prod_data.get('virtual')
+                        # Обрабатываем и bool и строку
+                        if is_virtual is True or str(is_virtual).lower() == 'true':
+                            logger.info(f"Попытка напечатать коды созданные для виртуального заказа {production_order_id}")
+                            return key
+                    else:
+                        logger.warning(f"[!] Файл производственного заказа не найден: {prod_path}")
+            except Exception as e:
+                logger.warning(f"Ошибка при проверке виртуальности заказа {production_order_id}: {e}")
+
+        if not ignore_duplicate and print_status != 'not-printed':
+            logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
+            return key
+
+        # Устанавливаем статус processing
+        logger.info(f"[*] Установка статуса print-status:processing для {key}")
+        storage_kodes.set_tags(json_s3_path, {'print-status': 'processing'})
+
         vdf_template_s3_path = f"{prn_templates_path.rstrip('/')}/{vdf_template_name}"
         amica_json_s3_path = f"{prn_templates_path.rstrip('/')}/amica.json"
         mapping_json_s3_path = f"{prn_templates_path.rstrip('/')}/mapping-empty.json"
@@ -156,10 +205,19 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF"):
             logger.info(f"[*] Загрузка VDF в {dest_vdf_s3}...")
             storage_tasks.upload(str(local_vdf), dest_vdf_s3)
 
+            # 6. Устанавливаем статус printed
+            logger.info(f"[*] Установка статуса print-status:printed для {key}")
+            storage_kodes.set_tags(json_s3_path, {'print-status': 'printed'})
+
             logger.info(f"[+++] Процедура успешно завершена для {key}")
             return key
 
     except Exception as e:
+        # В случае ошибки сбрасываем статус в not-printed, чтобы можно было попробовать снова
+        try:
+            storage_kodes.set_tags(json_s3_path, {'print-status': 'not-printed'})
+        except:
+            pass
         logger.error(f"[!] Ошибка в generate_prn_files: {e}")
         import traceback
         logger.error(traceback.format_exc())
@@ -170,13 +228,14 @@ def main():
     parser.add_argument("key", help="Ключ объекта эмиссии (имя файла без .json)")
     parser.add_argument("--template", default="32x32_20x20.VDF", help="Имя файла шаблона VDF")
     parser.add_argument("--config", help="Путь к файлу конфигурации suz_worker_config")
+    parser.add_argument("--ignore-duplicate", action="store_true", help="Игнорировать проверку на повторную печать")
 
     args = parser.parse_args()
 
     if args.config:
         os.environ['suz_worker_config'] = args.config
 
-    result = generate_prn_files(args.key, args.template)
+    result = generate_prn_files(args.key, args.template, ignore_duplicate=args.ignore_duplicate)
     if result:
         print(f"Success: {result}")
     else:
