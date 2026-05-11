@@ -7,23 +7,39 @@ import requests
 import urllib3
 from pathlib import Path
 from .tokens import TokenProcessor
+from .config_loader import load_config
+from .storage import get_storage
 
 # Отключаем лишние предупреждения в консоли
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def get_new_token(inn, conid=None, mode='auth', timeout=60):
+def get_new_token(inn, conid=None, mode='auth', timeout=None):
     """
     Получает новый токен от Честного Знака, взаимодействуя с демоном подписи.
     Возвращает строку токена или None в случае ошибки.
     """
-    user_profile = os.environ.get('USERPROFILE', os.path.expanduser('~'))
-    #work_dir = Path(user_profile) / "tst"
-    work_dir = Path(r"Y:\BatchPassToPrint\tst")
-    work_dir.mkdir(parents=True, exist_ok=True)
+    config = load_config('token_config')
+    s3_config = config.get('s3_config')
+
+    # По ключу sign получаем S3 путь или локальный путь
+    sign_dir_path = config.get('sign')
+    if not sign_dir_path:
+        # Fallback to default if not in config
+        user_profile = os.environ.get('USERPROFILE', os.path.expanduser('~'))
+        sign_dir_path = str(Path(user_profile) / "tst")
+        print(f"[*] 'sign' not found in config, using default: {sign_dir_path}")
+
+    if timeout is None:
+        timeout = config.get('SIGNING_TIMEOUT', 60)
+
+    storage = get_storage(sign_dir_path, s3_config)
 
     unique_id = uuid.uuid4()
-    data_to_sign_path = work_dir / f"{inn}_{unique_id}_dataToSign.txt"
-    signature_path = work_dir / f"{inn}_{unique_id}_dataToSign.txt.sig"
+    data_to_sign_filename = f"{inn}_{unique_id}_dataToSign.txt"
+    signature_filename = f"{data_to_sign_filename}.sig"
+
+    data_to_sign_path = f"{sign_dir_path.rstrip('/')}/{data_to_sign_filename}"
+    signature_path = f"{sign_dir_path.rstrip('/')}/{signature_filename}"
 
     token_value = None
 
@@ -38,16 +54,15 @@ def get_new_token(inn, conid=None, mode='auth', timeout=60):
             print(f"[!] Error getting auth key: {e}")
             return None
 
-        with open(data_to_sign_path, "w", encoding="utf-8") as f:
-            f.write(auth_data['data'])
+        storage.write_text(data_to_sign_path, auth_data['data'])
 
         print(f"[*] Data saved to: {data_to_sign_path}. Waiting for daemon...")
 
         # --- Шаг 2: Ожидание подписи ---
         start_time = time.time()
-        while not signature_path.exists():
+        while not storage.exists(signature_path):
             if time.time() - start_time > timeout:
-                print("[!] Timeout: Signature file not found.")
+                print(f"[!] Timeout ({timeout}s): Signature file {signature_filename} not found.")
                 return None
             time.sleep(2)
 
@@ -55,8 +70,7 @@ def get_new_token(inn, conid=None, mode='auth', timeout=60):
         print("[+] Signature detected!")
 
         # --- Шаг 3: Сборка JSON ---
-        with open(signature_path, "r", encoding="utf-8") as f:
-            signature_body = f.read().strip()
+        signature_body = storage.read_text(signature_path).strip()
 
         payload = {
             "uuid": auth_data['uuid'],
@@ -83,16 +97,17 @@ def get_new_token(inn, conid=None, mode='auth', timeout=60):
 
     finally:
         # Cleanup temporary files
-        if data_to_sign_path.exists():
-            try:
-                data_to_sign_path.unlink()
-            except Exception as e:
-                print(f"[!] Error deleting data file: {e}")
-        if signature_path.exists():
-            try:
-                signature_path.unlink()
-            except Exception as e:
-                print(f"[!] Error deleting signature file: {e}")
+        try:
+            if storage.exists(data_to_sign_path):
+                storage.delete(data_to_sign_path)
+        except Exception as e:
+            print(f"[!] Error deleting data file: {e}")
+
+        try:
+            if storage.exists(signature_path):
+                storage.delete(signature_path)
+        except Exception as e:
+            print(f"[!] Error deleting signature file: {e}")
 
     return token_value
 
