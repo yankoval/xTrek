@@ -28,8 +28,8 @@ from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
 
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
-SIGNING_DIR = os.path.join(os.path.expanduser("~"), "tst")
-SIGNING_TIMEOUT = 60
+DEFAULT_SIGNING_DIR = os.path.join(os.path.expanduser("~"), "tst")
+DEFAULT_SIGNING_TIMEOUT = 60
 # ------------------------------
 
 # Настройка логирования
@@ -563,6 +563,13 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
         emission_orders_path = config.get('emission_orders_path')
         emission_receipts_path = config.get('emission_receipts')
 
+        # Переопределяем параметры подписи из конфига если они есть
+        sign_path = config.get('sign')
+        if sign_path:
+            signing_dir = sign_path
+
+        timeout = config.get('SIGNING_TIMEOUT', timeout)
+
         if not all([emission_orders_path, emission_receipts_path]):
             logger.error(f"[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emission_receipts)")
             return None
@@ -629,37 +636,49 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
             return None
 
         # 2. Подготовка к подписи
-        work_dir = Path(signing_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
-
+        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_order.json"
-        body_path = work_dir / body_filename
-        signature_path = work_dir / f"{body_filename}.sig"
+        signature_filename = f"{body_filename}.sig"
+
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+
+        # Локальные пути для API
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
 
         try:
-            with open(body_path, "w", encoding="utf-8") as f:
-                # СУЗ требует компактный JSON без пробелов между ключами.
-                # Используем ensure_ascii=True (по умолчанию) для экранирования ASCII 29 как \u001d.
-                json.dump(order_data, f, separators=(',', ':'))
+            # СУЗ требует компактный JSON без пробелов между ключами.
+            body_json = json.dumps(order_data, separators=(',', ':'))
+            storage_sign.write_text(remote_body_path, body_json)
 
-            logger.info(f"[*] Файл заказа сохранен в: {body_path}. Ожидание подписи...")
+            # Также сохраняем локально для SUZ API
+            with open(local_body_path, "w", encoding="utf-8") as f:
+                f.write(body_json)
+
+            logger.info(f"[*] Заказ отправлен на подпись в: {remote_body_path}. Ожидание...")
 
             start_time = time.time()
-            while not signature_path.exists():
+            while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
-                    logger.error(f"[!] Таймаут ({timeout}с): Файл подписи {signature_path.name} не найден.")
+                    logger.error(f"[!] Таймаут ({timeout}с): Файл подписи {signature_filename} не найден.")
                     storage_orders.mark_error(order_path)
                     return None
-                time.sleep(1)
+                time.sleep(2)
 
             time.sleep(0.5)
-            logger.info("[+] Подпись обнаружена!")
+            logger.info("[+] Подпись обнаружена в хранилище!")
+
+            # Скачиваем подпись локально для API
+            storage_sign.download(remote_signature_path, str(local_signature_path))
 
             # 3. Отправка в СУЗ
             suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
             logger.info(f"[*] Отправка заказа в СУЗ (omsId: {final_oms_id})...")
-            result = suz_api.order_create(str(body_path), str(signature_path))
+            result = suz_api.order_create(str(local_body_path), str(local_signature_path))
 
             # 4. Сохранение результата и обновление статуса
             if isinstance(result, EmissionOrderreceipts):
@@ -670,7 +689,7 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
                     storage_receipts = get_storage(emission_receipts_path, s3_config)
                     remote_receipt_path = f"{emission_receipts_path.rstrip('/')}/{production_order_id}.json"
 
-                    temp_receipt = work_dir / f"receipt_{unique_id}.json"
+                    temp_receipt = local_dir / f"receipt_{unique_id}.json"
                     result.productionOrderId = production_order_id
                     with open(temp_receipt, 'w', encoding='utf-8') as f:
                         json.dump(result.to_dict(), f, indent=4)
@@ -687,8 +706,16 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
                 return result
 
         finally:
-            if body_path.exists(): body_path.unlink()
-            if signature_path.exists(): signature_path.unlink()
+            if local_body_path.exists(): local_body_path.unlink()
+            if local_signature_path.exists(): local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except: pass
+            try:
+                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
+                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
+            except: pass
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_emission: {e}")
@@ -1203,6 +1230,13 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
         utilisation_tasks_path = config.get('utilisation_tasks_path')
         utilisation_receipts_path = config.get('utilisation_receipts')
 
+        # Переопределяем параметры подписи из конфига если они есть
+        sign_path = config.get('sign')
+        if sign_path:
+            signing_dir = sign_path
+
+        timeout = config.get('SIGNING_TIMEOUT', timeout)
+
         if not all([utilisation_tasks_path, utilisation_receipts_path]):
             logger.error(f"[!] В конфигурации отсутствуют пути (utilisation_tasks_path, utilisation_receipts)")
             return None
@@ -1268,31 +1302,46 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
             return None
 
         # Подпись
-        work_dir = Path(signing_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
+        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_utilisation.json"
-        body_path = work_dir / body_filename
-        signature_path = work_dir / f"{body_filename}.sig"
+        signature_filename = f"{body_filename}.sig"
+
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+
+        # Локальные пути для API
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
 
         try:
-            with open(body_path, "w", encoding="utf-8") as f:
-                # Важно: ensure_ascii=True для корректной передачи GS1-разделителей
-                json.dump(task_data, f, separators=(',', ':'))
+            # Важно: separators=(',', ':') для компактного JSON
+            body_json = json.dumps(task_data, separators=(',', ':'))
+            storage_sign.write_text(remote_body_path, body_json)
 
-            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            with open(local_body_path, "w", encoding="utf-8") as f:
+                f.write(body_json)
+
+            logger.info(f"[*] Отчет отправлен на подпись в: {remote_body_path}. Ожидание...")
             start_time = time.time()
-            while not signature_path.exists():
+            while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
                     logger.error("[!] Таймаут ожидания подписи.")
                     storage_tasks.mark_error(task_path)
                     return None
-                time.sleep(1)
+                time.sleep(2)
+
+            time.sleep(0.5)
+            logger.info("[+] Подпись обнаружена в хранилище!")
+
+            storage_sign.download(remote_signature_path, str(local_signature_path))
 
             # Отправка
             suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
             logger.info(f"[*] Отправка отчета в СУЗ (orderId: {order_id})...")
-            report_id = suz_api.utilisation_send(str(body_path), str(signature_path), orderId=order_id)
+            report_id = suz_api.utilisation_send(str(local_body_path), str(local_signature_path), orderId=order_id)
 
             if report_id and not report_id.startswith('{') and 'Error' not in report_id:
                 logger.info(f"[+++] Отчет принят! ID: {report_id}")
@@ -1301,7 +1350,7 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
                 storage_receipts = get_storage(utilisation_receipts_path, s3_config)
                 remote_receipt_path = f"{utilisation_receipts_path.rstrip('/')}/{order_id}.json"
 
-                temp_receipt = work_dir / f"receipt_util_{unique_id}.json"
+                temp_receipt = local_dir / f"receipt_util_{unique_id}.json"
                 with open(temp_receipt, 'w', encoding='utf-8') as f:
                     json.dump({
                         "reportId": report_id,
@@ -1321,8 +1370,16 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
                 return None
 
         finally:
-            if body_path.exists(): body_path.unlink()
-            if signature_path.exists(): signature_path.unlink()
+            if local_body_path.exists(): local_body_path.unlink()
+            if local_signature_path.exists(): local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except: pass
+            try:
+                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
+                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
+            except: pass
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_utilisation: {e}")
@@ -1574,6 +1631,13 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         s3_config = config.get('s3_config')
         agg_tasks_path = config.get('agg-tasks')
 
+        # Переопределяем параметры подписи из конфига если они есть
+        sign_path = config.get('sign')
+        if sign_path:
+            signing_dir = sign_path
+
+        timeout = config.get('SIGNING_TIMEOUT', timeout)
+
         if not agg_tasks_path:
             logger.error("[!] В конфигурации отсутствует путь agg-tasks")
             return None
@@ -1621,40 +1685,47 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         except: pass
 
         # 3. Подготовка к подписи
-        work_dir = Path(signing_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
+        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_agg.json"
-        body_path = work_dir / body_filename
-        signature_path = work_dir / f"{body_filename}.sig"
+        signature_filename = f"{body_filename}.sig"
+
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+
+        # Локальные пути
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
 
         try:
-            with open(body_path, "wb") as f:
-                # ЧЗ крайне чувствителен к изменению тела документа после подписи.
-                # Поэтому мы используем исходные байты, загруженные из S3.
-                if isinstance(report_content, str):
-                    f.write(report_content.encode('utf-8'))
-                else:
-                    f.write(report_content)
+            # ЧЗ крайне чувствителен к изменению тела документа после подписи.
+            # Поэтому мы используем исходные байты, загруженные из S3.
+            storage_sign.write_text(remote_body_path, report_content)
 
-            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            # Также сохраняем локально, чтобы потом прочитать как байты
+            local_body_bytes = report_content if isinstance(report_content, bytes) else report_content.encode('utf-8')
+            with open(local_body_path, "wb") as f:
+                f.write(local_body_bytes)
+
+            logger.info(f"[*] Ожидание подписи для {remote_body_path}...")
             start_time = time.time()
-            while not signature_path.exists():
+            while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
                     logger.error("[!] Таймаут ожидания подписи.")
                     return None
-                time.sleep(1)
+                time.sleep(2)
 
-            # Читаем тело и подпись как байты, кодируем в Base64
-            # Мы повторно читаем файл body_path, чтобы гарантировать
-            # побайтовую идентичность с тем, что видел демон подписи.
-            with open(body_path, "rb") as f:
-                doc_bytes = f.read()
-                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+            time.sleep(0.5)
+            logger.info("[+] Подпись обнаружена в хранилище!")
 
-            with open(signature_path, "r", encoding="utf-8") as f:
-                # В данном проекте демон подписи сохраняет подпись в формате Base64.
-                # Повторное кодирование приведет к ошибке проверки подписи в ЛК.
+            # Используем байты напрямую
+            doc_base64 = base64.b64encode(local_body_bytes).decode('utf-8')
+
+            # Скачиваем подпись и читаем её
+            storage_sign.download(remote_signature_path, str(local_signature_path))
+            with open(local_signature_path, "r", encoding="utf-8") as f:
                 sig_base64 = f.read().strip()
 
             # Создаем обертку
@@ -1682,7 +1753,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                     storage_receipts = get_storage(agg_receipts_path, s3_config)
                     remote_receipt_path = f"{agg_receipts_path.rstrip('/')}/{task_uuid}.json"
 
-                    temp_receipt = work_dir / f"receipt_agg_{unique_id}.json"
+                    temp_receipt = local_dir / f"receipt_agg_{unique_id}.json"
                     # Если result это строка UUID, оборачиваем её (как в trueapi.py)
                     if isinstance(result, str):
                         result = {"document_id": result}
@@ -1704,8 +1775,16 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                 return result
 
         finally:
-            if body_path.exists(): body_path.unlink()
-            if signature_path.exists(): signature_path.unlink()
+            if local_body_path.exists(): local_body_path.unlink()
+            if local_signature_path.exists(): local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except: pass
+            try:
+                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
+                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
+            except: pass
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_aggregation: {e}")
@@ -2025,6 +2104,13 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         introduce_tasks_path = config.get('introduce-tasks')
         introduce_receipts_path = config.get('introduce-receipts')
 
+        # Переопределяем параметры подписи из конфига если они есть
+        sign_path = config.get('sign')
+        if sign_path:
+            signing_dir = sign_path
+
+        timeout = config.get('SIGNING_TIMEOUT', timeout)
+
         if not all([introduce_tasks_path, introduce_receipts_path]):
             logger.error("[!] В конфигурации отсутствуют необходимые пути (introduce-tasks, introduce-receipts)")
             return None
@@ -2064,33 +2150,42 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             return None
 
         # Подпись
-        work_dir = Path(signing_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
+        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_introduce.json"
-        body_path = work_dir / body_filename
-        signature_path = work_dir / f"{body_filename}.sig"
+        signature_filename = f"{body_filename}.sig"
+
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+
+        # Локальные пути
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
 
         try:
-            with open(body_path, "wb") as f:
-                if isinstance(task_content, str):
-                    f.write(task_content.encode('utf-8'))
-                else:
-                    f.write(task_content)
+            storage_sign.write_text(remote_body_path, task_content)
 
-            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            local_body_bytes = task_content if isinstance(task_content, bytes) else task_content.encode('utf-8')
+            with open(local_body_path, "wb") as f:
+                f.write(local_body_bytes)
+
+            logger.info(f"[*] Ожидание подписи для {remote_body_path}...")
             start_time = time.time()
-            while not signature_path.exists():
+            while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
                     logger.error("[!] Таймаут ожидания подписи.")
                     return None
-                time.sleep(1)
+                time.sleep(2)
 
-            with open(body_path, "rb") as f:
-                doc_bytes = f.read()
-                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+            time.sleep(0.5)
+            logger.info("[+] Подпись обнаружена в хранилище!")
 
-            with open(signature_path, "r", encoding="utf-8") as f:
+            doc_base64 = base64.b64encode(local_body_bytes).decode('utf-8')
+
+            storage_sign.download(remote_signature_path, str(local_signature_path))
+            with open(local_signature_path, "r", encoding="utf-8") as f:
                 sig_base64 = f.read().strip()
 
             wrapper = DocumentWrapper(
@@ -2110,7 +2205,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                     storage_receipts = get_storage(introduce_receipts_path, s3_config)
                     remote_receipt_path = f"{introduce_receipts_path.rstrip('/')}/{order_id}.json"
 
-                    temp_receipt = work_dir / f"receipt_intro_{unique_id}.json"
+                    temp_receipt = local_dir / f"receipt_intro_{unique_id}.json"
                     if isinstance(result, str):
                         result = {"document_id": result}
                     result["productionOrderId"] = production_order_id
@@ -2129,8 +2224,16 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                 return result
 
         finally:
-            if body_path.exists(): body_path.unlink()
-            if signature_path.exists(): signature_path.unlink()
+            if local_body_path.exists(): local_body_path.unlink()
+            if local_signature_path.exists(): local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except: pass
+            try:
+                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
+                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
+            except: pass
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_introduce: {e}")
@@ -2390,6 +2493,13 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
         agg_set_tasks_path = config.get('agg_set_tasks')
         agg_set_receipts_path = config.get('agg_set_receipts')
 
+        # Переопределяем параметры подписи из конфига если они есть
+        sign_path = config.get('sign')
+        if sign_path:
+            signing_dir = sign_path
+
+        timeout = config.get('SIGNING_TIMEOUT', timeout)
+
         if not all([agg_set_tasks_path, agg_set_receipts_path]):
             logger.error("[!] В конфигурации отсутствуют пути agg_set_tasks или agg_set_receipts")
             return None
@@ -2428,33 +2538,42 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
             return None
 
         # 3. Подготовка к подписи
-        work_dir = Path(signing_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
+        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_agg_set.json"
-        body_path = work_dir / body_filename
-        signature_path = work_dir / f"{body_filename}.sig"
+        signature_filename = f"{body_filename}.sig"
+
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+
+        # Локальные пути
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
 
         try:
-            with open(body_path, 'wb') as f:
-                if isinstance(report_content, str):
-                    f.write(report_content.encode('utf-8'))
-                else:
-                    f.write(report_content)
+            storage_sign.write_text(remote_body_path, report_content)
 
-            logger.info(f"[*] Ожидание подписи для {body_path}...")
+            local_body_bytes = report_content if isinstance(report_content, bytes) else report_content.encode('utf-8')
+            with open(local_body_path, 'wb') as f:
+                f.write(local_body_bytes)
+
+            logger.info(f"[*] Ожидание подписи для {remote_body_path}...")
             start_time = time.time()
-            while not signature_path.exists():
+            while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
                     logger.error("[!] Таймаут ожидания подписи.")
                     return None
-                time.sleep(1)
+                time.sleep(2)
 
-            with open(body_path, 'rb') as f:
-                doc_bytes = f.read()
-                doc_base64 = base64.b64encode(doc_bytes).decode('utf-8')
+            time.sleep(0.5)
+            logger.info("[+] Подпись обнаружена в хранилище!")
 
-            with open(signature_path, 'r', encoding='utf-8') as f:
+            doc_base64 = base64.b64encode(local_body_bytes).decode('utf-8')
+
+            storage_sign.download(remote_signature_path, str(local_signature_path))
+            with open(local_signature_path, 'r', encoding='utf-8') as f:
                 sig_base64 = f.read().strip()
 
             # Создаем обертку для SETS_AGGREGATION
@@ -2475,7 +2594,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                 storage_receipts = get_storage(agg_set_receipts_path, s3_config)
                 remote_receipt_path = f"{agg_set_receipts_path.rstrip('/')}/{task_uuid}.json"
 
-                temp_receipt = Path(f"temp_receipt_agg_set_{task_uuid}.json")
+                temp_receipt = local_dir / f"temp_receipt_agg_set_{task_uuid}.json"
                 if isinstance(result, str):
                     result = {"document_id": result}
                 result["productionOrderId"] = task_uuid
@@ -2494,8 +2613,16 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                 return result
 
         finally:
-            if body_path.exists(): body_path.unlink()
-            if signature_path.exists(): signature_path.unlink()
+            if local_body_path.exists(): local_body_path.unlink()
+            if local_signature_path.exists(): local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except: pass
+            try:
+                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
+                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
+            except: pass
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_aggregation_set: {e}")
@@ -3258,8 +3385,8 @@ def main():
     parser.add_argument("--suz_worker_config", help="Путь к конфигурационному файлу")
     parser.add_argument("--debug", action="store_true", help="Выводить отладочную информацию (текст запроса)")
     parser.add_argument("--client_token", help="Client Token / Connection ID")
-    parser.add_argument("--signing_dir", default=SIGNING_DIR, help="Директория для обмена с демоном подписи")
-    parser.add_argument("--timeout", type=int, default=SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
+    parser.add_argument("--signing_dir", default=DEFAULT_SIGNING_DIR, help="Директория для обмена с демоном подписи")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_SIGNING_TIMEOUT, help="Тайм-аут ожидания подписи (сек)")
     parser.add_argument("--status", help="Получить статус заказа по productionOrderId")
     parser.add_argument("--production-date", help="Дата производства для отчета (yyyy-MM-dd)")
     parser.add_argument("--expiration-date", help="Дата истечения срока годности для отчета (yyyy-MM-dd)")

@@ -26,6 +26,10 @@ class BaseStorage:
         pass
     def read_text(self, path):
         pass
+    def write_text(self, path, text):
+        pass
+    def delete(self, path):
+        pass
     def set_tags(self, path, tags):
         pass
     def get_tags(self, path):
@@ -91,6 +95,24 @@ class LocalStorage(BaseStorage):
     def read_text(self, path):
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
+
+    def write_text(self, path, text):
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(text, bytes):
+            with open(p, 'wb') as f:
+                f.write(text)
+        else:
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(text)
+
+    def delete(self, path):
+        p = Path(path)
+        if p.exists():
+            tags_path = p.parent / (p.name + '.tags')
+            if tags_path.exists():
+                tags_path.unlink()
+            p.unlink()
 
     def set_tags(self, path, tags):
         p = Path(path)
@@ -227,6 +249,15 @@ class S3Storage(BaseStorage):
         bucket, key = self._parse_s3_url(path)
         response = self.s3.get_object(Bucket=bucket, Key=key)
         return response['Body'].read().decode('utf-8')
+
+    def write_text(self, path, text):
+        bucket, key = self._parse_s3_url(path)
+        body = text if isinstance(text, bytes) else text.encode('utf-8')
+        self.s3.put_object(Bucket=bucket, Key=key, Body=body)
+
+    def delete(self, path):
+        bucket, key = self._parse_s3_url(path)
+        self.s3.delete_object(Bucket=bucket, Key=key)
 
     def set_tags(self, path, tags):
         bucket, key = self._parse_s3_url(path)
