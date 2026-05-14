@@ -185,9 +185,9 @@ def test_status_logic(analyzer, tmp_path):
             elif "BOX_EXISTING" in c:
                 results.append({"cisInfo": {"cis": c, "status": "EMITTED"}}) # Found -> Error
             elif "SET_OK" in c:
-                results.append({"cisInfo": {"cis": c, "status": "APPLIED"}}) # OK
+                results.append({"cisInfo": {"cis": c, "status": "EMITTED"}}) # OK
             elif "SET_BAD" in c:
-                results.append({"cisInfo": {"cis": c, "status": "INTRODUCED"}}) # Error for SET
+                results.append({"cisInfo": {"cis": c, "status": "APPLIED"}}) # Error for SET (APPLIED instead of EMITTED)
             elif "PROD_OK" in c:
                 results.append({"cisInfo": {"cis": c, "status": "INTRODUCED"}}) # OK
             elif "PROD_BAD" in c:

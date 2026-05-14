@@ -149,7 +149,7 @@ class AggregationAnalyzer:
                     continue
 
                 if is_set_flag:
-                    if status != 'APPLIED':
+                    if status != 'EMITTED':
                         errors['wrongsetstatus'].append(f"{code} (Статус: {status})")
                 else:
                     if status != 'INTRODUCED':
