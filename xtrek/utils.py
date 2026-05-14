@@ -52,12 +52,16 @@ class AggregationAnalyzer:
         if gtin in self.gtin_cache:
             return self.gtin_cache[gtin]
 
-        info = self.nk.feedProduct(gtin)
-        if not info:
+        product = self.nk.feedProduct(gtin)
+        if not product:
+            product = self.nk.get_set_by_gtin(gtin)
+
+        if not product or not product.get("result"):
             logger.error(f"GTIN {gtin} не найден в Национальном Каталоге")
             return None
 
-        is_set = info.get('is_set', False)
+        item = product["result"][0]
+        is_set = item.get('is_set', False)
         self.gtin_cache[gtin] = is_set
         return is_set
 

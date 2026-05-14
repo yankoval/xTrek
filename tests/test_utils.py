@@ -171,8 +171,8 @@ def test_status_logic(analyzer, tmp_path):
 
     # Mock NK
     def mock_feed(gtin):
-        if gtin == "04640286999931": return {"is_set": True}
-        if gtin == "04630234040808": return {"is_set": False}
+        if gtin == "04640286999931": return {"result": [{"is_set": True}]}
+        if gtin == "04630234040808": return {"result": [{"is_set": False}]}
         return None
     analyzer.nk.feedProduct.side_effect = mock_feed
 
