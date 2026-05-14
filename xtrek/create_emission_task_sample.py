@@ -3028,6 +3028,12 @@ def create_equipment_aggregation_task(production_order_id: str):
         prod_filename = production_order_id if production_order_id.lower().endswith('.json') else f"{production_order_id}.json"
         prod_order_path = f"{production_orders_path.rstrip('/')}/{prod_filename}"
 
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        target_path = f"{equipment_tasks_path.rstrip('/')}/{prod_filename}"
+
+        if storage_tasks.exists(target_path):
+            raise FileExistsError(f"Задание для оборудования уже существует: {target_path}")
+
         if not storage_prod.exists(prod_order_path):
             logger.error(f"[!] Файл производственного заказа не найден: {prod_order_path}")
             return None
@@ -3035,8 +3041,10 @@ def create_equipment_aggregation_task(production_order_id: str):
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         pasport = prod_data.get('PasportData', {})
 
-        # Поле id это uuid его нужно создать.
-        task_uuid = str(uuid.uuid4())
+        # Поле id теперь совпадает с production_order_id (без расширения .json)
+        task_uuid = production_order_id
+        if task_uuid.lower().endswith('.json'):
+            task_uuid = task_uuid[:-5]
 
         # expDate используй Batch_date_expired и YYMMDD
         batch_date_expired = pasport.get('Batch_date_expired', '') # dd.mm.yyyy
@@ -3127,11 +3135,6 @@ def create_equipment_aggregation_task(production_order_id: str):
         }
 
         # Сохранение в S3 (equipment-tasks)
-        storage_tasks = get_storage(equipment_tasks_path, s3_config)
-        # Выгружаем в S3 с именем равным production_order_id + расширение json
-        target_filename = production_order_id if production_order_id.lower().endswith('.json') else f"{production_order_id}.json"
-        target_path = f"{equipment_tasks_path.rstrip('/')}/{target_filename}"
-
         temp_local = Path(f"temp_eq_task_{task_uuid}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
             json.dump(task_data, f, indent=3, ensure_ascii=False)

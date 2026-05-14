@@ -1,0 +1,35 @@
+{
+   "addProdInfo": "",
+   "boxLabelFields": [
+      {
+         "FieldData": "Product Name",
+         "FieldName": "#productName#"
+      },
+      {
+         "FieldData": "01234567890123",
+         "FieldName": "#productGTIN#"
+      },
+      {
+         "FieldData": "",
+         "FieldName": "#productKIGU#"
+      }
+   ],
+   "boxNumbers": [],
+   "date": "2026-05-14T04:47:18Z",
+   "expDate": "231231",
+   "gtin": "01234567890123",
+   "id": "PROD123",
+   "isGroup": false,
+   "lengthBox": 0.04,
+   "lineNum": "75f3d435-8582-11f0-bfdc-dcf401e5df3f",
+   "lotNo": "LOT001",
+   "maxNoRead": 0,
+   "numLabelAtBox": 1,
+   "numLayersInBox": 1,
+   "numPacksInParcel": 0,
+   "numРacksInBox": 10,
+   "productNumbers": [],
+   "task-export-signed-link": "http://presigned.url/PROD123.json",
+   "urlLabelBoxTemplate": "1",
+   "urlLabelProductTemplate": "1"
+}
