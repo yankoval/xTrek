@@ -1,7 +1,8 @@
 import pytest
 import json
+import os
 from unittest.mock import MagicMock, patch
-from xtrek.utils import AggregationAnalyzer
+from xtrek.utils import AggregationAnalyzer, check_aggregation_report, check_aggregation_reports
 
 @pytest.fixture
 def mock_api():
@@ -16,20 +17,15 @@ def analyzer(mock_api, mock_nk):
     return AggregationAnalyzer(mock_api, mock_nk)
 
 def test_uniqueness_check(analyzer, tmp_path):
-    # Create two files with duplicate codes
+    # Create a file with duplicate codes
     file1 = tmp_path / "file1.json"
-    file2 = tmp_path / "file2.json"
 
     data1 = {
         "readyBox": [
             {
                 "boxNumber": "BOX1\u001d93tail",
                 "productNumbersFull": ["CHILD1\u001d93tail", "CHILD2\u001d93tail"]
-            }
-        ]
-    }
-    data2 = {
-        "readyBox": [
+            },
             {
                 "boxNumber": "BOX1\u001d93tail", # Duplicate box
                 "productNumbersFull": ["CHILD2\u001d93tail", "CHILD3\u001d93tail"] # Duplicate child
@@ -38,16 +34,19 @@ def test_uniqueness_check(analyzer, tmp_path):
     }
 
     file1.write_text(json.dumps(data1))
-    file2.write_text(json.dumps(data2))
 
     # We mock API calls to avoid network errors
     analyzer.check_statuses = MagicMock(return_value=[])
+    # Disable min_sscc check for this test
+    analyzer.min_sscc = 0
 
-    errors = analyzer.analyze([str(file1), str(file2)])
+    errors = analyzer.check_report(str(file1))
 
     assert errors is not None
-    assert any("Дубликат кода агрегации: BOX1" in e for e in errors)
-    assert any("Дубликат кода вложения: CHILD2" in e for e in errors)
+    assert "duplicateaggregation" in errors
+    assert "BOX1" in errors["duplicateaggregation"]
+    assert "duplicateattachment" in errors
+    assert "CHILD2" in errors["duplicateattachment"]
 
 def test_sscc_normalization(analyzer, tmp_path):
     file1 = tmp_path / "file1.json"
@@ -74,11 +73,13 @@ def test_sscc_normalization(analyzer, tmp_path):
         return results
 
     analyzer.check_statuses = MagicMock(side_effect=mock_check)
+    analyzer.min_sscc = 0
 
-    errors = analyzer.analyze([str(file1)])
+    errors = analyzer.check_report(str(file1))
 
     assert errors is not None
-    assert any(f"Код агрегации 00{sscc_18} уже зарегистрирован" in e for e in errors)
+    assert "alreadyregistered" in errors
+    assert any(f"00{sscc_18}" in e for e in errors["alreadyregistered"])
 
 @patch('xtrek.utils.get_inn_by_gtin')
 @patch('xtrek.utils.TokenProcessor')
@@ -111,7 +112,8 @@ def test_auto_inn_detection(mock_get_storage, mock_tp_class, mock_get_inn, tmp_p
     with patch_args.object(sys, 'argv', ['utils.py', str(tmp_path / "dummy.json")]):
         with patch('xtrek.utils.HonestSignAPI') as mock_api_class:
             with patch('xtrek.utils.NK') as mock_nk_class:
-                with patch('xtrek.utils.AggregationAnalyzer') as mock_analyzer_class:
+                with patch('xtrek.utils.check_aggregation_reports') as mock_check_reports:
+                    mock_check_reports.return_value = {}
                     main()
 
                     # Verify auto detection was called
@@ -192,18 +194,68 @@ def test_status_logic(analyzer, tmp_path):
                 results.append({"cisInfo": {"cis": c, "status": "APPLIED"}}) # Error for PROD
         return results
     analyzer.check_statuses = MagicMock(side_effect=mock_check)
+    analyzer.min_sscc = 0
 
-    errors = analyzer.analyze([str(file1)])
+    errors = analyzer.check_report(str(file1))
 
     assert errors is not None
     # 1. Box existing error
-    assert any("Код агрегации BOX_EXISTING уже зарегистрирован" in e for e in errors)
+    assert "alreadyregistered" in errors
+    assert any("BOX_EXISTING" in e for e in errors["alreadyregistered"])
     # 2. SET bad status error
-    assert any("Код вложения (НАБОР) 010464028699993121SET_BAD имеет статус INTRODUCED, ожидался APPLIED" in e for e in errors)
+    assert "wrongsetstatus" in errors
+    assert any("SET_BAD" in e for e in errors["wrongsetstatus"])
     # 3. PROD bad status error
-    assert any("Код вложения (ТОВАР) 010463023404080821PROD_BAD имеет статус APPLIED, ожидался INTRODUCED" in e for e in errors)
+    assert "wrongunitstatus" in errors
+    assert any("PROD_BAD" in e for e in errors["wrongunitstatus"])
 
     # Verify OK statuses didn't cause errors
-    assert not any("SET_OK" in e for e in errors)
-    assert not any("PROD_OK" in e for e in errors)
-    assert not any("BOX_NEW" in e for e in errors)
+    for err_list in errors.values():
+        for e in err_list:
+            assert "SET_OK" not in e
+            assert "PROD_OK" not in e
+            assert "BOX_NEW" not in e
+
+def test_min_sscc_check(analyzer, tmp_path):
+    file1 = tmp_path / "file1.json"
+    data = {
+        "readyBox": [
+            {"boxNumber": "BOX1", "productNumbersFull": []},
+            {"boxNumber": "BOX2", "productNumbersFull": []}
+        ]
+    }
+    file1.write_text(json.dumps(data))
+
+    analyzer.min_sscc = 5
+    analyzer.check_statuses = MagicMock(return_value=[])
+
+    errors = analyzer.check_report(str(file1))
+    assert errors is not None
+    assert "minssccinaggrep" in errors
+    assert "Количество коробок 2 меньше 5" in errors["minssccinaggrep"]
+
+    # Check with enough boxes
+    analyzer.min_sscc = 2
+    errors = analyzer.check_report(str(file1))
+    assert errors is None or "minssccinaggrep" not in errors
+
+@patch('xtrek.utils.get_storage')
+def test_tag_setting(mock_get_storage, analyzer, tmp_path):
+    mock_storage = MagicMock()
+    mock_get_storage.return_value = mock_storage
+
+    file1 = tmp_path / "file1.json"
+    data = {"readyBox": [{"boxNumber": "DUPE", "productNumbersFull": []}, {"boxNumber": "DUPE", "productNumbersFull": []}]}
+    file1.write_text(json.dumps(data))
+    mock_storage.read_text.return_value = json.dumps(data)
+
+    analyzer.min_sscc = 0
+    analyzer.check_statuses = MagicMock(return_value=[])
+
+    analyzer.check_report(str(file1))
+
+    # Verify set_tags was called with 'check': 'duplicateaggregation'
+    mock_storage.set_tags.assert_called_once()
+    args, kwargs = mock_storage.set_tags.call_args
+    assert args[0] == str(file1)
+    assert args[1]['check'] == 'duplicateaggregation'

@@ -2,8 +2,9 @@ import os
 import json
 import logging
 import argparse
+import tempfile
 from typing import List, Dict, Any, Optional, Set
-from collections import Counter
+from collections import Counter, defaultdict
 
 from .storage import get_storage
 from .trueapi import HonestSignAPI
@@ -37,13 +38,17 @@ def get_gtin_from_code(code: str) -> Optional[str]:
         return code[2:16]
     return None
 
+MIN_SSCC_IN_AGG_REP_DEFAULT = 10
+
 class AggregationAnalyzer:
-    def __init__(self, api: HonestSignAPI, nk: NK):
+    def __init__(self, api: HonestSignAPI, nk: NK, config: Optional[Dict] = None):
         self.api = api
         self.nk = nk
+        self.config = config or {}
         self.gtin_cache = {}
+        self.min_sscc = self.config.get('MIN_SSCC_IN_AGG_REP', MIN_SSCC_IN_AGG_REP_DEFAULT)
 
-    def is_set(self, gtin: str) -> bool:
+    def is_set(self, gtin: str) -> Optional[bool]:
         if gtin in self.gtin_cache:
             return self.gtin_cache[gtin]
 
@@ -71,120 +76,110 @@ class AggregationAnalyzer:
                 logger.error(f"Исключение при проверке пачки: {e}")
         return results
 
-    def analyze(self, file_paths: List[str], s3_config: Optional[Dict] = None) -> Optional[List[str]]:
-        errors = []
-        all_box_codes = Counter()
-        all_child_codes = Counter()
+    def check_report(self, path: str, s3_config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
+        """Проверяет один отчет об агрегации и устанавливает тег check."""
+        errors = defaultdict(list)
+        storage = get_storage(path, s3_config or self.config.get('s3_config'))
 
-        file_data = []
+        try:
+            content = storage.read_text(path)
+            data = json.loads(content)
+        except Exception as e:
+            logger.error(f"Ошибка чтения файла {path}: {e}")
+            return {'filereaderror': [str(e)]}
 
-        # 1. Загрузка и первичный анализ (уникальность)
-        for path in file_paths:
-            storage = get_storage(path, s3_config)
-            try:
-                content = storage.read_text(path)
-                data = json.loads(content)
-            except Exception as e:
-                err = f"Ошибка чтения файла {path}: {e}"
-                logger.error(err)
-                errors.append(err)
-                continue
+        ready_boxes = data.get('readyBox', [])
 
-            ready_boxes = data.get('readyBox', [])
-            if not ready_boxes:
-                logger.warning(f"Файл {path} не содержит readyBox или пуст")
-                continue
+        # Проверка на минимальное количество коробок
+        if len(ready_boxes) < self.min_sscc:
+            errors['minssccinaggrep'].append(f"Количество коробок {len(ready_boxes)} меньше {self.min_sscc}")
 
-            file_boxes = []
-            file_children = []
+        box_codes_counter = Counter()
+        child_codes_counter = Counter()
 
-            for box in ready_boxes:
-                box_code = box.get('boxNumber')
-                if box_code:
-                    clean_box = normalize_sscc(cut_crypto_tail(box_code))
-                    all_box_codes[clean_box] += 1
-                    file_boxes.append(clean_box)
+        clean_boxes = []
+        clean_children = []
 
-                children = box.get('productNumbersFull') or []
-                for child in children:
-                    clean_child = cut_crypto_tail(child)
-                    all_child_codes[clean_child] += 1
-                    file_children.append(clean_child)
+        for box in ready_boxes:
+            box_code = box.get('boxNumber')
+            if box_code:
+                clean_box = normalize_sscc(cut_crypto_tail(box_code))
+                box_codes_counter[clean_box] += 1
+                clean_boxes.append(clean_box)
 
-            file_data.append({
-                'path': path,
-                'boxes': file_boxes,
-                'children': file_children
-            })
+            children = box.get('productNumbersFull') or []
+            for child in children:
+                clean_child = cut_crypto_tail(child)
+                child_codes_counter[clean_child] += 1
+                clean_children.append(clean_child)
 
-        # Проверка уникальности
-        for code, count in all_box_codes.items():
+        # Проверка уникальности внутри файла
+        for code, count in box_codes_counter.items():
             if count > 1:
-                errors.append(f"Дубликат кода агрегации: {code} (встречается {count} раз)")
-        for code, count in all_child_codes.items():
+                errors['duplicateaggregation'].append(code)
+        for code, count in child_codes_counter.items():
             if count > 1:
-                errors.append(f"Дубликат кода вложения: {code} (встречается {count} раз)")
+                errors['duplicateattachment'].append(code)
 
-        # 2. Проверка статусов в True API и анализ по правилам
-        for item in file_data:
-            path = item['path']
-            boxes = item['boxes']
-            children = item['children']
+        # Проверка статусов в ГИС МТ
+        if clean_boxes:
+            box_results = self.check_statuses(clean_boxes)
+            for res in box_results:
+                cis_info = res.get('cisInfo', {})
+                status = cis_info.get('status')
+                code = cis_info.get('cis') or res.get('requestedCis')
+                if status:
+                    errors['alreadyregistered'].append(f"{code} (Статус: {status})")
 
-            logger.info(f"--- Анализ файла: {path} ---")
+        if clean_children:
+            child_results = self.check_statuses(clean_children)
+            for res in child_results:
+                cis_info = res.get('cisInfo', {})
+                status = cis_info.get('status', 'NOT_FOUND')
+                code = cis_info.get('cis') or res.get('requestedCis')
 
-            # Проверка агрегатов
-            if boxes:
-                box_results = self.check_statuses(boxes)
-                box_statuses = Counter()
-                # API возвращает список. Сопоставляем по requestedCis если нужно, но тут просто идем по результатам
-                for res in box_results:
-                    cis_info = res.get('cisInfo', {})
-                    status = cis_info.get('status')
-                    code = cis_info.get('cis') or res.get('requestedCis')
-                    if status:
-                        box_statuses[status] += 1
-                        # "коды SSCC не должны быть зарегестрированны в суз"
-                        # Если статус есть, значит код уже "зарегистрирован" (эмитирован или более)
-                        errors.append(f"Ошибка: Код агрегации {code} уже зарегистрирован в ГИС МТ (Статус: {status})")
-                    else:
-                        box_statuses['NOT_FOUND'] += 1
+                gtin = get_gtin_from_code(code)
+                if not gtin:
+                    continue
 
-                logger.info(f"Статусы агрегатов: {dict(box_statuses)}")
+                is_set_flag = self.is_set(gtin)
+                if is_set_flag is None:
+                    errors['gtinnotfound'].append(gtin)
+                    continue
 
-            # Проверка вложений
-            if children:
-                child_results = self.check_statuses(children)
-                child_statuses = Counter()
+                if is_set_flag:
+                    if status != 'APPLIED':
+                        errors['wrongsetstatus'].append(f"{code} (Статус: {status})")
+                else:
+                    if status != 'INTRODUCED':
+                        errors['wrongunitstatus'].append(f"{code} (Статус: {status})")
 
-                for res in child_results:
-                    cis_info = res.get('cisInfo', {})
-                    status = cis_info.get('status', 'NOT_FOUND')
-                    code = cis_info.get('cis') or res.get('requestedCis')
-                    child_statuses[status] += 1
+        result = dict(errors) if errors else None
 
-                    gtin = get_gtin_from_code(code)
-                    if not gtin:
-                        logger.warning(f"Не удалось извлечь GTIN из кода вложения: {code}")
-                        continue
+        # Установка тега check
+        tag_value = ""
+        if result:
+            tag_value = "-".join(sorted(result.keys()))
 
-                    is_set_flag = self.is_set(gtin)
-                    if is_set_flag is None:
-                        errors.append(f"Ошибка: GTIN {gtin} для кода {code} не найден в Нац.Каталоге")
-                        continue
+        try:
+            storage.set_tags(path, {'check': tag_value})
+        except Exception as e:
+            logger.error(f"Не удалось установить тег check для {path}: {e}")
 
-                    if is_set_flag:
-                        # Набор: должен быть APPLIED
-                        if status != 'APPLIED':
-                            errors.append(f"Ошибка: Код вложения (НАБОР) {code} имеет статус {status}, ожидался APPLIED")
-                    else:
-                        # Товар: должен быть INTRODUCED
-                        if status != 'INTRODUCED':
-                            errors.append(f"Ошибка: Код вложения (ТОВАР) {code} имеет статус {status}, ожидался INTRODUCED")
+        return result
 
-                logger.info(f"Статусы вложений: {dict(child_statuses)}")
+def check_aggregation_report(path: str, api: HonestSignAPI, nk: NK, config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
+    """Функция для проверки одного отчета об агрегации."""
+    analyzer = AggregationAnalyzer(api, nk, config)
+    return analyzer.check_report(path)
 
-        return errors if errors else None
+def check_aggregation_reports(paths: List[str], api: HonestSignAPI, nk: NK, config: Optional[Dict] = None) -> Dict[str, Optional[Dict[str, List[str]]]]:
+    """Функция-обертка для проверки списка отчетов."""
+    analyzer = AggregationAnalyzer(api, nk, config)
+    results = {}
+    for path in paths:
+        results[path] = analyzer.check_report(path)
+    return results
 
 def resolve_file_path(path: str, config: Dict) -> str:
     """Разрешает путь к файлу, добавляя префикс из конфига если нужно."""
@@ -212,6 +207,7 @@ def main():
     parser.add_argument('--token', help="Прямая передача токена True API")
     parser.add_argument('--suz_worker_config', type=str, help='Путь к конфигурационному файлу suz_worker (для S3)')
     parser.add_argument('--debug', action='store_true', help="Включить DEBUG логирование")
+    parser.add_argument('--full', action='store_true', help="Выводить полный список проблемных кодов на экран")
 
     args = parser.parse_args()
 
@@ -284,16 +280,35 @@ def main():
 
     api = HonestSignAPI(token=token)
     nk = NK(token=token)
-    analyzer = AggregationAnalyzer(api, nk)
 
-    errors = analyzer.analyze(resolved_files, s3_config=s3_config)
+    results = check_aggregation_reports(resolved_files, api, nk, config)
 
-    if errors:
-        logger.error("--- ОБНАРУЖЕНЫ ОШИБКИ ---")
-        for err in errors:
-            print(err)
-    else:
-        logger.info("Проверка завершена успешно, ошибок не обнаружено.")
+    all_errors_details = {}
+
+    for path, errors in results.items():
+        tag_value = "-".join(sorted(errors.keys())) if errors else ""
+        if len(resolved_files) > 1:
+            print(f"{path}: {tag_value}")
+        else:
+            print(tag_value)
+
+        if errors:
+            all_errors_details[path] = errors
+
+    if all_errors_details:
+        # Сохранение во временный файл
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', prefix='agg_errors_', suffix='.json', delete=False, encoding='utf-8') as tf:
+                json.dump(all_errors_details, tf, ensure_ascii=False, indent=2)
+                temp_path = tf.name
+
+            logger.info(f"Полный список проблем сохранен в: {temp_path}")
+        except Exception as e:
+            logger.error(f"Не удалось создать временный файл: {e}")
+
+        if args.full:
+            print("\n--- ДЕТАЛЬНЫЙ ОТЧЕТ ОБ ОШИБКАХ ---")
+            print(json.dumps(all_errors_details, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
     main()
