@@ -259,3 +259,29 @@ def test_tag_setting(mock_get_storage, analyzer, tmp_path):
     args, kwargs = mock_storage.set_tags.call_args
     assert args[0] == str(file1)
     assert args[1]['check'] == 'duplicateaggregation'
+
+def test_finished_state(analyzer, tmp_path):
+    file1 = tmp_path / "file1.json"
+    data = {
+        "readyBox": [
+            {
+                "boxNumber": "BOX_INTRODUCED",
+                "productNumbersFull": ["010463023404080821CHILD_INTRODUCED\u001d93tail"]
+            }
+        ]
+    }
+    file1.write_text(json.dumps(data))
+
+    # Mock NK (it's a unit, not a set)
+    analyzer.nk.feedProduct.return_value = {"result": [{"is_set": False}]}
+
+    # Mock API: all codes are INTRODUCED
+    analyzer.check_statuses = MagicMock(return_value=[
+        {"cisInfo": {"cis": "BOX_INTRODUCED", "status": "INTRODUCED"}},
+        {"cisInfo": {"cis": "010463023404080821CHILD_INTRODUCED", "status": "INTRODUCED"}}
+    ])
+    analyzer.min_sscc = 0
+
+    errors = analyzer.check_report(str(file1))
+
+    assert errors == {"finished": ["All codes are INTRODUCED"]}

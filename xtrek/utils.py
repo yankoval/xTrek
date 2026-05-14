@@ -127,21 +127,33 @@ class AggregationAnalyzer:
                 errors['duplicateattachment'].append(code)
 
         # Проверка статусов в ГИС МТ
+        all_introduced = True
+        status_checked = False
+
         if clean_boxes:
             box_results = self.check_statuses(clean_boxes)
             for res in box_results:
+                status_checked = True
                 cis_info = res.get('cisInfo', {})
                 status = cis_info.get('status')
                 code = cis_info.get('cis') or res.get('requestedCis')
                 if status:
                     errors['alreadyregistered'].append(f"{code} (Статус: {status})")
+                    if status != 'INTRODUCED':
+                        all_introduced = False
+                else:
+                    all_introduced = False
 
         if clean_children:
             child_results = self.check_statuses(clean_children)
             for res in child_results:
+                status_checked = True
                 cis_info = res.get('cisInfo', {})
                 status = cis_info.get('status', 'NOT_FOUND')
                 code = cis_info.get('cis') or res.get('requestedCis')
+
+                if status != 'INTRODUCED':
+                    all_introduced = False
 
                 gtin = get_gtin_from_code(code)
                 if not gtin:
@@ -159,7 +171,11 @@ class AggregationAnalyzer:
                     if status != 'INTRODUCED':
                         errors['wrongunitstatus'].append(f"{code} (Статус: {status})")
 
-        result = dict(errors) if errors else None
+        # Если все коды в статусе INTRODUCED, то отчет считается завершенным
+        if status_checked and all_introduced:
+            result = {'finished': ['All codes are INTRODUCED']}
+        else:
+            result = dict(errors) if errors else None
 
         # Установка тега check
         tag_value = ""
