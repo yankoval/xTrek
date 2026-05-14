@@ -71,7 +71,8 @@ class AggregationAnalyzer:
                 if isinstance(batch_results, list):
                     results.extend(batch_results)
                 else:
-                    logger.error(f"Ошибка API при проверке пачки: {batch_results}")
+                    error_msg = batch_results.get('error', 'Unknown error')
+                    logger.error(f"Ошибка API при проверке пачки из {len(batch)} кодов: {error_msg}")
             except Exception as e:
                 logger.error(f"Исключение при проверке пачки: {e}")
         return results
