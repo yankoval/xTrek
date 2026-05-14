@@ -94,8 +94,9 @@ class HonestSignAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.warning(f"Ошибка кода {code}: {e}")
+            logger.warning(f"Ошибка при запросе информации о коде {code}: {e}")
             return {"code": code, "error": str(e)}
+
     def get_list_cis_info(self, code: List) -> Dict[str, Any]:
         url = f"{self.host}/api/v3/true-api/cises/info"
         try:
@@ -105,7 +106,7 @@ class HonestSignAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.warning(f"Ошибка кода {code}: {e}")
+            logger.warning(f"Ошибка при запросе информации о {len(code)} кодах: {e}")
             return {"code": code, "error": str(e)}
 
     def documents_create(self, wrapped_document_json: str, pg: str) -> Dict[str, Any]:
