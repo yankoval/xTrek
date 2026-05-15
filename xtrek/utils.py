@@ -227,24 +227,34 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
     if not token:
         # Автодетекция ИНН по файлу
         s3_config = config.get('s3_config')
-        storage = get_storage(resolved_path, s3_config)
-        detected_inn = None
         try:
-            content = storage.read_text(resolved_path)
-            data = json.loads(content)
-            ready_boxes = data.get('readyBox', [])
-            for box in ready_boxes:
-                codes_to_check = [box.get('boxNumber')] + (box.get('productNumbersFull') or [])
-                for code in codes_to_check:
-                    if code:
-                        gtin = get_gtin_from_code(cut_crypto_tail(code))
-                        if gtin:
-                            detected_inn = get_inn_by_gtin(gtin)
-                            if detected_inn:
-                                break
-                if detected_inn: break
-        except Exception:
-            pass
+            storage = get_storage(resolved_path, s3_config)
+            if not storage.exists(resolved_path):
+                 logger.warning(f"Файл {resolved_path} не найден для автодетекции ИНН")
+            else:
+                content = storage.read_text(resolved_path)
+                data = json.loads(content)
+                ready_boxes = data.get('readyBox', [])
+                detected_inn = None
+                for box in ready_boxes:
+                    codes_to_check = [box.get('boxNumber')] + (box.get('productNumbersFull') or [])
+                    for code in codes_to_check:
+                        if code:
+                            gtin = get_gtin_from_code(cut_crypto_tail(code))
+                            if gtin:
+                                detected_inn = get_inn_by_gtin(gtin)
+                                if detected_inn:
+                                    logger.info(f"Автоматически определен ИНН {detected_inn} по GTIN {gtin} из файла {resolved_path}")
+                                    break
+                    if detected_inn: break
+
+                if not detected_inn:
+                    logger.warning(f"Не удалось извлечь GTIN или сопоставить ИНН для файла {resolved_path}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка парсинга JSON в файле {resolved_path} при автодетекции: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка при чтении файла для автодетекции ИНН {resolved_path}: {e}")
+            detected_inn = None
 
         if detected_inn:
             base_path = os.path.dirname(os.path.abspath(__file__))
@@ -261,12 +271,14 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
 
     if not api:
         if token not in _RESOURCES_CACHE['api']:
-            _RESOURCES_CACHE['api'][token] = HonestSignAPI(token=token)
+            host = config.get('true_api_host')
+            _RESOURCES_CACHE['api'][token] = HonestSignAPI(token=token, host=host)
         api = _RESOURCES_CACHE['api'][token]
 
     if not nk:
         if token not in _RESOURCES_CACHE['nk']:
-            _RESOURCES_CACHE['nk'][token] = NK(token=token)
+            host = config.get('nk_api_host')
+            _RESOURCES_CACHE['nk'][token] = NK(token=token, host=host)
         nk = _RESOURCES_CACHE['nk'][token]
 
     return resolved_path, api, nk, config
@@ -295,8 +307,8 @@ def resolve_file_path(path: str, config: Dict) -> str:
     if not config:
         return path
 
-    # Если путь не содержит s3://, не имеет расширения и не содержит разделителей папок
-    if not path.startswith('s3://') and '.' not in os.path.basename(path) and '/' not in path and '\\' not in path:
+    # Если путь не содержит s3://, не заканчивается на .json и не содержит разделителей папок
+    if not path.startswith('s3://') and not path.lower().endswith('.json') and '/' not in path and '\\' not in path:
         reports_path = config.get('equipment-reports')
         if reports_path:
             if reports_path.startswith('s3://'):

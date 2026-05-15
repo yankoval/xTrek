@@ -93,7 +93,7 @@ class LocalStorage(BaseStorage):
         return Path(path).exists()
 
     def read_text(self, path):
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8-sig') as f:
             return f.read()
 
     def write_text(self, path, text):
@@ -248,7 +248,7 @@ class S3Storage(BaseStorage):
     def read_text(self, path):
         bucket, key = self._parse_s3_url(path)
         response = self.s3.get_object(Bucket=bucket, Key=key)
-        return response['Body'].read().decode('utf-8')
+        return response['Body'].read().decode('utf-8-sig')
 
     def write_text(self, path, text):
         bucket, key = self._parse_s3_url(path)
