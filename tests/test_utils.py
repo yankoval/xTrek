@@ -116,12 +116,14 @@ def test_auto_inn_detection(mock_get_storage, mock_tp_class, mock_get_inn, tmp_p
                     mock_check_reports.return_value = {}
                     main()
 
-                    # Verify auto detection was called
-                    mock_get_inn.assert_called_with(gtin)
-                    mock_tp.get_token_by_inn.assert_called_with("1234567890")
-
-                    # Verify API was initialized with the auto token
-                    mock_api_class.assert_called_with(token="AUTO_TOKEN")
+                    # В новой реализации main делегирует автоопределение внутрь check_aggregation_reports
+                    # Поэтому здесь мы просто проверяем, что check_aggregation_reports был вызван
+                    mock_check_reports.assert_called_once()
+                    args, kwargs = mock_check_reports.call_args
+                    assert args[0] == [str(tmp_path / "dummy.json")]
+                    # api и nk должны быть None, так как токен не передан в аргументах
+                    assert args[1] is None
+                    assert args[2] is None
 
 def test_path_resolution():
     from xtrek.utils import resolve_file_path

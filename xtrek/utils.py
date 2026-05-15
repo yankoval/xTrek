@@ -189,17 +189,105 @@ class AggregationAnalyzer:
 
         return result
 
-def check_aggregation_report(path: str, api: HonestSignAPI, nk: NK, config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
-    """Функция для проверки одного отчета об агрегации."""
-    analyzer = AggregationAnalyzer(api, nk, config)
-    return analyzer.check_report(path)
+# Глобальный кеш для ресурсов
+_RESOURCES_CACHE = {
+    'config': None,
+    'api': {}, # token -> api
+    'nk': {},  # token -> nk
+    'last_token': None,
+}
 
-def check_aggregation_reports(paths: List[str], api: HonestSignAPI, nk: NK, config: Optional[Dict] = None) -> Dict[str, Optional[Dict[str, List[str]]]]:
-    """Функция-обертка для проверки списка отчетов."""
+def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None):
+    """Обеспечивает наличие API, NK и конфига, выполняя автодетекцию если нужно."""
+    if config is None:
+        if _RESOURCES_CACHE['config'] is None:
+            _RESOURCES_CACHE['config'] = load_config('suz_worker_config')
+        config = _RESOURCES_CACHE['config']
+
+    resolved_path = resolve_file_path(path, config)
+
+    # Если переданы и API и NK, просто возвращаем их
+    if api and nk:
+        return resolved_path, api, nk, config
+
+    # Попытка найти токен
+    token = None
+    if api:
+        token = api.token
+    elif nk:
+        token = nk.token # У NK тоже есть атрибут token
+
+    if not token:
+        token = os.getenv("TRUE_API_TOKEN")
+
+    # Если токен все еще не найден, пробуем использовать последний успешно определенный
+    if not token:
+        token = _RESOURCES_CACHE['last_token']
+
+    if not token:
+        # Автодетекция ИНН по файлу
+        s3_config = config.get('s3_config')
+        storage = get_storage(resolved_path, s3_config)
+        detected_inn = None
+        try:
+            content = storage.read_text(resolved_path)
+            data = json.loads(content)
+            ready_boxes = data.get('readyBox', [])
+            for box in ready_boxes:
+                codes_to_check = [box.get('boxNumber')] + (box.get('productNumbersFull') or [])
+                for code in codes_to_check:
+                    if code:
+                        gtin = get_gtin_from_code(cut_crypto_tail(code))
+                        if gtin:
+                            detected_inn = get_inn_by_gtin(gtin)
+                            if detected_inn:
+                                break
+                if detected_inn: break
+        except Exception:
+            pass
+
+        if detected_inn:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            orgs_dir = os.path.join(base_path, 'my_orgs')
+            tp = TokenProcessor(orgs_dir=orgs_dir)
+            token_data = tp.get_token_by_inn(detected_inn)
+            if token_data:
+                token = token_data.get('Токен')
+                _RESOURCES_CACHE['last_token'] = token
+
+    if not token:
+        raise ValueError(f"Не удалось определить токен для проверки {resolved_path}. "
+                         f"Укажите токен явно или обеспечьте наличие ИНН в базе для GTIN из файла.")
+
+    if not api:
+        if token not in _RESOURCES_CACHE['api']:
+            _RESOURCES_CACHE['api'][token] = HonestSignAPI(token=token)
+        api = _RESOURCES_CACHE['api'][token]
+
+    if not nk:
+        if token not in _RESOURCES_CACHE['nk']:
+            _RESOURCES_CACHE['nk'][token] = NK(token=token)
+        nk = _RESOURCES_CACHE['nk'][token]
+
+    return resolved_path, api, nk, config
+
+def check_aggregation_report(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
+    """Функция для проверки одного отчета об агрегации."""
+    resolved_path, api, nk, config = _ensure_resources(path, api, nk, config)
     analyzer = AggregationAnalyzer(api, nk, config)
+    return analyzer.check_report(resolved_path)
+
+def check_aggregation_reports(paths: List[str], api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Dict[str, Optional[Dict[str, List[str]]]]:
+    """Функция-обертка для проверки списка отчетов."""
     results = {}
     for path in paths:
-        results[path] = analyzer.check_report(path)
+        try:
+            resolved_path, current_api, current_nk, current_config = _ensure_resources(path, api, nk, config)
+            analyzer = AggregationAnalyzer(current_api, current_nk, current_config)
+            results[resolved_path] = analyzer.check_report(resolved_path)
+        except Exception as e:
+            logger.error(f"Ошибка при проверке {path}: {e}")
+            results[path] = {'error': [str(e)]}
     return results
 
 def resolve_file_path(path: str, config: Dict) -> str:
@@ -238,18 +326,10 @@ def main():
     if args.suz_worker_config:
         os.environ['suz_worker_config'] = args.suz_worker_config
 
-    config = load_config('suz_worker_config')
-    s3_config = config.get('s3_config')
-
-    # Разрешение путей к файлам
-    resolved_files = [resolve_file_path(f, config) for f in args.files]
-
-    # Авторизация
-    token = args.token
-
-    # Если токен не задан, попробуем поискать в переменных окружения
-    if not token:
-        token = os.getenv("TRUE_API_TOKEN")
+    # Подготовка API и NK если переданы токен или ИНН
+    api = None
+    nk = None
+    token = args.token or os.getenv("TRUE_API_TOKEN")
 
     if not token and args.inn:
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -260,55 +340,17 @@ def main():
             token = token_data.get('Токен')
             logger.info(f"Получен токен для ИНН {args.inn}")
 
-    # Если токен не задан, попробуем определить ИНН по первому найденному GTIN в файлах
-    if not token and not args.inn:
-        logger.info("Попытка автоматического определения ИНН по GTIN из файлов...")
-        detected_inn = None
-        for path in resolved_files:
-            storage = get_storage(path, s3_config)
-            try:
-                content = storage.read_text(path)
-                data = json.loads(content)
-                ready_boxes = data.get('readyBox', [])
-                for box in ready_boxes:
-                    # Пробуем извлечь GTIN из коробки или вложений
-                    codes_to_check = [box.get('boxNumber')] + (box.get('productNumbersFull') or [])
-                    for code in codes_to_check:
-                        if code:
-                            gtin = get_gtin_from_code(cut_crypto_tail(code))
-                            if gtin:
-                                detected_inn = get_inn_by_gtin(gtin)
-                                if detected_inn:
-                                    logger.info(f"Автоматически определен ИНН: {detected_inn} (по GTIN {gtin})")
-                                    break
-                    if detected_inn: break
-            except Exception:
-                continue
-            if detected_inn: break
+    if token:
+        api = HonestSignAPI(token=token)
+        nk = NK(token=token)
 
-        if detected_inn:
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            orgs_dir = os.path.join(base_path, 'my_orgs')
-            tp = TokenProcessor(orgs_dir=orgs_dir)
-            token_data = tp.get_token_by_inn(detected_inn)
-            if token_data:
-                token = token_data.get('Токен')
-                logger.info(f"Получен токен для автоматически определенного ИНН {detected_inn}")
-
-    if not token:
-        logger.error("Не указан токен. Используйте --inn, --token или переменную TRUE_API_TOKEN")
-        return
-
-    api = HonestSignAPI(token=token)
-    nk = NK(token=token)
-
-    results = check_aggregation_reports(resolved_files, api, nk, config)
+    results = check_aggregation_reports(args.files, api, nk)
 
     all_errors_details = {}
 
     for path, errors in results.items():
         tag_value = "-".join(sorted(errors.keys())) if errors else ""
-        if len(resolved_files) > 1:
+        if len(results) > 1:
             print(f"{path}: {tag_value}")
         else:
             print(tag_value)
