@@ -42,7 +42,7 @@ def create_virtual_tasks_from_equipment_report(production_order_id: str):
     Находит отчет в два этапа: через задание на оборудование и ссылку в нем.
     """
     try:
-        from urllib.parse import urlparse
+        from urllib.parse import urlparse, unquote
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
         equipment_tasks_path = config.get('equipment-tasks')
@@ -71,7 +71,7 @@ def create_virtual_tasks_from_equipment_report(production_order_id: str):
 
         # Распарсить ссылку и получить ключ (имя файла)
         parsed_url = urlparse(signed_link)
-        report_filename = os.path.basename(parsed_url.path)
+        report_filename = unquote(os.path.basename(parsed_url.path))
 
         if not report_filename:
              logger.error(f"[!] Не удалось извлечь имя файла из ссылки: {signed_link}")
@@ -2814,7 +2814,7 @@ def create_equipment_set_report_from_report(production_order_id: str):
     temp_files = []
     try:
         from .kinGenerator import KinReportGenerator
-        from urllib.parse import urlparse
+        from urllib.parse import urlparse, unquote
 
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
@@ -2842,7 +2842,7 @@ def create_equipment_set_report_from_report(production_order_id: str):
             return None
 
         parsed_url = urlparse(signed_link)
-        report_filename = os.path.basename(parsed_url.path)
+        report_filename = unquote(os.path.basename(parsed_url.path))
         storage_reports = get_storage(equipment_reports_path, s3_config)
         report_path = f"{equipment_reports_path.rstrip('/')}/{report_filename}"
 
