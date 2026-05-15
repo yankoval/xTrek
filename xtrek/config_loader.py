@@ -37,7 +37,7 @@ def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
     for path in config_candidates:
         if os.path.exists(path):
             try:
-                with open(path, 'r', encoding='utf-8') as f:
+                with open(path, 'r', encoding='utf-8-sig') as f:
                     config = json.load(f)
                     logger.info(f"Конфигурация загружена из: {path}")
                     return config

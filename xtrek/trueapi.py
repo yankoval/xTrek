@@ -59,7 +59,7 @@ def setup_logging(log_file: str = None):
 logger = logging.getLogger(__name__)
 
 class HonestSignAPI:
-    def __init__(self, token: str = None, omsId: str = None, clientToken: str = None):
+    def __init__(self, token: str = None, omsId: str = None, clientToken: str = None, host: str = None):
         self.token = token or os.getenv('HONEST_SIGN_TOKEN')
         if not self.token:
             raise ValueError("Токен не найден")
@@ -67,7 +67,7 @@ class HonestSignAPI:
         self.omsId = omsId or os.getenv('OMSID')
         self.clientToken = clientToken or os.getenv('CLIENT_TOKEN')
 
-        self.host = "https://markirovka.crpt.ru"
+        self.host = host or os.getenv('TRUE_API_HOST', "https://markirovka.crpt.ru")
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",

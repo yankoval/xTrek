@@ -14,12 +14,13 @@ class NK:
     Версия API: v5.38
     """
 
-    def __init__(self, token: str = None, apikey: str = None, sandbox: bool = False):
+    def __init__(self, token: str = None, apikey: str = None, sandbox: bool = False, host: str = None):
         """
         Инициализация API клиента.
         :param token: Bearer-токен True API
         :param apikey: API Key Национального каталога
         :param sandbox: использовать тестовую среду
+        :param host: переопределение базового URL API
         """
         self.token = token or os.getenv("TRUE_API_TOKEN")
         self.apikey = apikey or os.getenv("API_KEY")
@@ -30,11 +31,12 @@ class NK:
                              "Установите переменные TRUE_API_TOKEN или API_KEY.")
 
         # Правильный хост API
-        self.base_url = (
-            "https://api.nk.sandbox.crptech.ru"
-            if sandbox
-            else "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai"
-        )
+        if host:
+            self.base_url = host
+        elif sandbox:
+            self.base_url = "https://api.nk.sandbox.crptech.ru"
+        else:
+            self.base_url = os.getenv("NK_API_HOST", "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai")
 
     # ---------------------------
     # Метод 1: Получить карточку по GTIN (v3/product)
