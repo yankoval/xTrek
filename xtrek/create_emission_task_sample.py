@@ -1119,6 +1119,114 @@ def create_virtual_introduce_task(order_id: str, group: str, production_date: st
         logger.error(f"[!] Ошибка в create_virtual_introduce_task: {e}")
         return None
 
+def create_utilisation_task_from_report(production_order_id: str, group: str = "chemistry"):
+    """
+    Создает задачу на отчет о нанесении на основе отчета оборудования.
+    Извлекает коды КМ из отчета оборудования и создает задачу.
+    """
+    try:
+        from urllib.parse import urlparse, unquote
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        equipment_tasks_path = config.get('equipment-tasks')
+        equipment_reports_path = config.get('equipment-reports')
+        production_orders_path = config.get('production_orders_path')
+        utilisation_tasks_path = config.get('utilisation_tasks_path')
+
+        if not all([equipment_tasks_path, equipment_reports_path, production_orders_path, utilisation_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (equipment-tasks, equipment-reports, production_orders_path, utilisation_tasks_path)")
+            return None
+
+        # 1. Находим задание на оборудование
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        task_filename = production_order_id if production_order_id.lower().endswith('.json') else f"{production_order_id}.json"
+        task_path = f"{equipment_tasks_path.rstrip('/')}/{task_filename}"
+
+        if not storage_tasks.exists(task_path):
+            logger.error(f"[!] Задание на оборудование не найдено: {task_path}")
+            return None
+
+        task_content = storage_tasks.read_text(task_path)
+        task_data = json.loads(task_content)
+
+        # Получаем ссылку на отчет
+        signed_link = task_data.get('task-export-signed-link') or task_data.get('task_export_signed_link')
+        if not signed_link:
+            logger.error(f"[!] В задании {production_order_id} не найден ключ task-export-signed-link")
+            return None
+
+        # Извлекаем имя файла отчета
+        parsed_url = urlparse(signed_link)
+        report_filename = unquote(os.path.basename(parsed_url.path))
+
+        # 2. Получаем отчет оборудования
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        report_path = f"{equipment_reports_path.rstrip('/')}/{report_filename}"
+
+        if not storage_reports.exists(report_path):
+            logger.error(f"[!] Отчет оборудования не найден: {report_path}")
+            return None
+
+        report_content = storage_reports.read_text(report_path)
+        report_data = json.loads(report_content)
+
+        # Извлекаем коды
+        codes = extract_and_flatten(report_data)
+        if not codes:
+            logger.warning(f"[*] Отчет {report_filename} не содержит кодов.")
+            return None
+
+        # 3. Получаем даты из производственного заказа
+        storage_prod = get_storage(production_orders_path, s3_config)
+        prod_path = f"{production_orders_path.rstrip('/')}/{task_filename}"
+
+        auto_prod_date = None
+        auto_exp_date = None
+
+        if storage_prod.exists(prod_path):
+            prod_data = json.loads(storage_prod.read_text(prod_path))
+            pasport = prod_data.get('PasportData', {})
+            auto_prod_date = format_date_suz(pasport.get('Batch_date_production'))
+            auto_exp_date = format_date_suz(pasport.get('Batch_date_expired'))
+            logger.info(f"[+] Извлечены даты: prod={auto_prod_date}, exp={auto_exp_date}")
+        else:
+            logger.warning(f"[!] Файл производственного заказа {prod_path} не найден.")
+
+        # 4. Формируем отчет
+        attributes = {}
+        if auto_prod_date:
+            attributes["productionDate"] = auto_prod_date
+        if auto_exp_date:
+            attributes["expirationDate"] = auto_exp_date
+
+        report = UtilisationReport(
+            productGroup=group,
+            sntins=codes,
+            attributes=attributes,
+            productionOrderId=production_order_id
+        )
+
+        # 5. Сохраняем
+        storage_util = get_storage(utilisation_tasks_path, s3_config)
+        stem = production_order_id[:-5] if production_order_id.lower().endswith('.json') else production_order_id
+        remote_path = f"{utilisation_tasks_path.rstrip('/')}/{stem}.json"
+
+        temp_local = Path(f"temp_util_rep_{stem}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(report.to_json())
+
+        logger.info(f"[*] Выгрузка задачи на отчет о нанесении в S3: {remote_path}")
+        storage_util.upload(str(temp_local), remote_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return production_order_id
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_utilisation_task_from_report: {e}")
+        return None
+
 def create_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None, production_order_id: str = None):
     """
     Создает задачу на отчет о нанесении на основе полученных кодов.
@@ -3367,6 +3475,7 @@ def main():
     parser.add_argument("--create-task", help="Создать задачу на эмиссию по productionOrderId")
     parser.add_argument("--send-task", help="Подписать и отправить задачу на эмиссию по productionOrderId")
     parser.add_argument("--create-utilisation", help="Создать задачу на отчет о нанесении по orderId (UUID)")
+    parser.add_argument("--create-utilisation-from-report", help="Создать задачу на отчет о нанесении на основе отчета оборудования по productionOrderId")
     parser.add_argument("--send-utilisation", help="Подписать и отправить отчет о нанесении по orderId (UUID)")
     parser.add_argument("--utilisation-status", help="Получить статус отчета о нанесении по orderId (UUID)")
     parser.add_argument("--create-aggregation", help="Создать отчет об агрегации для ЛК по UUID задания оборудования")
@@ -3488,6 +3597,14 @@ def main():
             logger.info(f"[+++] Задача на отчет о нанесении успешно создана для {result}")
         else:
             logger.error(f"[!] Не удалось создать задачу для {args.create_utilisation}")
+        return
+
+    if args.create_utilisation_from_report:
+        result = create_utilisation_task_from_report(args.create_utilisation_from_report, args.group)
+        if result:
+            logger.info(f"[+++] Задача на отчет о нанесении успешно создана для {result}")
+        else:
+            logger.error(f"[!] Не удалось создать задачу для {args.create_utilisation_from_report}")
         return
 
     if args.send_utilisation:
