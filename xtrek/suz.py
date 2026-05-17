@@ -17,6 +17,7 @@ from requests import HTTPError
 #import pyperclip
 import json
 import urllib3
+from urllib.parse import quote
 from typing import List, Dict, Any, Generator, Union
 from .suz_api_models import EmissionOrderreceipts
 from .org_manager import OrganizationManager
@@ -159,12 +160,11 @@ class SUZ:
         Отправить отчёт об использовании (нанесении) КМ (Метод 4.4.11)
         """
         url = f"{self.base_url}/api/v3/utilisation?omsId={self.omsId}"
-        extra_headers = {}
         if orderId:
-            extra_headers["orderId"] = orderId
+            url += f"&orderId={quote(orderId)}"
 
         try:
-            response = self._send_signed_request(url, body_file, signature_file, max_retries, extra_headers=extra_headers)
+            response = self._send_signed_request(url, body_file, signature_file, max_retries)
             if response and response.status_code == 200:
                 data = response.json()
                 return data.get('reportId', '')
