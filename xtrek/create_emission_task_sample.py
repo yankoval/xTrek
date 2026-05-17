@@ -3610,7 +3610,7 @@ def main():
     if args.send_utilisation:
         result = sign_and_send_utilisation(args.send_utilisation, args.signing_dir, args.timeout,
                                          oms_id=args.oms_id, client_token=args.client_token)
-        if result and not result.startswith('{') and 'Error' not in result:
+        if result and not str(result).startswith('{') and 'error' not in str(result).lower():
              logger.info(f"[+++] Отчет о нанесении успешно отправлен! ID: {result}")
         elif result:
             logger.error(f"[!] Ошибка отправки: {result}")
