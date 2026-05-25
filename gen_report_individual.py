@@ -5,7 +5,7 @@ Usage:
   python3 gen_report_individual.py                              # scan all non-finished
 Requires: suz_worker_config env var or ~/python-projects/suz_worker_config.json
 """
-import boto3, json, sys, os, re
+import boto3, json, sys, os, re, io, xlsxwriter
 from datetime import datetime, timezone
 
 cfg_path = os.environ.get('suz_worker_config', os.path.expanduser('~/python-projects/suz_worker_config.json'))
@@ -72,6 +72,8 @@ a{color:#0d6efd;text-decoration:none}a:hover{text-decoration:underline}
 .ft{text-align:center;color:#adb5bd;margin-top:8px;font-size:.75em}
 </style>'''
 
+# XLSX generation is done server-side in generate_kodes_xlsx() — no JS conversion needed.
+
 def ex(key):
     try: s3.head_object(Bucket=B, Key=key); return True
     except: return False
@@ -94,6 +96,40 @@ def st_html(lb,key,cls,meta,lvl='l0'):
 
 def kd_link(key,label):
     return f'<a href="{U}/{key}" target="_blank" class="kd-inline">\U0001F4E5 {label}</a>'
+
+def kd_xls_link(xlsx_key, label):
+    """Direct download link to pre-generated XLSX on S3 (via xlsxwriter, same as jsontoxlsx.py)."""
+    return f'<a href="{U}/{xlsx_key}" class="kd-inline" style="color:#0d6efd;margin-left:4px">\U0001F4CA {label}.xls</a>'
+
+def generate_kodes_xlsx(kd_data, bucket, xlsx_key):
+    """Read codes from kodes JSON, write XLSX via xlsxwriter, upload to S3."""
+    codes_raw = kd_data.get('codes', kd_data.get('productNumbersFull', []))
+    if not codes_raw:
+        return
+    output = io.BytesIO()
+    wb = xlsxwriter.Workbook(output, {'in_memory': True})
+    ws = wb.add_worksheet('Codes')
+    fmt_header = wb.add_format({'bold': True})
+    ws.write(0, 0, 'Номер КИ', fmt_header)
+    import re as _re
+    for i, raw in enumerate(codes_raw):
+        if not isinstance(raw, str):
+            continue
+        m = _re.search(r"01(\d{14})21([^\u001d]+)", raw)
+        if m:
+            code = f"01{m.group(1)}21{m.group(2)}"
+        else:
+            code = raw.replace('\u001d', '').strip()
+        ws.write(i + 1, 0, code)
+    wb.close()
+    output.seek(0)
+    try:
+        s3.put_object(Bucket=bucket, Key=xlsx_key,
+                      Body=output.getvalue(),
+                      ContentType='application/vnd.ms-excel')
+        print(f'  XLSX uploaded: {xlsx_key}')
+    except Exception as e:
+        print(f'  XLSX upload failed: {e}')
 
 def norm_name(raw):
     n = raw.strip().replace(P['eq'],'').replace('.json','')
@@ -192,7 +228,13 @@ for n,k,ch in r:
             s1 += st_html('Emission receipt',vk,'ok',f'orderId {oid_v[:16]}' if oid_v else 'no','l2'); oks1.append(True)
             if oid_v:
                 kk = f'{P["kd"]}{oid_v}.json'
-                if ex(kk): s1 += f'<div class="st ok l2"><span class="lb">Kodes</span><span>{kd_link(kk, f"V{vi+1} codes")}</span></div>'
+                if ex(kk):
+                    xlsx_key = f'{P["out"]}{n}_kodes_V{vi+1}.xls'
+                    if not ex(xlsx_key):
+                        try: generate_kodes_xlsx(rj(kk), B, xlsx_key)
+                        except Exception as xe: print(f'  XLSX gen failed: {xe}')
+                    else: print(f'  XLSX exists: {xlsx_key}')
+                    s1 += f'<div class="st ok l2"><span class="lb">Kodes</span><span>{kd_link(kk, f"V{vi+1} codes")} {kd_xls_link(xlsx_key, f"kodes_V{vi+1}")}</span></div>'
                 for lb,sf in [('Util task','ut'),('Util receipt','ur'),('Util report','up'),('Intro receipt','ir'),('Intro doc','iv')]:
                     kv = f'{P[sf]}{oid_v}.json'
                     if ex(kv):
@@ -228,7 +270,13 @@ for n,k,ch in r:
 
     if first_oid:
         kk = f'{P["kd"]}{first_oid}.json'
-        if ex(kk): s1 += f'<div class="st ok l1"><span class="lb">T Kodes</span><span>{kd_link(kk, "T-level codes")}</span></div>'
+        if ex(kk):
+            xlsx_key = f'{P["out"]}{n}_kodes_T-level.xls'
+            if not ex(xlsx_key):
+                try: generate_kodes_xlsx(rj(kk), B, xlsx_key)
+                except Exception as xe: print(f'  XLSX gen failed: {xe}')
+            else: print(f'  XLSX exists: {xlsx_key}')
+            s1 += f'<div class="st ok l1"><span class="lb">T Kodes</span><span>{kd_link(kk, "T-level codes")} {kd_xls_link(xlsx_key, "kodes_T-level")}</span></div>'
 
     s1s = 'ok' if all(oks1) else ('w' if any(oks1) else 'e')
     secs.append(('1. Equipment report & Attachments',s1s,s1)); all_ok.extend(oks1)
