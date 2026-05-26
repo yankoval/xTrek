@@ -336,34 +336,15 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
         return None
 
     # 2. Проверка статуса utilisation для кодов набора
-    emission_receipts_path = config.get('emission_receipts')
     utilisation_reports_path = config.get('utilisation_reports')
 
-    if not emission_receipts_path or not utilisation_reports_path:
-        logger.error("В конфигурации отсутствуют пути для квитанций эмиссии или отчетов об утилизации")
-        return None
-
-    # Получаем orderId набора
-    storage_receipts = get_storage(emission_receipts_path, s3_config)
-    receipt_file = f"{emission_receipts_path.rstrip('/')}/{production_order_id}.json"
-    if not storage_receipts.exists(receipt_file):
-        logger.error(f"Квитанция об эмиссии {receipt_file} не найдена")
-        return None
-
-    try:
-        receipt_data = json.loads(storage_receipts.read_text(receipt_file))
-        order_id = receipt_data.get('orderId')
-    except Exception as e:
-        logger.error(f"Ошибка чтения квитанции {receipt_file}: {e}")
-        return None
-
-    if not order_id:
-        logger.error(f"В квитанции {production_order_id} не найден orderId")
+    if not utilisation_reports_path:
+        logger.error("В конфигурации отсутствует путь для отчетов об утилизации")
         return None
 
     # Проверяем статус утилизации
     storage_util = get_storage(utilisation_reports_path, s3_config)
-    util_file = f"{utilisation_reports_path.rstrip('/')}/{order_id}.json"
+    util_file = f"{utilisation_reports_path.rstrip('/')}/{production_order_id}.json"
     if not storage_util.exists(util_file):
         logger.error(f"Отчет об утилизации {util_file} не найден")
         return None
@@ -371,17 +352,20 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
     try:
         util_data = json.loads(storage_util.read_text(util_file))
         if util_data.get('reportStatus') != 'SUCCESS':
-            logger.error(f"Статус утилизации для {order_id}: {util_data.get('reportStatus')} (ожидалось SUCCESS)")
+            logger.error(f"Статус утилизации для {production_order_id}: {util_data.get('reportStatus')} (ожидалось SUCCESS)")
             return None
     except Exception as e:
         logger.error(f"Ошибка чтения отчета об утилизации {util_file}: {e}")
         return None
 
     # 3. Проверка ввода в оборот для вложений
+    emission_receipts_path = config.get('emission_receipts')
     introduces_path = config.get('introduces')
-    if not introduces_path:
-        logger.error("В конфигурации отсутствует путь introduces")
+    if not introduces_path or not emission_receipts_path:
+        logger.error("В конфигурации отсутствуют пути emission_receipts или introduces")
         return None
+
+    storage_receipts = get_storage(emission_receipts_path, s3_config)
 
     # Получаем состав набора
     set_feed = nk.get_set_by_gtin(gtin)
@@ -524,17 +508,14 @@ def main():
     all_errors_details = {}
 
     for path, errors in results.items():
-        if isinstance(errors, str):
-            tag_value = errors
-        else:
-            tag_value = "-".join(sorted(errors.keys())) if errors else ""
+        tag_value = "-".join(sorted(errors.keys())) if errors else ""
 
         if len(results) > 1:
             print(f"{path}: {tag_value}")
         else:
             print(tag_value)
 
-        if errors and not isinstance(errors, str):
+        if errors:
             all_errors_details[path] = errors
 
     if all_errors_details:

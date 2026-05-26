@@ -45,13 +45,13 @@ def test_set_ready_check_success(mock_resources):
         # Mock AggregationAnalyzer.is_set
         with patch('xtrek.utils.AggregationAnalyzer.is_set', return_value=True):
 
-            # 2. Emission Receipt for set
-            storage_receipts.exists.side_effect = lambda p: True
-            storage_receipts.read_text.side_effect = lambda p: json.dumps({'orderId': 'SET_ORDER_123'})
-
-            # 3. Utilisation Report
+            # 2. Utilisation Report (found by production_order_id)
             storage_util.exists.return_value = True
             storage_util.read_text.return_value = json.dumps({'reportStatus': 'SUCCESS'})
+
+            # 3. Emission Receipt for components
+            storage_receipts.exists.side_effect = lambda p: True
+            storage_receipts.read_text.side_effect = lambda p: json.dumps({'orderId': 'COMP_ORDER_123'})
 
             # 4. Components introduction
             nk.get_set_by_gtin.return_value = {
@@ -98,10 +98,9 @@ def test_set_ready_check_fail_util_not_success(mock_resources):
             mock_get_storage.return_value = storage
             storage.exists.return_value = True
 
-            # Sequence of read_text calls: prod order, receipt, util report
+            # Sequence of read_text calls: prod order, util report
             storage.read_text.side_effect = [
                 json.dumps({'Gtin': '12345678901234'}),
-                json.dumps({'orderId': 'SET_ORDER_123'}),
                 json.dumps({'reportStatus': 'FAILED'})
             ]
 
