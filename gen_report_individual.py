@@ -391,7 +391,7 @@ for n,k,ch in r:
         sn=title.split()[0].rstrip('.')
         parts.append(f'{sn}:{dot(status)}')
     report_url = f'{U}/{P["out"]}{n}_report.html'
-    link = f'\033]8;;{report_url}\a{n[:80]}\033]8;;\a'
+    link = f'\033]8;;{report_url}\033\\{n[:80]}\033]8;;\033\\'
     parts.append(f'{C["ok"]}{link}{C["R"]}')
     print('  '+'  '.join(parts))
 
