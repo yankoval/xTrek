@@ -233,7 +233,6 @@ for n,k,ch in r:
                     if not ex(xlsx_key):
                         try: generate_kodes_xlsx(rj(kk), B, xlsx_key)
                         except Exception as xe: print(f'  XLSX gen failed: {xe}')
-                    else: print(f'  XLSX exists: {xlsx_key}')
                     s1 += f'<div class="st ok l2"><span class="lb">Kodes</span><span>{kd_link(kk, f"V{vi+1} codes")} {kd_xls_link(xlsx_key, f"kodes_V{vi+1}")}</span></div>'
                 for lb,sf in [('Util task','ut'),('Util receipt','ur'),('Util report','up'),('Intro receipt','ir'),('Intro doc','iv')]:
                     kv = f'{P[sf]}{oid_v}.json'
@@ -275,7 +274,6 @@ for n,k,ch in r:
             if not ex(xlsx_key):
                 try: generate_kodes_xlsx(rj(kk), B, xlsx_key)
                 except Exception as xe: print(f'  XLSX gen failed: {xe}')
-            else: print(f'  XLSX exists: {xlsx_key}')
             s1 += f'<div class="st ok l1"><span class="lb">T Kodes</span><span>{kd_link(kk, "T-level codes")} {kd_xls_link(xlsx_key, "kodes_T-level")}</span></div>'
 
     s1s = 'ok' if all(oks1) else ('w' if any(oks1) else 'e')
@@ -388,10 +386,13 @@ for n,k,ch in r:
     ts=''
     try: ts=s3.get_object(Bucket=B,Key=k)['LastModified'].astimezone().strftime('%Y-%m-%d %H:%M')
     except:pass
-    parts=[f'{C["ok"]}{n[:80]}{C["R"]}  {ts}']
+    parts=[f'{ts}']
     for title,status,_ in secs:
         sn=title.split()[0].rstrip('.')
         parts.append(f'{sn}:{dot(status)}')
+    report_url = f'{U}/{P["out"]}{n}_report.html'
+    link = f'\033]8;;{report_url}\a{n[:80]}\033]8;;\a'
+    parts.append(f'{C["ok"]}{link}{C["R"]}')
     print('  '+'  '.join(parts))
 
 print(f'Done: {len(r)} reports')
