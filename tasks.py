@@ -3,6 +3,7 @@ from celery import Celery
 from urllib.parse import quote
 
 # 1. Импорт вашей бизнес-логики
+from xtrek.config_loader import load_config
 from xtrek.create_emission_task_sample import (
     process_incoming_task, 
     create_equipment_aggregation_task, 
@@ -42,7 +43,19 @@ BROKER_URL = f'sqs://{ACCESS_KEY}:{safe_secret}@'
 
 app = Celery('tasks', broker=BROKER_URL)
 
-signing_dir = r"Y:\BatchPassToPrint\tst"
+# Загрузка конфигурации
+config = load_config('suz_worker_config')
+
+# Настройки бакетов
+INPUT_BUCKET = config.get('input_bucket', "1bf11148-3595-4a07-a089-d460153b7c7a")
+INTERNAL_BUCKET = config.get('internal_bucket', "20ab2a0c-2726-4ba1-9c7c-7deae82941ff")
+
+# Глобальные настройки для процессов
+PRODUCT_GROUP = config.get('product_group', "chemistry")
+CONTACT_PERSON = config.get('contact_person', "scan")
+
+# Директория для подписи
+signing_dir = config.get('sign', r"Y:\BatchPassToPrint\tst")
 
 app.conf.update(
     broker_transport_options={
@@ -62,7 +75,7 @@ app.conf.update(
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 1bf11148... / ПАПКА: Задания ---
 def logic_create_order(full_key):
-    group, contact = "chemistry", "scan"
+    group, contact = PRODUCT_GROUP, CONTACT_PERSON
     print(f"[LOGIC-0] Запуск создания заказа для: {full_key}")
     
     production_order_id = process_incoming_task(s3_full_key=full_key)
@@ -147,7 +160,7 @@ def logic_kodes(full_key):
     except Exception as e:
         print(e)
     # Создаем отчет о нанесении
-    result = create_virtual_utilisation_task(kodes_order_id, "chemistry")
+    result = create_virtual_utilisation_task(kodes_order_id, PRODUCT_GROUP)
     if not result:
         raise RuntimeError(f"create_virtual_utilisation_task failed for {kodes_order_id}")
     if type(result) is ProductionOrder:
@@ -179,12 +192,12 @@ def logic_utilisationReceipt(full_key):
     # Если документ относиться к виртуальному заданию на производство то запускаем создание сообщения о вводе в оборот
     if utilisationReceipt_id[0:2] == 'T-':
         return f"пропускаем создание сообщения о вводе в оборот для не виртуального{utilisationReceipt_id}"
-    result = create_virtual_introduce_task(utilisationReceipt_id, "chemistry")
+    result = create_virtual_introduce_task(utilisationReceipt_id, PRODUCT_GROUP)
     if not result:
         raise RuntimeError(f"create_virtual_introduce_task failed for {utilisationReceipt_id}")
     if type(result) is ProductionOrder:
         if result.virtual:
-            result = sign_and_send_introduce(utilisationReceipt_id, "chemistry", signing_dir, 120)
+            result = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
             if not result:
                 raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
 
@@ -204,7 +217,7 @@ def logic_update_introduce(full_key):
     
     print(f"[LOGIC-7] Запуск обновления статуса сообщения о вводе в оборот для ID: {introduceReceipt_id}")
     
-    result = update_introduce_status(introduceReceipt_id,"chemistry")
+    result = update_introduce_status(introduceReceipt_id, PRODUCT_GROUP)
     if not result:
         raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id} result:{result}")
     if isinstance(result, dict) and "error" in result:
@@ -218,6 +231,7 @@ def logic_update_introduce(full_key):
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: equipment-reports/ ---
 def logic_start_equipment_reports(full_key):
+    group = PRODUCT_GROUP
     print(f"[LOGIC-20] Запуск обработки equipment-reports: {full_key}")
     report_id = full_key.split('/')[-1].replace('.json', '') 
     if not report_id:
@@ -237,7 +251,7 @@ def logic_start_equipment_reports(full_key):
     
     # Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство
     print(f"Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство")
-    utResult = create_utilisation_task_from_report(report_id)
+    utResult = create_utilisation_task_from_report(report_id, group)
     if not utResult:
         print(f"Ошибка при попытке создания отчёта о нанесении по отчету оборудования f{report_id}. Продолжаем обработку. {utResult}")
     else:
@@ -260,7 +274,7 @@ def logic_start_equipment_reports(full_key):
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: productionOrders/ ---
 def logic_start_virtualProdTask_emission(full_key):
-    group, contact = "chemistry", "scan"
+    group, contact = PRODUCT_GROUP, CONTACT_PERSON
     print(f"[LOGIC-21] Запуск обработки productionOrders: {full_key}")
     production_order_id = full_key.split('/')[-1].replace('.json', '') 
     if not production_order_id:
@@ -277,13 +291,13 @@ def logic_start_virtualProdTask_emission(full_key):
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggReceipts/ ---
 def logic_update_agg(full_key):
-    group, contact = "chemistry", "scan"
+    group, contact = PRODUCT_GROUP, CONTACT_PERSON
     print(f"[LOGIC-92] Запуск обработки aggReceipts: {full_key}")
     production_order_id = full_key.split('/')[-1].replace('.json', '') 
     if not production_order_id:
         return f"No production_order_id found for {full_key}"
 
-    result = update_aggregation_status(production_order_id, "chemistry")
+    result = update_aggregation_status(production_order_id, group)
     if not result:
         raise RuntimeError(f"update_aggregation_status failed for {production_order_id} result:{result}")
     if isinstance(result, dict) and "error" in result:
@@ -304,8 +318,8 @@ def logic_update_agg(full_key):
     bind=True,
     acks_late=True,
     autoretry_for=(Exception,),
-    retry_kwargs={'max_retries': 10},
-    retry_backoff=60,          # 30,60,120,240,480,600...
+    retry_kwargs={'max_retries': 200}, # Увеличено до 200 для ожидания до 12+ часов
+    retry_backoff=60,                 # 60, 120, 240, 300...
     retry_backoff_max=300,
     retry_jitter=True
 )
@@ -321,44 +335,44 @@ def process_s3_event(self, data):
 
     try:
         # Условие №1: Создание заказа
-        if bucket == "1bf11148-3595-4a07-a089-d460153b7c7a" and key.startswith("Задания/"):
+        if bucket == INPUT_BUCKET and key.startswith("Задания/"):
             result = logic_create_order(full_key)
             print(f"[OK] {result}")
 
         # Условие №2: Подписание эмиссии
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("emissionOrders/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("emissionOrders/"):
             result = logic_sign_emission(full_key)
             print(f"[OK] {result}")
         # Условие №3: Обновление статуса эмиссии
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("emissionReceipts/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("emissionReceipts/"):
             result = logic_update_emission(full_key)
             print(f"[OK] {result}")
         # Условие №4: Получение кодов эмиссии
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("emissions/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("emissions/"):
             result = logic_get_emission_kodes(full_key)
             print(f"[OK] {result}")
         # Условие №5: Создание отчёта о нанесении
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("kodes/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("kodes/"):
             result = logic_kodes(full_key)
             print(f"[OK] {result}")
         # Условие №6: Создание отчёта о нанесении
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("utilisationReceipts/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("utilisationReceipts/"):
             result = logic_utilisationReceipt(full_key)
             print(f"[OK] {result}")
         # Условие №7: Обновление статуса отчёта о нанесении
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("introduceReceipts/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("introduceReceipts/"):
             result = logic_update_introduce(full_key)
             print(f"[OK] {result}")
         # Условие №20: Обработка отчета оборудования 
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("equipment-reports/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("equipment-reports/"):
             result = logic_start_equipment_reports(full_key)
             print(f"[OK] {result}")
         # Условие №21: Обработка виртуального заказа на производство
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("productionOrders/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("productionOrders/"):
             result = logic_start_virtualProdTask_emission(full_key)
             print(f"[OK] {result}")
         # Условие №92: Обработка чека об агрегации
-        elif bucket == "20ab2a0c-2726-4ba1-9c7c-7deae82941ff" and key.startswith("aggReceipts/"):
+        elif bucket == INTERNAL_BUCKET and key.startswith("aggReceipts/"):
             result = logic_update_agg(full_key)
             print(f"[OK] {result}")
 
