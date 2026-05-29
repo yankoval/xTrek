@@ -289,6 +289,143 @@ def check_aggregation_report(path: str, api: Optional[HonestSignAPI] = None, nk:
     analyzer = AggregationAnalyzer(api, nk, config)
     return analyzer.check_report(resolved_path)
 
+def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Optional[str]:
+    """
+    Проверяет готовность связанных документов для агрегации в набор.
+    Возвращает "setReady" в случае успеха и устанавливает тег check: "setReady".
+    Возвращает None в случае неудачи.
+    """
+    try:
+        resolved_path, api, nk, config = _ensure_resources(path, api, nk, config)
+    except Exception as e:
+        logger.error(f"Ошибка инициализации ресурсов для {path}: {e}")
+        return None
+
+    # Идентификатор заказа - имя файла без расширения
+    production_order_id = os.path.splitext(os.path.basename(resolved_path))[0]
+    s3_config = config.get('s3_config')
+
+    # 1. Проверка типа GTIN в производственном заказе
+    production_orders_path = config.get('production_orders_path')
+    if not production_orders_path:
+        logger.error("В конфигурации отсутствует production_orders_path")
+        return None
+
+    storage_prod = get_storage(production_orders_path, s3_config)
+    prod_file = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+    if not storage_prod.exists(prod_file):
+        logger.error(f"Производственный заказ {prod_file} не найден")
+        return None
+
+    try:
+        prod_data = json.loads(storage_prod.read_text(prod_file))
+    except Exception as e:
+        logger.error(f"Ошибка чтения заказа {prod_file}: {e}")
+        return None
+
+    gtin = prod_data.get('Gtin')
+    if not gtin:
+        logger.error(f"В заказе {production_order_id} не найден GTIN")
+        return None
+
+    # Проверка типа SET через NK
+    analyzer = AggregationAnalyzer(api, nk, config)
+    is_set_flag = analyzer.is_set(gtin)
+    if not is_set_flag:
+        logger.error(f"GTIN {gtin} не является набором (is_set={is_set_flag})")
+        return None
+
+    # 2. Проверка статуса utilisation для кодов набора
+    utilisation_reports_path = config.get('utilisation_reports')
+
+    if not utilisation_reports_path:
+        logger.error("В конфигурации отсутствует путь для отчетов об утилизации")
+        return None
+
+    # Проверяем статус утилизации
+    storage_util = get_storage(utilisation_reports_path, s3_config)
+    util_file = f"{utilisation_reports_path.rstrip('/')}/{production_order_id}.json"
+    if not storage_util.exists(util_file):
+        logger.error(f"Отчет об утилизации {util_file} не найден")
+        return None
+
+    try:
+        util_data = json.loads(storage_util.read_text(util_file))
+        if util_data.get('reportStatus') != 'SUCCESS':
+            logger.error(f"Статус утилизации для {production_order_id}: {util_data.get('reportStatus')} (ожидалось SUCCESS)")
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка чтения отчета об утилизации {util_file}: {e}")
+        return None
+
+    # 3. Проверка ввода в оборот для вложений
+    emission_receipts_path = config.get('emission_receipts')
+    introduces_path = config.get('introduces')
+    if not introduces_path or not emission_receipts_path:
+        logger.error("В конфигурации отсутствуют пути emission_receipts или introduces")
+        return None
+
+    storage_receipts = get_storage(emission_receipts_path, s3_config)
+
+    # Получаем состав набора
+    set_feed = nk.get_set_by_gtin(gtin)
+    if not set_feed or not set_feed.get('result'):
+        logger.error(f"Не удалось получить состав набора для {gtin}")
+        return None
+
+    set_gtins = set_feed['result'][0].get('set_gtins', [])
+    if not set_gtins:
+        logger.warning(f"Набор {gtin} не содержит вложений")
+
+    storage_intro = get_storage(introduces_path, s3_config)
+
+    for s in set_gtins:
+        comp_gtin = str(s['gtin']).strip().zfill(14)
+        comp_prod_id = f"V-{production_order_id}-{comp_gtin}"
+
+        # Получаем orderId компонента
+        comp_receipt_file = f"{emission_receipts_path.rstrip('/')}/{comp_prod_id}.json"
+        if not storage_receipts.exists(comp_receipt_file):
+            logger.error(f"Квитанция об эмиссии для компонента {comp_prod_id} не найдена")
+            return None
+
+        try:
+            comp_receipt_data = json.loads(storage_receipts.read_text(comp_receipt_file))
+            comp_order_id = comp_receipt_data.get('orderId')
+        except Exception as e:
+            logger.error(f"Ошибка чтения квитанции компонента {comp_receipt_file}: {e}")
+            return None
+
+        if not comp_order_id:
+            logger.error(f"В квитанции компонента {comp_prod_id} не найден orderId")
+            return None
+
+        # Проверяем статус ввода в оборот
+        intro_file = f"{introduces_path.rstrip('/')}/{comp_order_id}.json"
+        if not storage_intro.exists(intro_file):
+            logger.error(f"Документ ввода в оборот {intro_file} не найден")
+            return None
+
+        try:
+            intro_data = json.loads(storage_intro.read_text(intro_file))
+            target_obj = intro_data[0] if isinstance(intro_data, list) and len(intro_data) > 0 else intro_data
+            if target_obj.get('status') != 'CHECKED_OK':
+                logger.error(f"Статус ввода в оборот для компонента {comp_order_id}: {target_obj.get('status')} (ожидалось CHECKED_OK)")
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка чтения документа ввода в оборот {intro_file}: {e}")
+            return None
+
+    # Успех
+    try:
+        storage_rep = get_storage(resolved_path, s3_config)
+        storage_rep.set_tags(resolved_path, {'check': 'setReady'})
+        logger.info(f"Успешная проверка готовности для {production_order_id}. Тег check установлен в setReady")
+        return "setReady"
+    except Exception as e:
+        logger.error(f"Не удалось установить тег check для {resolved_path}: {e}")
+        return None
+
 def check_aggregation_reports(paths: List[str], api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Dict[str, Optional[Dict[str, List[str]]]]:
     """Функция-обертка для проверки списка отчетов."""
     results = {}
@@ -329,6 +466,7 @@ def main():
     parser.add_argument('--suz_worker_config', type=str, help='Путь к конфигурационному файлу suz_worker (для S3)')
     parser.add_argument('--debug', action='store_true', help="Включить DEBUG логирование")
     parser.add_argument('--full', action='store_true', help="Выводить полный список проблемных кодов на экран")
+    parser.add_argument('--set-ready', action='store_true', help="Проверить готовность к агрегации в набор")
 
     args = parser.parse_args()
 
@@ -356,12 +494,22 @@ def main():
         api = HonestSignAPI(token=token)
         nk = NK(token=token)
 
+    if args.set_ready:
+        for file_path in args.files:
+            res = set_ready_check(file_path, api, nk)
+            if len(args.files) > 1:
+                print(f"{file_path}: {res}")
+            else:
+                print(res or "")
+        return
+
     results = check_aggregation_reports(args.files, api, nk)
 
     all_errors_details = {}
 
     for path, errors in results.items():
         tag_value = "-".join(sorted(errors.keys())) if errors else ""
+
         if len(results) > 1:
             print(f"{path}: {tag_value}")
         else:
