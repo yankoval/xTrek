@@ -38,7 +38,7 @@ def get_gtin_from_code(code: str) -> Optional[str]:
         return code[2:16]
     return None
 
-MIN_SSCC_IN_AGG_REP_DEFAULT = 10
+MIN_SSCC_IN_AGG_REP_DEFAULT = 0
 
 class AggregationAnalyzer:
     def __init__(self, api: HonestSignAPI, nk: NK, config: Optional[Dict] = None):
