@@ -20,10 +20,19 @@ from xtrek.create_emission_task_sample import (
     create_virtual_tasks_from_equipment_report,
     create_utilisation_task_from_report,
     update_aggregation_status,
+    _find_production_order_id_by_suz_order_id,
+    create_equipment_set_report_from_report,
+    create_aggregation_set_report,
+    sign_and_send_aggregation_set,
+    update_aggregation_set_status,
+    create_aggregation_report,
+    sign_and_send_aggregation,
 )
 from xtrek.prn_util import generate_prn_files
 from xtrek.utils import (
         check_aggregation_reports,
+        set_ready_check,
+        check_aggregation_report,
         )
 from xtrek.suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
@@ -72,6 +81,39 @@ app.conf.update(
     worker_enable_remote_control=False,
     task_acks_late=True, # Подтверждаем удаление только после успеха
 )
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def trigger_set_aggregation_if_ready(parent_id):
+    """
+    Проверяет готовность набора и запускает процесс агрегации наборов.
+    """
+    print(f"[*] Проверка готовности набора для {parent_id}...")
+    # set_ready_check принимает путь к отчету оборудования.
+    # В xtrek/utils.py resolve_file_path достроит его если передать просто ID.
+    ready_status = set_ready_check(parent_id)
+
+    if ready_status == "setReady":
+        print(f"[+++] Набор {parent_id} готов к агрегации. Запуск процедур...")
+
+        # 1. Создаем отчет об агрегации наборов
+        res1 = create_equipment_set_report_from_report(parent_id)
+        if not res1:
+            raise RuntimeError(f"create_equipment_set_report_from_report failed for {parent_id}")
+
+        # 2. Создаем задачу на агрегацию наборов (в формате для ЛК)
+        res2 = create_aggregation_set_report(parent_id, PRODUCT_GROUP)
+        if not res2:
+            raise RuntimeError(f"create_aggregation_set_report failed for {parent_id}")
+
+        # 3. Подписываем и отправляем
+        res3 = sign_and_send_aggregation_set(parent_id, PRODUCT_GROUP, signing_dir, 120)
+        if not res3:
+            raise RuntimeError(f"sign_and_send_aggregation_set failed for {parent_id}")
+
+        return f"Set aggregation for {parent_id} started successfully"
+    else:
+        print(f"[*] Набор {parent_id} еще не готов к агрегации.")
+        return f"Set {parent_id} not ready yet"
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 1bf11148... / ПАПКА: Задания ---
 def logic_create_order(full_key):
@@ -189,9 +231,13 @@ def logic_utilisationReceipt(full_key):
         raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result:{result}")
     if result.reportStatus !="SUCCESS":
         raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result staus:{result.reportStatus}")
+
+    # Если это реальный заказ (набор), проверяем готовность к агрегации
+    if utilisationReceipt_id.startswith('T-'):
+        trigger_set_aggregation_if_ready(utilisationReceipt_id)
+        return f"Utilization report for set {utilisationReceipt_id} is SUCCESS, checked set readiness"
+
     # Если документ относиться к виртуальному заданию на производство то запускаем создание сообщения о вводе в оборот
-    if utilisationReceipt_id[0:2] == 'T-':
-        return f"пропускаем создание сообщения о вводе в оборот для не виртуального{utilisationReceipt_id}"
     result = create_virtual_introduce_task(utilisationReceipt_id, PRODUCT_GROUP)
     if not result:
         raise RuntimeError(f"create_virtual_introduce_task failed for {utilisationReceipt_id}")
@@ -225,6 +271,15 @@ def logic_update_introduce(full_key):
         raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id}  result:{result}")
     result = result[0] if isinstance(result, list) and len(result) > 0 else result
     if isinstance(result, dict) and result.get('status')== 'CHECKED_OK':
+        # Если это виртуальный компонент, пробуем запустить агрегацию набора
+        prod_id = _find_production_order_id_by_suz_order_id(introduceReceipt_id)
+        if prod_id and prod_id.startswith('V-'):
+            # Извлекаем parent_id из V-{parent_id}-{gtin}
+            parts = prod_id[2:].split('-')
+            if len(parts) > 1:
+                parent_id = "-".join(parts[:-1])
+                trigger_set_aggregation_if_ready(parent_id)
+
         return f"introduce status for {introduceReceipt_id} is {result.get('status')}"
     else:
         raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id} result:{result}")
@@ -289,6 +344,40 @@ def logic_start_virtualProdTask_emission(full_key):
     if not resultCEmT:
         raise RuntimeError(f"create_emission_task failed for {production_order_id}")
 
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggSetReceipts/ ---
+def logic_update_agg_set(full_key):
+    group = PRODUCT_GROUP
+    print(f"[LOGIC-93] Запуск обработки aggSetReceipts: {full_key}")
+    production_order_id = full_key.split('/')[-1].replace('.json', '')
+    if not production_order_id:
+        return f"No production_order_id found for {full_key}"
+
+    result = update_aggregation_set_status(production_order_id, group)
+    if not result:
+        raise RuntimeError(f"update_aggregation_set_status failed for {production_order_id} result:{result}")
+    if isinstance(result, dict) and "error" in result:
+        print("Ошибка API при запросе статуса")
+        raise RuntimeError(f"update_aggregation_set_status failed for {production_order_id} result:{result}")
+
+    result = result[0] if isinstance(result, list) and len(result) > 0 else result
+    if isinstance(result, dict) and result.get('status') == 'CHECKED_OK':
+        print(f"[+++] Агрегация наборов для {production_order_id} успешна. Запуск стандартной агрегации...")
+
+        # 1. Создаем отчет об агрегации (стандартный для ЛК)
+        res1 = create_aggregation_report(production_order_id)
+        if not res1:
+            raise RuntimeError(f"create_aggregation_report failed for {production_order_id}")
+
+        # 2. Подписываем и отправляем
+        res2 = sign_and_send_aggregation(production_order_id, group, signing_dir, 120)
+        if not res2:
+            raise RuntimeError(f"sign_and_send_aggregation failed for {production_order_id}")
+
+        return f"Standard aggregation for {production_order_id} started successfully"
+    else:
+        status = result.get('status') if isinstance(result, dict) else 'unknown'
+        raise RuntimeError(f"update_aggregation_set_status for {production_order_id} is {status}")
+
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggReceipts/ ---
 def logic_update_agg(full_key):
     group, contact = PRODUCT_GROUP, CONTACT_PERSON
@@ -304,12 +393,14 @@ def logic_update_agg(full_key):
         print("Ошибка API при запросе статуса")
         raise RuntimeError(f"update_aggregation_status failed for {production_order_id}  result:{result}")
     result = result[0] if isinstance(result, list) and len(result) > 0 else result
-    if isinstance(result, dict) and result.get('status')== 'CHECKED_OK':
-        # Проверяем отчет перед обработкой
-        result = check_aggregation_reports([production_order_id])
-        return f"aggregation status for {production_order_id} is {result.get('status')}"
+    if isinstance(result, dict) and result.get('status') == 'CHECKED_OK':
+        # Выполняем проверку отчета и установку тега check
+        print(f"[+++] Агрегация для {production_order_id} успешна. Проверка отчета...")
+        check_aggregation_report(production_order_id)
+        return f"aggregation status for {production_order_id} is CHECKED_OK, report checked and tagged"
     else:
-        raise RuntimeError(f"update_aggregation_status failed for {production_order_id} result:{result}")
+        status = result.get('status') if isinstance(result, dict) else 'unknown'
+        raise RuntimeError(f"update_aggregation_status failed for {production_order_id} result status:{status}")
 
 # --- ГЛАВНЫЙ ВОРКЕР (РОУТЕР) ---
 #@app.task(name='tasks.process_s3_event', bind=True)
@@ -374,6 +465,10 @@ def process_s3_event(self, data):
         # Условие №92: Обработка чека об агрегации
         elif bucket == INTERNAL_BUCKET and key.startswith("aggReceipts/"):
             result = logic_update_agg(full_key)
+            print(f"[OK] {result}")
+        # Условие №93: Обработка чека об агрегации наборов
+        elif bucket == INTERNAL_BUCKET and key.startswith("aggSetReceipts/"):
+            result = logic_update_agg_set(full_key)
             print(f"[OK] {result}")
 
         else:
