@@ -8,33 +8,42 @@ logger = logging.getLogger("ConfigLoader")
 def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
     """
     Загружает конфигурацию из файла.
-    Порядок поиска:
-    1. Переменная окружения env_name (по умолчанию TOKENS_CONFIG)
-    2. tokens_config.json в текущей директории
-    3. config.json в текущей директории
-    4. tokens_config.json в директории скрипта
-    5. config.json в директории скрипта
     """
     config_candidates = []
 
-    # 1. Переменная окружения
-    env_config = os.environ.get(env_name)
-    if env_config:
-        config_candidates.append(env_config)
+    # 1. Переменные окружения
+    for env in [env_name, 'suz_worker_config']:
+        val = os.environ.get(env)
+        if val:
+            if val.endswith('.json') and os.path.exists(val):
+                config_candidates.append(val)
+            elif not val.endswith('.json'):
+                try:
+                    config = json.loads(val)
+                    logger.info(f"Конфигурация загружена из переменной окружения {env}")
+                    return config
+                except:
+                    pass
 
-    # 2 & 3. В текущей директории
-    config_candidates.append('tokens_config.json')
-    config_candidates.append('config.json')
+    # 2. Файлы
+    candidates = ['tokens_config.json', 'suz_worker_config.json', 'config.json']
 
-    # 4 & 5. В директории скрипта
+    for c in candidates:
+        config_candidates.append(c)
+
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_candidates.append(os.path.join(script_dir, 'tokens_config.json'))
-        config_candidates.append(os.path.join(script_dir, 'config.json'))
+        for c in candidates:
+            config_candidates.append(os.path.join(script_dir, c))
     except Exception:
         pass
 
+    checked_paths = []
     for path in config_candidates:
+        abs_path = os.path.abspath(path)
+        if abs_path in checked_paths: continue
+        checked_paths.append(abs_path)
+
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8-sig') as f:
@@ -44,5 +53,5 @@ def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
             except Exception as e:
                 logger.error(f"Ошибка при чтении файла конфигурации {path}: {e}")
 
-    logger.warning("Файл конфигурации не найден. Будут использованы значения по умолчанию.")
+    logger.warning(f"Файл конфигурации не найден. Проверены пути: {checked_paths}")
     return {}

@@ -34,6 +34,15 @@ class TokenProcessor:
             org_manager (OrganizationManager, optional): Существующий менеджер организаций
         """
         self.config = load_config()
+        # Если в основном конфиге нет путей, пробуем загрузить suz_worker_config
+        if not self.config.get('tokens_path') or not self.config.get('s3_config'):
+            suz_config = load_config('suz_worker_config')
+            if suz_config:
+                # Обновляем только если в suz_config есть полезные данные
+                for key in ['tokens_path', 's3_config', 'orgs_path']:
+                    if key in suz_config and key not in self.config:
+                        self.config[key] = suz_config[key]
+
         self.s3_config = self.config.get('s3_config')
         self.tokens_path = self.config.get('tokens_path')
 
@@ -64,6 +73,7 @@ class TokenProcessor:
     def _sync_on_init(self):
         """Синхронизация при инициализации: если нет в S3 - выгружаем, если есть - загружаем."""
         if not self.storage or not self.tokens_path:
+            logger.warning(f"S3 хранилище для токенов не настроено (storage={bool(self.storage)}, tokens_path={self.tokens_path})")
             return
 
         try:
@@ -74,6 +84,9 @@ class TokenProcessor:
                 logger.info(f"Токены найдены в S3. Загрузка в {self.file_path}")
                 self.storage.download(self.tokens_path, self.file_path)
                 self.last_sync_time = datetime.now().timestamp()
+                # После загрузки обновляем данные в памяти
+                self.read_tokens_file()
+                self.process_tokens()
             elif local_exists:
                 logger.info(f"Токены не найдены в S3. Выгрузка локального файла {self.file_path} в S3")
                 self.storage.upload(self.file_path, self.tokens_path)
@@ -440,7 +453,7 @@ class TokenProcessor:
 
     def get_token_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
         """
-        Находит токен по полю INN
+        Находит токен по полю INN. Предпочтение отдается активным токенам.
 
         Args:
             inn (str): ИНН для поиска
@@ -453,10 +466,16 @@ class TokenProcessor:
         if not self.processed_tokens:
             self.process_tokens()
 
+        # Сначала ищем среди активных
+        active_tokens = self.get_active_tokens()
+        for token in active_tokens:
+            token_inn = token.get('inn')
+            if token_inn and str(token_inn) == str(inn):
+                return token
+
+        # Если активных нет, ищем любой
         for token in self.processed_tokens:
             token_inn = token.get('inn')
-
-            # Проверяем совпадение INN (как строка)
             if token_inn and str(token_inn) == str(inn):
                 return token
 
