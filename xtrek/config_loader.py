@@ -7,51 +7,70 @@ logger = logging.getLogger("ConfigLoader")
 
 def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
     """
-    Загружает конфигурацию из файла.
+    Загружает и объединяет конфигурацию из всех доступных источников.
+    Порядок приоритета (от низкого к высокому):
+    1. config.json
+    2. suz_worker_config.json
+    3. tokens_config.json
+    4. переменная suz_worker_config (файл или JSON)
+    5. переменная env_name (файл или JSON)
     """
-    config_candidates = []
+    merged_config = {}
 
-    # 1. Переменные окружения
-    for env in [env_name, 'suz_worker_config']:
-        val = os.environ.get(env)
-        if val:
-            if val.endswith('.json') and os.path.exists(val):
-                config_candidates.append(val)
-            elif not val.endswith('.json'):
-                try:
-                    config = json.loads(val)
-                    logger.info(f"Конфигурация загружена из переменной окружения {env}")
-                    return config
-                except:
-                    pass
-
-    # 2. Файлы
-    candidates = ['tokens_config.json', 'suz_worker_config.json', 'config.json']
-
-    for c in candidates:
-        config_candidates.append(c)
+    # 1. Сбор путей к файлам (от низкого приоритета к высокому)
+    candidates = ['config.json', 'suz_worker_config.json', 'tokens_config.json']
+    file_paths = []
 
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         for c in candidates:
-            config_candidates.append(os.path.join(script_dir, c))
-    except Exception:
-        pass
+            file_paths.append(os.path.join(script_dir, c))
+    except: pass
 
-    checked_paths = []
-    for path in config_candidates:
+    for c in candidates:
+        file_paths.append(c)
+
+    # Загружаем файлы в порядке приоритета
+    checked_paths = set()
+    for path in file_paths:
         abs_path = os.path.abspath(path)
         if abs_path in checked_paths: continue
-        checked_paths.append(abs_path)
+        checked_paths.add(abs_path)
 
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8-sig') as f:
-                    config = json.load(f)
-                    logger.info(f"Конфигурация загружена из: {path}")
-                    return config
+                    data = json.load(f)
+                    merged_config.update(data)
+                    logger.info(f"Конфигурация дополнена из файла: {path}")
             except Exception as e:
-                logger.error(f"Ошибка при чтении файла конфигурации {path}: {e}")
+                logger.error(f"Ошибка при чтении {path}: {e}")
 
-    logger.warning(f"Файл конфигурации не найден. Проверены пути: {checked_paths}")
-    return {}
+    # 2. Переменные окружения (имеют высший приоритет)
+    for env in ['suz_worker_config', env_name]:
+        val = os.environ.get(env)
+        if not val: continue
+
+        # Если путь к файлу
+        if val.endswith('.json') and os.path.exists(val):
+            try:
+                with open(val, 'r', encoding='utf-8-sig') as f:
+                    data = json.load(f)
+                    merged_config.update(data)
+                    logger.info(f"Конфигурация дополнена из файла (env {env}): {val}")
+            except Exception as e:
+                logger.error(f"Ошибка при чтении {val}: {e}")
+        else:
+            # Возможно сам JSON
+            try:
+                data = json.loads(val)
+                merged_config.update(data)
+                logger.info(f"Конфигурация дополнена из JSON (env {env})")
+            except:
+                # Если не JSON и не существующий файл - игнорируем
+                pass
+
+    if not merged_config:
+        logger.warning(f"Конфигурация не найдена. Проверены файлы: {list(checked_paths)}")
+
+    return merged_config

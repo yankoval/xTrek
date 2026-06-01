@@ -64,13 +64,6 @@ class OrganizationManager:
             os.makedirs(self.storage_dir)
             
         self.config = load_config()
-        # Если в основном конфиге нет путей, пробуем загрузить suz_worker_config
-        if not self.config.get('orgs_path') or not self.config.get('s3_config'):
-            suz_config = load_config('suz_worker_config')
-            if suz_config:
-                for key in ['orgs_path', 's3_config']:
-                    if key in suz_config and key not in self.config:
-                        self.config[key] = suz_config[key]
 
         self.s3_config = self.config.get('s3_config')
         self.orgs_path = self.config.get('orgs_path')

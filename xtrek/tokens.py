@@ -1,6 +1,6 @@
 import json
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 import re
 import os
@@ -34,17 +34,11 @@ class TokenProcessor:
             org_manager (OrganizationManager, optional): Существующий менеджер организаций
         """
         self.config = load_config()
-        # Если в основном конфиге нет путей, пробуем загрузить suz_worker_config
-        if not self.config.get('tokens_path') or not self.config.get('s3_config'):
-            suz_config = load_config('suz_worker_config')
-            if suz_config:
-                # Обновляем только если в suz_config есть полезные данные
-                for key in ['tokens_path', 's3_config', 'orgs_path']:
-                    if key in suz_config and key not in self.config:
-                        self.config[key] = suz_config[key]
 
         self.s3_config = self.config.get('s3_config')
         self.tokens_path = self.config.get('tokens_path')
+
+        logger.info(f"Конфигурация TokenProcessor: tokens_path={self.tokens_path}, s3_configured={bool(self.s3_config)}")
 
         self.last_sync_time = 0
         if self.tokens_path and self.tokens_path.startswith('s3://'):
@@ -83,14 +77,14 @@ class TokenProcessor:
             if s3_exists:
                 logger.info(f"Токены найдены в S3. Загрузка в {self.file_path}")
                 self.storage.download(self.tokens_path, self.file_path)
-                self.last_sync_time = datetime.now().timestamp()
+                self.last_sync_time = datetime.now(timezone.utc).timestamp()
                 # После загрузки обновляем данные в памяти
                 self.read_tokens_file()
                 self.process_tokens()
             elif local_exists:
                 logger.info(f"Токены не найдены в S3. Выгрузка локального файла {self.file_path} в S3")
                 self.storage.upload(self.file_path, self.tokens_path)
-                self.last_sync_time = datetime.now().timestamp()
+                self.last_sync_time = datetime.now(timezone.utc).timestamp()
             else:
                 logger.info("Токены не найдены ни в S3, ни локально.")
         except Exception as e:
@@ -102,7 +96,7 @@ class TokenProcessor:
                 if self.storage.exists(self.tokens_path):
                     logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
                     self.storage.download(self.tokens_path, self.file_path)
-                    self.last_sync_time = datetime.now().timestamp()
+                    self.last_sync_time = datetime.now(timezone.utc).timestamp()
                     # После загрузки обновляем данные в памяти
                     self.read_tokens_file()
                     self.process_tokens()
@@ -116,16 +110,24 @@ class TokenProcessor:
             try:
                 logger.info(f"Выгрузка токенов из {self.file_path} в {self.tokens_path}")
                 self.storage.upload(self.file_path, self.tokens_path)
-                self.last_sync_time = datetime.now().timestamp()
+                self.last_sync_time = datetime.now(timezone.utc).timestamp()
             except Exception as e:
                 logger.error(f"Ошибка синхронизации в S3: {e}")
 
-    def _maybe_sync_from_s3(self):
-        """Проверяет необходимость синхронизации на основе SYNC_INTERVAL."""
+    def _maybe_sync_from_s3(self, force=False):
+        """Проверяет необходимость синхронизации на основе SYNC_INTERVAL или флага force."""
         if not self.storage or not self.tokens_path:
             return
 
-        now = datetime.now().timestamp()
+        now = datetime.now(timezone.utc).timestamp()
+
+        # Если принудительно, разрешаем не чаще чем раз в 30 секунд
+        if force:
+            if now - self.last_sync_time > 30:
+                 logger.info("Принудительная синхронизация (токен не найден или просрочен)...")
+                 self._sync_from_s3()
+                 return
+
         if now - self.last_sync_time > SYNC_INTERVAL:
             logger.info("Прошло более SYNC_INTERVAL секунд. Синхронизация из S3...")
             self._sync_from_s3()
@@ -139,15 +141,28 @@ class TokenProcessor:
         return self.get_token_value_by_inn(inn, token_type='UUID')
 
     def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
-        """Возвращает только строку токена, если он найден и активен"""
+        """Возвращает только строку токена, если он найден и активен. Если активный не найден, пробует синхронизироваться с S3."""
         self._maybe_sync_from_s3()
 
+        token_value = self._find_active_token(inn, token_type, conid)
+
+        if not token_value:
+            # Если не нашли активный, пробуем синхронизироваться принудительно
+            self._maybe_sync_from_s3(force=True)
+            token_value = self._find_active_token(inn, token_type, conid)
+
+        return token_value
+
+    def _find_active_token(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
+        """Внутренний метод для поиска активного токена в памяти"""
         # Синонимы для UUID
         if token_type in ['auth', 'uuid']:
             token_type = 'UUID'
 
-        # Получаем все токены для данного ИНН
-        tokens = self.get_tokens_by_inn_list([inn])
+        # Получаем все токены для данного ИНН (из уже загруженных в память)
+        inn_set = {str(inn)}
+        tokens = [t for t in self.processed_tokens if t.get('inn') and str(t.get('inn')) in inn_set]
+
         if not tokens:
             return None
 
@@ -162,12 +177,35 @@ class TokenProcessor:
             if not tokens_of_type:
                 return None
 
-        # Фильтруем активные токены
-        active_tokens_list = self.get_active_tokens()
-        # Создаем набор (set) токенов (значений) для быстрого поиска
-        active_values = {t.get('Токен') for t in active_tokens_list}
+        # Фильтруем активные токены (вычисляем активность на месте)
+        active_tokens_of_type = []
+        current_time = datetime.now(timezone.utc)
 
-        active_tokens_of_type = [t for t in tokens_of_type if t.get('Токен') in active_values]
+        for t in tokens_of_type:
+            is_active = False
+            expiry_str = t.get('ДействуетДо', '')
+            if expiry_str and expiry_str != '0001-01-01T00:00:00':
+                try:
+                    expiry_date = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                    if expiry_date.tzinfo is None:
+                        expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+                    if expiry_date >= current_time:
+                        is_active = True
+                except ValueError: pass
+
+            exp_timestamp = t.get('exp_timestamp')
+            if exp_timestamp:
+                try:
+                    exp_date = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
+                    if exp_date >= current_time:
+                        is_active = True
+                except: pass
+
+            if is_active:
+                active_tokens_of_type.append(t)
+            elif not expiry_str or expiry_str == '0001-01-01T00:00:00':
+                if not exp_timestamp:
+                    active_tokens_of_type.append(t)
 
         if not active_tokens_of_type:
             return None
@@ -180,7 +218,6 @@ class TokenProcessor:
                     reverse=True
                 )
             except Exception:
-                # В случае ошибки сортировки просто берем первый
                 pass
 
         return active_tokens_of_type[0].get('Токен')
@@ -403,7 +440,7 @@ class TokenProcessor:
             self.process_tokens()
 
         active_tokens = []
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
 
         for token in self.processed_tokens:
             # Проверяем несколько возможных источников информации о сроке действия
@@ -415,6 +452,8 @@ class TokenProcessor:
             if expiry_str and expiry_str != '0001-01-01T00:00:00':
                 try:
                     expiry_date = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                    if expiry_date.tzinfo is None:
+                        expiry_date = expiry_date.replace(tzinfo=timezone.utc)
                     if expiry_date >= current_time:
                         is_active_by_expiry = True
                 except ValueError:
@@ -427,8 +466,9 @@ class TokenProcessor:
 
             if exp_timestamp:
                 try:
-                    expiry_date = datetime.fromtimestamp(exp_timestamp)
-                    if expiry_date >= current_time:
+                    # exp в JWT - это UTC timestamp
+                    exp_date = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
+                    if exp_date >= current_time:
                         is_active_by_jwt = True
                 except (ValueError, TypeError):
                     pass
@@ -453,7 +493,8 @@ class TokenProcessor:
 
     def get_token_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
         """
-        Находит токен по полю INN. Предпочтение отдается активным токенам.
+        Находит токен по полю ИНН. Предпочтение отдается активным токенам.
+        Если активный токен не найден, пытается синхронизироваться с S3.
 
         Args:
             inn (str): ИНН для поиска
@@ -463,17 +504,28 @@ class TokenProcessor:
         """
         self._maybe_sync_from_s3()
 
+        token = self._find_best_token_in_memory(inn)
+
+        # Если нашли только неактивный или вообще ничего - пробуем форсировать синхронизацию
+        is_active = token in self.get_active_tokens() if token else False
+
+        if not is_active:
+            self._maybe_sync_from_s3(force=True)
+            token = self._find_best_token_in_memory(inn)
+
+        return token
+
+    def _find_best_token_in_memory(self, inn: str) -> Optional[Dict[str, Any]]:
+        """Внутренний метод для поиска лучшего (активного) токена в памяти"""
         if not self.processed_tokens:
             self.process_tokens()
 
-        # Сначала ищем среди активных
         active_tokens = self.get_active_tokens()
         for token in active_tokens:
             token_inn = token.get('inn')
             if token_inn and str(token_inn) == str(inn):
                 return token
 
-        # Если активных нет, ищем любой
         for token in self.processed_tokens:
             token_inn = token.get('inn')
             if token_inn and str(token_inn) == str(inn):
