@@ -13,6 +13,8 @@ from .config_loader import load_config
 # Настройка логирования
 logger = logging.getLogger("TokenProcessor")
 
+SYNC_INTERVAL = 600
+
 home_dir = Path.home()
 
 
@@ -35,6 +37,7 @@ class TokenProcessor:
         self.s3_config = self.config.get('s3_config')
         self.tokens_path = self.config.get('tokens_path')
 
+        self.last_sync_time = 0
         if self.tokens_path and self.tokens_path.startswith('s3://'):
             self.storage = get_storage(self.tokens_path, self.s3_config)
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
@@ -70,9 +73,11 @@ class TokenProcessor:
             if s3_exists:
                 logger.info(f"Токены найдены в S3. Загрузка в {self.file_path}")
                 self.storage.download(self.tokens_path, self.file_path)
+                self.last_sync_time = datetime.now().timestamp()
             elif local_exists:
                 logger.info(f"Токены не найдены в S3. Выгрузка локального файла {self.file_path} в S3")
                 self.storage.upload(self.file_path, self.tokens_path)
+                self.last_sync_time = datetime.now().timestamp()
             else:
                 logger.info("Токены не найдены ни в S3, ни локально.")
         except Exception as e:
@@ -84,6 +89,10 @@ class TokenProcessor:
                 if self.storage.exists(self.tokens_path):
                     logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
                     self.storage.download(self.tokens_path, self.file_path)
+                    self.last_sync_time = datetime.now().timestamp()
+                    # После загрузки обновляем данные в памяти
+                    self.read_tokens_file()
+                    self.process_tokens()
                 else:
                     logger.debug(f"Файл {self.tokens_path} отсутствует в S3, пропуск загрузки.")
             except Exception as e:
@@ -94,8 +103,19 @@ class TokenProcessor:
             try:
                 logger.info(f"Выгрузка токенов из {self.file_path} в {self.tokens_path}")
                 self.storage.upload(self.file_path, self.tokens_path)
+                self.last_sync_time = datetime.now().timestamp()
             except Exception as e:
                 logger.error(f"Ошибка синхронизации в S3: {e}")
+
+    def _maybe_sync_from_s3(self):
+        """Проверяет необходимость синхронизации на основе SYNC_INTERVAL."""
+        if not self.storage or not self.tokens_path:
+            return
+
+        now = datetime.now().timestamp()
+        if now - self.last_sync_time > SYNC_INTERVAL:
+            logger.info("Прошло более SYNC_INTERVAL секунд. Синхронизация из S3...")
+            self._sync_from_s3()
 
     def get_jwt_token_value_by_inn(self, inn: str) -> Optional[str]:
         """Обертка для получения JWT токена по ИНН"""
@@ -107,6 +127,8 @@ class TokenProcessor:
 
     def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Возвращает только строку токена, если он найден и активен"""
+        self._maybe_sync_from_s3()
+
         # Синонимы для UUID
         if token_type in ['auth', 'uuid']:
             token_type = 'UUID'
@@ -362,6 +384,8 @@ class TokenProcessor:
         Returns:
             List[Dict[str, Any]]: Список активных токенов
         """
+        self._maybe_sync_from_s3()
+
         if not self.processed_tokens:
             self.process_tokens()
 
@@ -424,6 +448,8 @@ class TokenProcessor:
         Returns:
             Optional[Dict[str, Any]]: Найденный токен или None
         """
+        self._maybe_sync_from_s3()
+
         if not self.processed_tokens:
             self.process_tokens()
 
@@ -446,6 +472,8 @@ class TokenProcessor:
         Returns:
             List[Dict[str, Any]]: Список найденных токенов
         """
+        self._maybe_sync_from_s3()
+
         if not self.processed_tokens:
             self.process_tokens()
 
@@ -501,48 +529,83 @@ class TokenProcessor:
 
     def save_token(self, token_value: str, conid: Optional[str] = None):
         """
-        Сохраняет или обновляет токен в базе tokens.json
+        Сохраняет или обновляет токен в базе tokens.json.
+        При сохранении удаляет все старые токены для того же ИНН и типа (и conid для UUID).
         """
+        # 1. Принудительная синхронизация перед сохранением для получения актуального состояния
+        if self.storage and self.tokens_path:
+            self._sync_from_s3()
+        else:
+            self.read_tokens_file()
+            self.process_tokens()
+
         now = datetime.now()
         # Формат 2026-04-07T17:07:12
         start_time = now.strftime("%Y-%m-%dT%H:%M:%S")
         end_time = (now + timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%S")
 
-        identifier = None
+        # Определяем параметры нового токена
+        new_token_type = 'НЕИЗВЕСТНО'
+        new_token_inn = None
+        new_token_identifier = None
+
         if self._is_jwt_token(token_value):
+            new_token_type = 'JWT'
             try:
                 payload = self._decode_jwt_payload(token_value)
                 fields = self._extract_jwt_fields(payload)
-                pid = fields.get('pid')
-                if pid:
-                    identifier = str(pid)
+                new_token_inn = str(fields.get('inn')) if fields.get('inn') else None
+                new_token_identifier = str(fields.get('pid')) if fields.get('pid') else None
             except Exception as e:
-                logger.error(f"Ошибка при извлечении pid из JWT: {e}")
-        else:
-            identifier = conid
+                logger.error(f"Ошибка при разборе нового JWT: {e}")
+        elif self._is_uuid_token(token_value):
+            new_token_type = 'UUID'
+            new_token_identifier = str(conid) if conid else None
+            if new_token_identifier:
+                org = self.org_manager.find(connection_id=new_token_identifier)
+                if org and org.inn:
+                    new_token_inn = str(org.inn)
 
-        if not identifier:
-             logger.warning("Не удалось определить идентификатор для сохранения токена.")
-             return
+        if not new_token_identifier:
+            logger.warning("Не удалось определить идентификатор для сохранения токена.")
+            return
 
         new_entry = {
-            "Идентификатор": identifier,
+            "Идентификатор": new_token_identifier,
             "Токен": token_value,
             "ДействуетС": start_time,
             "ДействуетДо": end_time,
             "ТокенОбновления": ""
         }
 
-        # Обновляем существующий или добавляем новый
-        updated = False
-        for i, token_data in enumerate(self.tokens):
-            if str(token_data.get("Идентификатор")) == str(identifier):
-                self.tokens[i] = new_entry
-                updated = True
-                break
+        # Определяем токены для удаления
+        tokens_to_remove_values = set()
+        for token_data in self.processed_tokens:
+            should_remove = False
+            token_inn = str(token_data.get('inn')) if token_data.get('inn') else None
+            token_type = token_data.get('ТипТокена')
+            token_id = str(token_data.get('Идентификатор'))
+            token_value = token_data.get('Токен')
 
-        if not updated:
-            self.tokens.append(new_entry)
+            # Логика удаления:
+            if token_inn and new_token_inn and token_inn == new_token_inn and token_type == new_token_type:
+                if new_token_type == 'JWT':
+                    # Для JWT удаляем всё с тем же ИНН
+                    should_remove = True
+                elif new_token_type == 'UUID' and token_id == new_token_identifier:
+                    # Для UUID (Auth) удаляем с тем же ИНН и тем же Conid
+                    should_remove = True
+            elif token_id == new_token_identifier:
+                # Если ИНН не определен, удаляем по Идентификатору (старое поведение)
+                should_remove = True
+
+            if should_remove and token_value:
+                tokens_to_remove_values.add(token_value)
+
+        # Фильтруем оригинальный список self.tokens
+        self.tokens = [t for t in self.tokens if t.get('Токен') not in tokens_to_remove_values]
+
+        self.tokens.append(new_entry)
 
         try:
             p = Path(self.file_path)
@@ -550,7 +613,7 @@ class TokenProcessor:
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, 'w', encoding='utf-8') as f:
                 json.dump(self.tokens, f, indent=4, ensure_ascii=False)
-            logger.info(f"Токен сохранен в базу с идентификатором: {identifier}")
+            logger.info(f"Токен сохранен в базу. Идентификатор: {new_token_identifier}, ИНН: {new_token_inn}, Тип: {new_token_type}")
             self._sync_to_s3()
         except Exception as e:
             logger.error(f"Ошибка записи в файл {self.file_path}: {e}")
