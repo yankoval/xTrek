@@ -37,10 +37,14 @@ class TokenProcessor:
         self.tokens_path = self.config.get('tokens_path')
 
         # Если tokens_path не задан, пробуем сконструировать его из бакета
-        if not self.tokens_path and self.s3_config:
-            bucket = self.config.get('internal_bucket') or self.s3_config.get('bucket')
+        if not self.tokens_path:
+            bucket = (self.config.get('internal_bucket') or
+                     self.config.get('input_bucket') or
+                     self.config.get('bucket') or
+                     (self.s3_config.get('bucket') if self.s3_config else None))
             if bucket:
                 self.tokens_path = f"s3://{bucket}/tokens.json"
+                logger.info(f"Сконструирован tokens_path из бакета {bucket}: {self.tokens_path}")
 
         logger.info(f"Конфигурация TokenProcessor: tokens_path={self.tokens_path}, s3_configured={bool(self.s3_config)}")
 
@@ -117,6 +121,7 @@ class TokenProcessor:
     def _maybe_sync_from_s3(self, force=False):
         """Проверяет необходимость синхронизации по дате изменения файла в S3."""
         if not self.storage or not self.tokens_path:
+            logger.debug(f"Пропуск синхронизации: storage={bool(self.storage)}, tokens_path={self.tokens_path}")
             return
 
         try:
@@ -464,32 +469,36 @@ class TokenProcessor:
 
             # 2. Проверяем поле 'exp' из JWT (если есть)
             exp_timestamp = token.get('exp_timestamp')
-            is_active_by_jwt = False
+            is_jwt_expired = False
+            has_jwt_exp = False
 
             if exp_timestamp:
+                has_jwt_exp = True
                 try:
                     # exp в JWT - это UTC timestamp
                     exp_date = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
-                    if exp_date >= current_time:
-                        is_active_by_jwt = True
+                    if exp_date < current_time:
+                        is_jwt_expired = True
                 except (ValueError, TypeError):
                     pass
 
-            # 3. Если есть хотя бы один признак активности, считаем токен активным
-            if is_active_by_expiry or is_active_by_jwt:
+            # 3. Решаем, активен ли токен
+            if has_jwt_exp and is_jwt_expired:
+                # Если JWT явно просрочен, он не активен
+                token['Активен'] = False
+            elif is_active_by_expiry or (has_jwt_exp and not is_jwt_expired):
+                # Если активен по любой из дат
                 token['Активен'] = True
                 active_tokens.append(token)
-            else:
-                # Если срок истек или не определен, проверяем по умолчанию
-                # Для токенов без указания срока действия считаем их активными
-                if not expiry_str or expiry_str == '0001-01-01T00:00:00':
-                    if not exp_timestamp:  # И нет JWT exp
-                        token['Активен'] = True  # Считаем активным по умолчанию
-                        active_tokens.append(token)
-                    else:
-                        token['Активен'] = False
+            elif not expiry_str or expiry_str == '0001-01-01T00:00:00':
+                # Если дат нет вообще
+                if not has_jwt_exp:
+                    token['Активен'] = True
+                    active_tokens.append(token)
                 else:
                     token['Активен'] = False
+            else:
+                token['Активен'] = False
 
         return active_tokens
 
@@ -506,9 +515,12 @@ class TokenProcessor:
         self._maybe_sync_from_s3()
         token = self._find_best_token_in_memory(inn)
 
-        # Если не нашли токен, попробуем еще раз проверить S3
-        if not token:
-            logger.info(f"Токен для ИНН {inn} не найден в памяти. Проверка обновлений в S3...")
+        # Если не нашли токен или он не активен, попробуем еще раз проверить S3
+        active_tokens = self.get_active_tokens()
+        is_active = token in active_tokens if token else False
+
+        if not token or not is_active:
+            logger.info(f"Активный токен для ИНН {inn} не найден в памяти. Проверка обновлений в S3...")
             self._maybe_sync_from_s3(force=True)
             token = self._find_best_token_in_memory(inn)
 
