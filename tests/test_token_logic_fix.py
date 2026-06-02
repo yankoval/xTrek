@@ -2,9 +2,9 @@ import json
 import os
 import pytest
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
-from xtrek.tokens import TokenProcessor, SYNC_INTERVAL
+from xtrek.tokens import TokenProcessor
 
 @pytest.fixture
 def temp_tokens_file(tmp_path):
@@ -18,30 +18,44 @@ def temp_orgs_dir(tmp_path):
     d.mkdir()
     return d
 
-def test_sync_interval_caching(temp_tokens_file, temp_orgs_dir):
+def test_date_based_sync(temp_tokens_file, temp_orgs_dir):
     with patch('xtrek.tokens.get_storage') as mock_get_storage, \
          patch('xtrek.tokens.load_config', return_value={'tokens_path': 's3://bucket/tokens.json'}):
 
-        mock_storage = MagicMock()
-        mock_get_storage.return_value = mock_storage
-        mock_storage.exists.return_value = True
+        mock_s3_storage = MagicMock()
+        mock_local_storage = MagicMock()
+
+        def get_storage_side_effect(path, config=None):
+            if str(path).startswith('s3://'):
+                return mock_s3_storage
+            return mock_local_storage
+
+        mock_get_storage.side_effect = get_storage_side_effect
+
+        # Initial setup: S3 is newer
+        s3_time = datetime.now(timezone.utc)
+        local_time = s3_time - timedelta(minutes=10)
+
+        mock_s3_storage.get_info.return_value = {'LastModified': s3_time, 'Size': 100}
+        mock_local_storage.get_info.return_value = {'LastModified': local_time, 'Size': 50}
 
         tp = TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir))
 
         # Initial sync happened in __init__ -> _sync_on_init
-        assert mock_storage.download.call_count == 1
+        assert mock_s3_storage.download.called
 
-        # Call get_token_value_by_inn
+        # Reset mock to test get_token_value_by_inn
+        mock_s3_storage.download.reset_mock()
+
+        # Now make S3 even newer
+        new_s3_time = s3_time + timedelta(minutes=5)
+        mock_s3_storage.get_info.return_value = {'LastModified': new_s3_time, 'Size': 100}
+        # local_info stays at s3_time (simulated)
+        mock_local_storage.get_info.return_value = {'LastModified': s3_time, 'Size': 100}
+
         tp.get_token_value_by_inn("12345")
-        # Should not sync because last_sync_time is fresh
-        assert mock_storage.download.call_count == 1
-
-        # Simulate time passage
-        tp.last_sync_time -= (SYNC_INTERVAL + 1)
-
-        tp.get_token_value_by_inn("12345")
-        # Should sync now
-        assert mock_storage.download.call_count == 2
+        # Should sync because S3 is newer
+        assert mock_s3_storage.download.called
 
 def test_save_token_removes_duplicates_jwt(temp_tokens_file, temp_orgs_dir):
     # Setup: one existing JWT token for INN 12345

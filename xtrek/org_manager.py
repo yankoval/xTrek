@@ -68,6 +68,16 @@ class OrganizationManager:
         self.s3_config = self.config.get('s3_config')
         self.orgs_path = self.config.get('orgs_path')
 
+        # Если orgs_path не задан, пробуем сконструировать его из бакета
+        if not self.orgs_path:
+            bucket = (self.config.get('internal_bucket') or
+                     self.config.get('input_bucket') or
+                     self.config.get('bucket') or
+                     (self.s3_config.get('bucket') if self.s3_config else None))
+            if bucket:
+                self.orgs_path = f"s3://{bucket}/my_orgs/"
+                logger.info(f"Сконструирован orgs_path из бакета {bucket}: {self.orgs_path}")
+
         if self.orgs_path and self.orgs_path.startswith('s3://'):
             self.storage = get_storage(self.orgs_path, self.s3_config)
             logger.info(f"Инициализирован S3 storage для организаций: {self.orgs_path}")
