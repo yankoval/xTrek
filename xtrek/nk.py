@@ -230,6 +230,7 @@ def main():
     parser.add_argument("--linked-limit", type=int, default=1000, help="Размер страницы для постраничной выгрузки linked-gtins (макс. 10000)")
     parser.add_argument("--linked-output", help="Файл для сохранения результатов linked-gtins (по умолчанию: linked_gtins_<timestamp>.csv)")
     parser.add_argument("--log-file", help=f"Файл для сохранения логов (по умолчанию: {default_log_file})")
+    parser.add_argument("--suz_worker_config", help="Путь к конфигурационному файлу suz_worker")
     parser.add_argument("--owngtins", action="store_true", help="получить ВЕСЬ список собственных GTIN (постранично)")
     parser.add_argument("--find-token-by-inn", help="Найти токен по ИНН ")
 
@@ -238,6 +239,9 @@ def main():
     # Настраиваем логирование
     log_file = args.log_file if args.log_file else default_log_file
     setup_logging(log_file)
+
+    if args.suz_worker_config:
+        os.environ['suz_worker_config'] = args.suz_worker_config
 
     try:
         tokenInn  = args.find_token_by_inn if args.find_token_by_inn else os.getenv("FIND_TOKEN_BY_INN")

@@ -1,6 +1,6 @@
 import json
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 import re
 import os
@@ -12,6 +12,8 @@ from .config_loader import load_config
 
 # Настройка логирования
 logger = logging.getLogger("TokenProcessor")
+
+SYNC_INTERVAL = 600
 
 home_dir = Path.home()
 
@@ -32,9 +34,13 @@ class TokenProcessor:
             org_manager (OrganizationManager, optional): Существующий менеджер организаций
         """
         self.config = load_config()
+
         self.s3_config = self.config.get('s3_config')
         self.tokens_path = self.config.get('tokens_path')
 
+        logger.info(f"Конфигурация TokenProcessor: tokens_path={self.tokens_path}, s3_configured={bool(self.s3_config)}")
+
+        self.last_sync_time = 0
         if self.tokens_path and self.tokens_path.startswith('s3://'):
             self.storage = get_storage(self.tokens_path, self.s3_config)
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
@@ -61,6 +67,7 @@ class TokenProcessor:
     def _sync_on_init(self):
         """Синхронизация при инициализации: если нет в S3 - выгружаем, если есть - загружаем."""
         if not self.storage or not self.tokens_path:
+            logger.warning(f"S3 хранилище для токенов не настроено (storage={bool(self.storage)}, tokens_path={self.tokens_path})")
             return
 
         try:
@@ -70,9 +77,14 @@ class TokenProcessor:
             if s3_exists:
                 logger.info(f"Токены найдены в S3. Загрузка в {self.file_path}")
                 self.storage.download(self.tokens_path, self.file_path)
+                self.last_sync_time = datetime.now(timezone.utc).timestamp()
+                # После загрузки обновляем данные в памяти
+                self.read_tokens_file()
+                self.process_tokens()
             elif local_exists:
                 logger.info(f"Токены не найдены в S3. Выгрузка локального файла {self.file_path} в S3")
                 self.storage.upload(self.file_path, self.tokens_path)
+                self.last_sync_time = datetime.now(timezone.utc).timestamp()
             else:
                 logger.info("Токены не найдены ни в S3, ни локально.")
         except Exception as e:
@@ -84,6 +96,10 @@ class TokenProcessor:
                 if self.storage.exists(self.tokens_path):
                     logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
                     self.storage.download(self.tokens_path, self.file_path)
+                    self.last_sync_time = datetime.now(timezone.utc).timestamp()
+                    # После загрузки обновляем данные в памяти
+                    self.read_tokens_file()
+                    self.process_tokens()
                 else:
                     logger.debug(f"Файл {self.tokens_path} отсутствует в S3, пропуск загрузки.")
             except Exception as e:
@@ -94,8 +110,27 @@ class TokenProcessor:
             try:
                 logger.info(f"Выгрузка токенов из {self.file_path} в {self.tokens_path}")
                 self.storage.upload(self.file_path, self.tokens_path)
+                self.last_sync_time = datetime.now(timezone.utc).timestamp()
             except Exception as e:
                 logger.error(f"Ошибка синхронизации в S3: {e}")
+
+    def _maybe_sync_from_s3(self, force=False):
+        """Проверяет необходимость синхронизации на основе SYNC_INTERVAL или флага force."""
+        if not self.storage or not self.tokens_path:
+            return
+
+        now = datetime.now(timezone.utc).timestamp()
+
+        # Если принудительно, разрешаем не чаще чем раз в 30 секунд
+        if force:
+            if now - self.last_sync_time > 30:
+                 logger.info("Принудительная синхронизация (токен не найден или просрочен)...")
+                 self._sync_from_s3()
+                 return
+
+        if now - self.last_sync_time > SYNC_INTERVAL:
+            logger.info("Прошло более SYNC_INTERVAL секунд. Синхронизация из S3...")
+            self._sync_from_s3()
 
     def get_jwt_token_value_by_inn(self, inn: str) -> Optional[str]:
         """Обертка для получения JWT токена по ИНН"""
@@ -106,13 +141,28 @@ class TokenProcessor:
         return self.get_token_value_by_inn(inn, token_type='UUID')
 
     def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
-        """Возвращает только строку токена, если он найден и активен"""
+        """Возвращает только строку токена, если он найден и активен. Если активный не найден, пробует синхронизироваться с S3."""
+        self._maybe_sync_from_s3()
+
+        token_value = self._find_active_token(inn, token_type, conid)
+
+        if not token_value:
+            # Если не нашли активный, пробуем синхронизироваться принудительно
+            self._maybe_sync_from_s3(force=True)
+            token_value = self._find_active_token(inn, token_type, conid)
+
+        return token_value
+
+    def _find_active_token(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
+        """Внутренний метод для поиска активного токена в памяти"""
         # Синонимы для UUID
         if token_type in ['auth', 'uuid']:
             token_type = 'UUID'
 
-        # Получаем все токены для данного ИНН
-        tokens = self.get_tokens_by_inn_list([inn])
+        # Получаем все токены для данного ИНН (из уже загруженных в память)
+        inn_set = {str(inn)}
+        tokens = [t for t in self.processed_tokens if t.get('inn') and str(t.get('inn')) in inn_set]
+
         if not tokens:
             return None
 
@@ -127,12 +177,35 @@ class TokenProcessor:
             if not tokens_of_type:
                 return None
 
-        # Фильтруем активные токены
-        active_tokens_list = self.get_active_tokens()
-        # Создаем набор (set) токенов (значений) для быстрого поиска
-        active_values = {t.get('Токен') for t in active_tokens_list}
+        # Фильтруем активные токены (вычисляем активность на месте)
+        active_tokens_of_type = []
+        current_time = datetime.now(timezone.utc)
 
-        active_tokens_of_type = [t for t in tokens_of_type if t.get('Токен') in active_values]
+        for t in tokens_of_type:
+            is_active = False
+            expiry_str = t.get('ДействуетДо', '')
+            if expiry_str and expiry_str != '0001-01-01T00:00:00':
+                try:
+                    expiry_date = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                    if expiry_date.tzinfo is None:
+                        expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+                    if expiry_date >= current_time:
+                        is_active = True
+                except ValueError: pass
+
+            exp_timestamp = t.get('exp_timestamp')
+            if exp_timestamp:
+                try:
+                    exp_date = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
+                    if exp_date >= current_time:
+                        is_active = True
+                except: pass
+
+            if is_active:
+                active_tokens_of_type.append(t)
+            elif not expiry_str or expiry_str == '0001-01-01T00:00:00':
+                if not exp_timestamp:
+                    active_tokens_of_type.append(t)
 
         if not active_tokens_of_type:
             return None
@@ -145,7 +218,6 @@ class TokenProcessor:
                     reverse=True
                 )
             except Exception:
-                # В случае ошибки сортировки просто берем первый
                 pass
 
         return active_tokens_of_type[0].get('Токен')
@@ -362,11 +434,13 @@ class TokenProcessor:
         Returns:
             List[Dict[str, Any]]: Список активных токенов
         """
+        self._maybe_sync_from_s3()
+
         if not self.processed_tokens:
             self.process_tokens()
 
         active_tokens = []
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
 
         for token in self.processed_tokens:
             # Проверяем несколько возможных источников информации о сроке действия
@@ -378,6 +452,8 @@ class TokenProcessor:
             if expiry_str and expiry_str != '0001-01-01T00:00:00':
                 try:
                     expiry_date = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                    if expiry_date.tzinfo is None:
+                        expiry_date = expiry_date.replace(tzinfo=timezone.utc)
                     if expiry_date >= current_time:
                         is_active_by_expiry = True
                 except ValueError:
@@ -390,8 +466,9 @@ class TokenProcessor:
 
             if exp_timestamp:
                 try:
-                    expiry_date = datetime.fromtimestamp(exp_timestamp)
-                    if expiry_date >= current_time:
+                    # exp в JWT - это UTC timestamp
+                    exp_date = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
+                    if exp_date >= current_time:
                         is_active_by_jwt = True
                 except (ValueError, TypeError):
                     pass
@@ -416,7 +493,8 @@ class TokenProcessor:
 
     def get_token_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
         """
-        Находит токен по полю INN
+        Находит токен по полю ИНН. Предпочтение отдается активным токенам.
+        Если активный токен не найден, пытается синхронизироваться с S3.
 
         Args:
             inn (str): ИНН для поиска
@@ -424,13 +502,32 @@ class TokenProcessor:
         Returns:
             Optional[Dict[str, Any]]: Найденный токен или None
         """
+        self._maybe_sync_from_s3()
+
+        token = self._find_best_token_in_memory(inn)
+
+        # Если нашли только неактивный или вообще ничего - пробуем форсировать синхронизацию
+        is_active = token in self.get_active_tokens() if token else False
+
+        if not is_active:
+            self._maybe_sync_from_s3(force=True)
+            token = self._find_best_token_in_memory(inn)
+
+        return token
+
+    def _find_best_token_in_memory(self, inn: str) -> Optional[Dict[str, Any]]:
+        """Внутренний метод для поиска лучшего (активного) токена в памяти"""
         if not self.processed_tokens:
             self.process_tokens()
 
+        active_tokens = self.get_active_tokens()
+        for token in active_tokens:
+            token_inn = token.get('inn')
+            if token_inn and str(token_inn) == str(inn):
+                return token
+
         for token in self.processed_tokens:
             token_inn = token.get('inn')
-
-            # Проверяем совпадение INN (как строка)
             if token_inn and str(token_inn) == str(inn):
                 return token
 
@@ -446,6 +543,8 @@ class TokenProcessor:
         Returns:
             List[Dict[str, Any]]: Список найденных токенов
         """
+        self._maybe_sync_from_s3()
+
         if not self.processed_tokens:
             self.process_tokens()
 
@@ -501,48 +600,83 @@ class TokenProcessor:
 
     def save_token(self, token_value: str, conid: Optional[str] = None):
         """
-        Сохраняет или обновляет токен в базе tokens.json
+        Сохраняет или обновляет токен в базе tokens.json.
+        При сохранении удаляет все старые токены для того же ИНН и типа (и conid для UUID).
         """
+        # 1. Принудительная синхронизация перед сохранением для получения актуального состояния
+        if self.storage and self.tokens_path:
+            self._sync_from_s3()
+        else:
+            self.read_tokens_file()
+            self.process_tokens()
+
         now = datetime.now()
         # Формат 2026-04-07T17:07:12
         start_time = now.strftime("%Y-%m-%dT%H:%M:%S")
         end_time = (now + timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%S")
 
-        identifier = None
+        # Определяем параметры нового токена
+        new_token_type = 'НЕИЗВЕСТНО'
+        new_token_inn = None
+        new_token_identifier = None
+
         if self._is_jwt_token(token_value):
+            new_token_type = 'JWT'
             try:
                 payload = self._decode_jwt_payload(token_value)
                 fields = self._extract_jwt_fields(payload)
-                pid = fields.get('pid')
-                if pid:
-                    identifier = str(pid)
+                new_token_inn = str(fields.get('inn')) if fields.get('inn') else None
+                new_token_identifier = str(fields.get('pid')) if fields.get('pid') else None
             except Exception as e:
-                logger.error(f"Ошибка при извлечении pid из JWT: {e}")
-        else:
-            identifier = conid
+                logger.error(f"Ошибка при разборе нового JWT: {e}")
+        elif self._is_uuid_token(token_value):
+            new_token_type = 'UUID'
+            new_token_identifier = str(conid) if conid else None
+            if new_token_identifier:
+                org = self.org_manager.find(connection_id=new_token_identifier)
+                if org and org.inn:
+                    new_token_inn = str(org.inn)
 
-        if not identifier:
-             logger.warning("Не удалось определить идентификатор для сохранения токена.")
-             return
+        if not new_token_identifier:
+            logger.warning("Не удалось определить идентификатор для сохранения токена.")
+            return
 
         new_entry = {
-            "Идентификатор": identifier,
+            "Идентификатор": new_token_identifier,
             "Токен": token_value,
             "ДействуетС": start_time,
             "ДействуетДо": end_time,
             "ТокенОбновления": ""
         }
 
-        # Обновляем существующий или добавляем новый
-        updated = False
-        for i, token_data in enumerate(self.tokens):
-            if str(token_data.get("Идентификатор")) == str(identifier):
-                self.tokens[i] = new_entry
-                updated = True
-                break
+        # Определяем токены для удаления
+        tokens_to_remove_values = set()
+        for token_data in self.processed_tokens:
+            should_remove = False
+            token_inn = str(token_data.get('inn')) if token_data.get('inn') else None
+            token_type = token_data.get('ТипТокена')
+            token_id = str(token_data.get('Идентификатор'))
+            token_value = token_data.get('Токен')
 
-        if not updated:
-            self.tokens.append(new_entry)
+            # Логика удаления:
+            if token_inn and new_token_inn and token_inn == new_token_inn and token_type == new_token_type:
+                if new_token_type == 'JWT':
+                    # Для JWT удаляем всё с тем же ИНН
+                    should_remove = True
+                elif new_token_type == 'UUID' and token_id == new_token_identifier:
+                    # Для UUID (Auth) удаляем с тем же ИНН и тем же Conid
+                    should_remove = True
+            elif token_id == new_token_identifier:
+                # Если ИНН не определен, удаляем по Идентификатору (старое поведение)
+                should_remove = True
+
+            if should_remove and token_value:
+                tokens_to_remove_values.add(token_value)
+
+        # Фильтруем оригинальный список self.tokens
+        self.tokens = [t for t in self.tokens if t.get('Токен') not in tokens_to_remove_values]
+
+        self.tokens.append(new_entry)
 
         try:
             p = Path(self.file_path)
@@ -550,7 +684,7 @@ class TokenProcessor:
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, 'w', encoding='utf-8') as f:
                 json.dump(self.tokens, f, indent=4, ensure_ascii=False)
-            logger.info(f"Токен сохранен в базу с идентификатором: {identifier}")
+            logger.info(f"Токен сохранен в базу. Идентификатор: {new_token_identifier}, ИНН: {new_token_inn}, Тип: {new_token_type}")
             self._sync_to_s3()
         except Exception as e:
             logger.error(f"Ошибка записи в файл {self.file_path}: {e}")

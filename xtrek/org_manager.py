@@ -64,6 +64,7 @@ class OrganizationManager:
             os.makedirs(self.storage_dir)
             
         self.config = load_config()
+
         self.s3_config = self.config.get('s3_config')
         self.orgs_path = self.config.get('orgs_path')
 
@@ -80,6 +81,7 @@ class OrganizationManager:
     def _sync_on_init(self):
         """Двусторонняя синхронизация при инициализации."""
         if not self.storage or not self.orgs_path:
+            logger.warning(f"S3 хранилище для организаций не настроено (storage={bool(self.storage)}, orgs_path={self.orgs_path})")
             return
 
         try:
@@ -117,6 +119,8 @@ class OrganizationManager:
                     local_path = os.path.join(self.storage_dir, filename)
                     self.storage.download(remote_file, local_path)
                 logger.info(f"Загружено {len(remote_files)} файлов организаций.")
+                # Обновляем в памяти
+                self.sync_from_disk()
             except Exception as e:
                 logger.error(f"Ошибка синхронизации организаций из S3: {e}")
 
