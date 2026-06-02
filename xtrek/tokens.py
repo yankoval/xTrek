@@ -13,8 +13,6 @@ from .config_loader import load_config
 # Настройка логирования
 logger = logging.getLogger("TokenProcessor")
 
-SYNC_INTERVAL = 600
-
 home_dir = Path.home()
 
 
@@ -40,7 +38,6 @@ class TokenProcessor:
 
         logger.info(f"Конфигурация TokenProcessor: tokens_path={self.tokens_path}, s3_configured={bool(self.s3_config)}")
 
-        self.last_sync_time = 0
         if self.tokens_path and self.tokens_path.startswith('s3://'):
             self.storage = get_storage(self.tokens_path, self.s3_config)
             self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
@@ -71,20 +68,22 @@ class TokenProcessor:
             return
 
         try:
-            s3_exists = self.storage.exists(self.tokens_path)
-            local_exists = Path(self.file_path).exists()
+            s3_info = self.storage.get_info(self.tokens_path)
+            local_storage = get_storage(self.file_path)
+            local_info = local_storage.get_info(self.file_path)
 
-            if s3_exists:
-                logger.info(f"Токены найдены в S3. Загрузка в {self.file_path}")
-                self.storage.download(self.tokens_path, self.file_path)
-                self.last_sync_time = datetime.now(timezone.utc).timestamp()
-                # После загрузки обновляем данные в памяти
-                self.read_tokens_file()
-                self.process_tokens()
-            elif local_exists:
+            if s3_info:
+                if not local_info or s3_info['LastModified'] > local_info['LastModified']:
+                    logger.info(f"Токены найдены в S3 и они новее локальных. Загрузка в {self.file_path}")
+                    self.storage.download(self.tokens_path, self.file_path)
+                    # После загрузки обновляем данные в памяти
+                    self.read_tokens_file()
+                    self.process_tokens()
+                else:
+                    logger.info(f"Локальные токены актуальны ({local_info['LastModified']} >= {s3_info['LastModified']}).")
+            elif local_info:
                 logger.info(f"Токены не найдены в S3. Выгрузка локального файла {self.file_path} в S3")
                 self.storage.upload(self.file_path, self.tokens_path)
-                self.last_sync_time = datetime.now(timezone.utc).timestamp()
             else:
                 logger.info("Токены не найдены ни в S3, ни локально.")
         except Exception as e:
@@ -93,15 +92,11 @@ class TokenProcessor:
     def _sync_from_s3(self):
         if self.storage and self.tokens_path:
             try:
-                if self.storage.exists(self.tokens_path):
-                    logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
-                    self.storage.download(self.tokens_path, self.file_path)
-                    self.last_sync_time = datetime.now(timezone.utc).timestamp()
-                    # После загрузки обновляем данные в памяти
-                    self.read_tokens_file()
-                    self.process_tokens()
-                else:
-                    logger.debug(f"Файл {self.tokens_path} отсутствует в S3, пропуск загрузки.")
+                logger.info(f"Загрузка токенов из {self.tokens_path} в {self.file_path}")
+                self.storage.download(self.tokens_path, self.file_path)
+                # После загрузки обновляем данные в памяти
+                self.read_tokens_file()
+                self.process_tokens()
             except Exception as e:
                 logger.error(f"Ошибка синхронизации из S3: {e}")
 
@@ -110,27 +105,27 @@ class TokenProcessor:
             try:
                 logger.info(f"Выгрузка токенов из {self.file_path} в {self.tokens_path}")
                 self.storage.upload(self.file_path, self.tokens_path)
-                self.last_sync_time = datetime.now(timezone.utc).timestamp()
             except Exception as e:
                 logger.error(f"Ошибка синхронизации в S3: {e}")
 
     def _maybe_sync_from_s3(self, force=False):
-        """Проверяет необходимость синхронизации на основе SYNC_INTERVAL или флага force."""
+        """Проверяет необходимость синхронизации по дате изменения файла в S3."""
         if not self.storage or not self.tokens_path:
             return
 
-        now = datetime.now(timezone.utc).timestamp()
+        try:
+            s3_info = self.storage.get_info(self.tokens_path)
+            if not s3_info:
+                return
 
-        # Если принудительно, разрешаем не чаще чем раз в 30 секунд
-        if force:
-            if now - self.last_sync_time > 30:
-                 logger.info("Принудительная синхронизация (токен не найден или просрочен)...")
-                 self._sync_from_s3()
-                 return
+            local_storage = get_storage(self.file_path)
+            local_info = local_storage.get_info(self.file_path)
 
-        if now - self.last_sync_time > SYNC_INTERVAL:
-            logger.info("Прошло более SYNC_INTERVAL секунд. Синхронизация из S3...")
-            self._sync_from_s3()
+            if not local_info or s3_info['LastModified'] > local_info['LastModified']:
+                logger.info(f"S3 файл токенов новее локального ({s3_info['LastModified']} > {local_info['LastModified'] if local_info else 'None'}). Синхронизация...")
+                self._sync_from_s3()
+        except Exception as e:
+            logger.error(f"Ошибка при проверке необходимости синхронизации: {e}")
 
     def get_jwt_token_value_by_inn(self, inn: str) -> Optional[str]:
         """Обертка для получения JWT токена по ИНН"""
@@ -143,15 +138,7 @@ class TokenProcessor:
     def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Возвращает только строку токена, если он найден и активен. Если активный не найден, пробует синхронизироваться с S3."""
         self._maybe_sync_from_s3()
-
-        token_value = self._find_active_token(inn, token_type, conid)
-
-        if not token_value:
-            # Если не нашли активный, пробуем синхронизироваться принудительно
-            self._maybe_sync_from_s3(force=True)
-            token_value = self._find_active_token(inn, token_type, conid)
-
-        return token_value
+        return self._find_active_token(inn, token_type, conid)
 
     def _find_active_token(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Внутренний метод для поиска активного токена в памяти"""
@@ -494,7 +481,6 @@ class TokenProcessor:
     def get_token_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
         """
         Находит токен по полю ИНН. Предпочтение отдается активным токенам.
-        Если активный токен не найден, пытается синхронизироваться с S3.
 
         Args:
             inn (str): ИНН для поиска
@@ -503,17 +489,7 @@ class TokenProcessor:
             Optional[Dict[str, Any]]: Найденный токен или None
         """
         self._maybe_sync_from_s3()
-
-        token = self._find_best_token_in_memory(inn)
-
-        # Если нашли только неактивный или вообще ничего - пробуем форсировать синхронизацию
-        is_active = token in self.get_active_tokens() if token else False
-
-        if not is_active:
-            self._maybe_sync_from_s3(force=True)
-            token = self._find_best_token_in_memory(inn)
-
-        return token
+        return self._find_best_token_in_memory(inn)
 
     def _find_best_token_in_memory(self, inn: str) -> Optional[Dict[str, Any]]:
         """Внутренний метод для поиска лучшего (активного) токена в памяти"""

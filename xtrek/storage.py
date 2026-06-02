@@ -35,6 +35,9 @@ class BaseStorage:
     def get_tags(self, path):
         pass
 
+    def get_info(self, path):
+        pass
+
 class LocalStorage(BaseStorage):
     def list_files(self, path, pattern):
         p = Path(path)
@@ -149,6 +152,16 @@ class LocalStorage(BaseStorage):
             except Exception as e:
                 logger.error(f"Error reading tags file {tags_path}: {e}")
         return tags
+
+    def get_info(self, path):
+        p = Path(path)
+        if not p.exists():
+            return None
+        from datetime import datetime, timezone
+        return {
+            'LastModified': datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc),
+            'Size': p.stat().st_size
+        }
 
 class S3Storage(BaseStorage):
     def __init__(self, s3_config):
@@ -284,6 +297,19 @@ class S3Storage(BaseStorage):
         except Exception as e:
             logger.error(f"Error getting S3 tags: {e}")
             return {}
+
+    def get_info(self, path):
+        bucket, key = self._parse_s3_url(path)
+        try:
+            response = self.s3.head_object(Bucket=bucket, Key=key)
+            return {
+                'LastModified': response['LastModified'],
+                'Size': response['ContentLength'],
+                'ETag': response.get('ETag')
+            }
+        except Exception as e:
+            logger.debug(f"Error getting S3 info for {path}: {e}")
+            return None
 
 def get_storage(path, s3_config=None):
     if str(path).startswith('s3://'):
