@@ -36,6 +36,12 @@ class TokenProcessor:
         self.s3_config = self.config.get('s3_config')
         self.tokens_path = self.config.get('tokens_path')
 
+        # Если tokens_path не задан, пробуем сконструировать его из бакета
+        if not self.tokens_path and self.s3_config:
+            bucket = self.config.get('internal_bucket') or self.s3_config.get('bucket')
+            if bucket:
+                self.tokens_path = f"s3://{bucket}/tokens.json"
+
         logger.info(f"Конфигурация TokenProcessor: tokens_path={self.tokens_path}, s3_configured={bool(self.s3_config)}")
 
         if self.tokens_path and self.tokens_path.startswith('s3://'):
@@ -138,7 +144,16 @@ class TokenProcessor:
     def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Возвращает только строку токена, если он найден и активен. Если активный не найден, пробует синхронизироваться с S3."""
         self._maybe_sync_from_s3()
-        return self._find_active_token(inn, token_type, conid)
+        token = self._find_active_token(inn, token_type, conid)
+
+        # Если не нашли активный токен, попробуем еще раз проверить S3, возможно файл обновился прямо сейчас
+        if not token:
+            logger.info(f"Активный токен для ИНН {inn} не найден в памяти. Проверка обновлений в S3...")
+            # Передаем force=True чтобы игнорировать кэширование LastModified если оно будет добавлено
+            self._maybe_sync_from_s3(force=True)
+            token = self._find_active_token(inn, token_type, conid)
+
+        return token
 
     def _find_active_token(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Внутренний метод для поиска активного токена в памяти"""
@@ -489,7 +504,15 @@ class TokenProcessor:
             Optional[Dict[str, Any]]: Найденный токен или None
         """
         self._maybe_sync_from_s3()
-        return self._find_best_token_in_memory(inn)
+        token = self._find_best_token_in_memory(inn)
+
+        # Если не нашли токен, попробуем еще раз проверить S3
+        if not token:
+            logger.info(f"Токен для ИНН {inn} не найден в памяти. Проверка обновлений в S3...")
+            self._maybe_sync_from_s3(force=True)
+            token = self._find_best_token_in_memory(inn)
+
+        return token
 
     def _find_best_token_in_memory(self, inn: str) -> Optional[Dict[str, Any]]:
         """Внутренний метод для поиска лучшего (активного) токена в памяти"""
