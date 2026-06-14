@@ -14,7 +14,8 @@ from .suz_api_models import (
     EmissionOrderStatus, ProductionOrder, PasportData,
     UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
-    EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
+    EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument,
+    HierarchicalAggregationReport, HierarchicalAggregationUnit
 )
 from .kiz_from_rep import extract_and_flatten
 from .suz import SUZ
@@ -3357,6 +3358,378 @@ def update_aggregation_set_status(task_uuid: str, group: str):
         logger.error(f"[!] Ошибка в update_aggregation_set_status: {e}")
         return str(e)
 
+def create_setandagg_report(task_uuid: str, group: str, inn_override: str = None):
+    """
+    Создает комбинированный иерархический отчет об агрегации (Наборы + Короба)
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        equipment_tasks_path = config.get('equipment-tasks')
+        equipment_reports_path = config.get('equipment-reports')
+        equipment_set_reports_path = config.get('equipment_set_reports')
+        setandagg_tasks_path = config.get('setandagg-tasks')
+
+        if not all([equipment_tasks_path, equipment_reports_path, equipment_set_reports_path, setandagg_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути для setandagg")
+            return None
+
+        # 1. Загружаем задание оборудования (основное)
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        task_path = f"{equipment_tasks_path.rstrip('/')}/{task_uuid}.json"
+        if not storage_tasks.exists(task_path):
+            logger.error(f"[!] Задание оборудования не найдено: {task_path}")
+            return None
+
+        task_content = storage_tasks.read_text(task_path)
+        task_data = json.loads(task_content)
+        main_gtin = task_data.get('gtin')
+
+        # Определяем ИНН
+        inn = inn_override
+        if not inn:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            inn = get_inn_by_gtin(main_gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН для GTIN {main_gtin}")
+            return None
+
+        # 2. Находим основной отчет оборудования (Короба -> Наборы)
+        from urllib.parse import urlparse, unquote
+        signed_link = task_data.get('task-export-signed-link') or task_data.get('task_export_signed_link')
+        if not signed_link:
+            logger.error(f"[!] В задании {task_uuid} не найден ключ task-export-signed-link")
+            return None
+        parsed_url = urlparse(signed_link)
+        main_report_filename = unquote(os.path.basename(parsed_url.path))
+
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        main_report_path = f"{equipment_reports_path.rstrip('/')}/{main_report_filename}"
+        if not storage_reports.exists(main_report_path):
+            logger.error(f"[!] Основной отчет оборудования не найден: {main_report_path}")
+            return None
+        main_report_data = json.loads(storage_reports.read_text(main_report_path))
+
+        # 3. Загружаем отчет по наборам (Наборы -> Товары)
+        storage_set_reports = get_storage(equipment_set_reports_path, s3_config)
+        set_report_path = f"{equipment_set_reports_path.rstrip('/')}/{task_uuid}.json"
+        if not storage_set_reports.exists(set_report_path):
+            logger.error(f"[!] Отчет по наборам не найден: {set_report_path}")
+            return None
+        set_report_data = json.loads(storage_set_reports.read_text(set_report_path))
+
+        # Создаем индекс по кодам наборов для быстрого поиска
+        set_index = {}
+        for box in set_report_data.get('readyBox', []):
+            clean_set_sn = box['boxNumber'].split('\u001d')[0]
+            set_index[clean_set_sn] = box
+
+        # 4. Собираем иерархию
+        unit_sequences = []
+        for box in main_report_data.get('readyBox', []):
+            sscc = str(box['boxNumber'])
+            if len(sscc) == 18:
+                sscc = "00" + sscc
+
+            children = []
+            for set_code_full in box.get('productNumbersFull', []):
+                clean_set_sn = set_code_full.split('\u001d')[0]
+                set_box = set_index.get(clean_set_sn)
+                if not set_box:
+                    logger.warning(f"[*] Набор {clean_set_sn} не найден в отчете по наборам. Пропуск.")
+                    continue
+
+                clean_sntins = [c.split('\u001d')[0] for c in set_box.get('productNumbersFull', [])]
+
+                child_unit = HierarchicalAggregationUnit(
+                    unitSerialNumber=clean_set_sn,
+                    aggregationType="SET",
+                    sntins=clean_sntins
+                )
+                children.append(child_unit)
+
+            if not children:
+                logger.warning(f"[*] Короб {sscc} не содержит валидных вложений. Пропуск.")
+                continue
+
+            parent_unit = HierarchicalAggregationUnit(
+                unitSerialNumber=sscc,
+                aggregationType="AGGREGATION",
+                childer_sequences=children
+            )
+            unit_sequences.append(parent_unit)
+
+        if not unit_sequences:
+            logger.error(f"[!] Не удалось сформировать ни одной последовательности агрегации для {task_uuid}")
+            return None
+
+        final_report = HierarchicalAggregationReport(
+            participantId=inn,
+            unit_sequences=unit_sequences,
+            productGroup=group,
+            productionOrderId=task_uuid
+        )
+
+        # 5. Сохраняем
+        storage_agg = get_storage(setandagg_tasks_path, s3_config)
+        output_path = f"{setandagg_tasks_path.rstrip('/')}/{task_uuid}.json"
+
+        temp_local = Path(f"temp_setandagg_{task_uuid}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(final_report.to_json())
+
+        logger.info(f"[*] Выгрузка комбинированного отчета в S3: {output_path}")
+        storage_agg.upload(str(temp_local), output_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return task_uuid
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в create_setandagg_report: {e}")
+        return None
+
+def sign_and_send_setandagg(task_uuid: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False):
+    """
+    Подписывает и отправляет комбинированный отчет в ЛК ЧЗ
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        setandagg_tasks_path = config.get('setandagg-tasks')
+        setandagg_receipts_path = config.get('setandagg-receipts')
+
+        # Переопределяем параметры подписи из конфига если они есть
+        sign_path = config.get('sign')
+        if sign_path:
+            signing_dir = sign_path
+
+        timeout = config.get('SIGNING_TIMEOUT', timeout)
+
+        if not all([setandagg_tasks_path, setandagg_receipts_path]):
+            logger.error("[!] В конфигурации отсутствуют пути для setandagg-tasks или setandagg-receipts")
+            return None
+
+        # 1. Загружаем отчет и проверяем ИНН
+        storage_agg = get_storage(setandagg_tasks_path, s3_config)
+        report_path = f"{setandagg_tasks_path.rstrip('/')}/{task_uuid}.json"
+
+        if not storage_agg.exists(report_path):
+            logger.error(f"[!] Файл комбинированного отчета не найден: {report_path}")
+            return None
+
+        report_content = storage_agg.read_text(report_path)
+        report_data = json.loads(report_content)
+        inn = report_data.get('participantId')
+
+        if not inn:
+            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
+            return None
+
+        # 2. Токен
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+
+        token = None
+        if not refresh_token:
+            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            token = get_new_token(inn=inn, mode='jwt', timeout=timeout)
+            if token: token_processor.save_token(token)
+
+        if not token:
+            logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}")
+            return None
+
+        # 3. Подготовка к подписи
+        storage_sign = get_storage(signing_dir, s3_config)
+        unique_id = uuid.uuid4()
+        body_filename = f"{inn}_{unique_id}_setandagg.json"
+        signature_filename = f"{body_filename}.sig"
+
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+
+        # Локальные пути
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
+
+        try:
+            storage_sign.write_text(remote_body_path, report_content)
+            local_body_bytes = report_content if isinstance(report_content, bytes) else report_content.encode('utf-8')
+            with open(local_body_path, 'wb') as f:
+                f.write(local_body_bytes)
+
+            logger.info(f"[*] Ожидание подписи для {remote_body_path}...")
+            start_time = time.time()
+            while not storage_sign.exists(remote_signature_path):
+                if time.time() - start_time > timeout:
+                    logger.error("[!] Таймаут ожидания подписи.")
+                    return None
+                time.sleep(2)
+
+            time.sleep(0.5)
+            logger.info("[+] Подпись обнаружена в хранилище!")
+
+            doc_base64 = base64.b64encode(local_body_bytes).decode('utf-8')
+            storage_sign.download(remote_signature_path, str(local_signature_path))
+            with open(local_signature_path, 'r', encoding='utf-8') as f:
+                sig_base64 = f.read().strip()
+
+            wrapper = DocumentWrapper(
+                document_format="MANUAL",
+                product_document=doc_base64,
+                type="AGGREGATION_DOCUMENT",
+                signature=sig_base64
+            )
+
+            # Отправка через TrueAPI
+            api = HonestSignAPI(token=token)
+            result = api.documents_create(wrapper.to_json(), pg=group)
+
+            if result and "error" not in str(result).lower():
+                logger.info(f"[+++] Комбинированный отчет успешно отправлен! ID: {result}")
+
+                storage_receipts = get_storage(setandagg_receipts_path, s3_config)
+                remote_receipt_path = f"{setandagg_receipts_path.rstrip('/')}/{task_uuid}.json"
+
+                temp_receipt = local_dir / f"temp_receipt_setandagg_{task_uuid}.json"
+                if isinstance(result, str):
+                    result = {"document_id": result}
+                result["productionOrderId"] = task_uuid
+
+                with open(temp_receipt, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=4, ensure_ascii=False)
+
+                logger.info(f"[*] Выгрузка чека в S3: {remote_receipt_path}")
+                storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                try: temp_receipt.unlink()
+                except: pass
+
+                return result
+            else:
+                logger.error(f"[!] Ошибка отправки: {result}")
+                return result
+
+        finally:
+            if local_body_path.exists(): local_body_path.unlink()
+            if local_signature_path.exists(): local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except: pass
+            try:
+                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
+                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
+            except: pass
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в sign_and_send_setandagg: {e}")
+        return None
+
+def update_setandagg_status(task_uuid: str, group: str):
+    """
+    Получает актуальный статус комбинированного документа агрегации из ЛК ЧЗ.
+    """
+    try:
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        setandagg_receipts_path = config.get('setandagg-receipts')
+        setandagg_tasks_path = config.get('setandagg-tasks')
+        setandaggs_path = config.get('setandaggs')
+
+        if not all([setandagg_receipts_path, setandagg_tasks_path, setandaggs_path]):
+            logger.error("[!] В конфигурации отсутствуют пути для setandagg")
+            return None
+
+        # 1. Загружаем чек отправки
+        storage_receipts = get_storage(setandagg_receipts_path, s3_config)
+        receipt_path = f"{setandagg_receipts_path.rstrip('/')}/{task_uuid}.json"
+
+        if not storage_receipts.exists(receipt_path):
+            logger.error(f"[!] Чек отправки не найден: {receipt_path}")
+            return None
+
+        receipt_data = json.loads(storage_receipts.read_text(receipt_path))
+        doc_id = receipt_data.get('document_id')
+        production_order_id = receipt_data.get('productionOrderId')
+
+        if not doc_id:
+            logger.error(f"[!] В чеке {task_uuid} отсутствует document_id")
+            return None
+
+        # 2. Получаем ИНН из исходного отчета
+        storage_agg = get_storage(setandagg_tasks_path, s3_config)
+        report_path = f"{setandagg_tasks_path.rstrip('/')}/{task_uuid}.json"
+        if not storage_agg.exists(report_path):
+            logger.error(f"[!] Файл отчета не найден: {report_path}")
+            return None
+
+        report_data = json.loads(storage_agg.read_text(report_path))
+        inn = report_data.get('participantId')
+        if not production_order_id:
+            production_order_id = report_data.get('productionOrderId')
+
+        if not inn:
+            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
+            return None
+
+        # 3. Инициализация API
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            logger.error(f"[!] JWT токен для ИНН {inn} не найден.")
+            return None
+
+        api = HonestSignAPI(token=token)
+
+        # 4. Запрос статуса
+        logger.info(f"[*] Запрос статуса документа {doc_id} для {task_uuid}...")
+        status_res = api.doc(doc_id, pg=group)
+
+        if not status_res:
+            logger.error("[!] Пустой ответ от API.")
+            return None
+
+        # 5. Сохранение
+        storage_aggs = get_storage(setandaggs_path, s3_config)
+        output_status_path = f"{setandaggs_path.rstrip('/')}/{task_uuid}.json"
+
+        if isinstance(status_res, dict):
+            status_res["productionOrderId"] = production_order_id
+        elif isinstance(status_res, list) and len(status_res) > 0:
+            status_res[0]["productionOrderId"] = production_order_id
+
+        temp_local = Path(f"temp_setandagg_status_{task_uuid}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            json.dump(status_res, f, indent=4, ensure_ascii=False)
+
+        logger.info(f"[*] Сохранение статуса в {output_status_path}")
+        storage_aggs.upload(str(temp_local), output_status_path)
+
+        # Установка тегов статуса
+        target_obj = status_res[0] if isinstance(status_res, list) and len(status_res) > 0 else status_res
+        doc_status = target_obj.get('status') if isinstance(target_obj, dict) else None
+        if doc_status:
+            storage_aggs.set_tags(output_status_path, {'status': doc_status})
+
+        try: temp_local.unlink()
+        except: pass
+
+        return status_res
+
+    except Exception as e:
+        logger.error(f"[!] Ошибка в update_setandagg_status: {e}")
+        return str(e)
+
 def update_introduce_status(order_id: str, group: str):
     """
     Получает актуальный статус документа ввода в оборот из ЛК ЧЗ и сохраняет чек.
@@ -3484,6 +3857,9 @@ def main():
     parser.add_argument("--create-aggregation-set", help="Создать отчет об агрегации наборов для ЛК по UUID отчета оборудования")
     parser.add_argument("--send-aggregation-set", help="Отправить отчет об агрегации наборов в ЛК по UUID отчета оборудования")
     parser.add_argument("--aggregation-set-status", help="Получить статус отчета об агрегации наборов по UUID отчета оборудования")
+    parser.add_argument("--create-setandagg", help="Создать комбинированный отчет об агрегации по UUID задания оборудования")
+    parser.add_argument("--send-setandagg", help="Отправить комбинированный отчет об агрегации в ЛК по UUID задания оборудования")
+    parser.add_argument("--setandagg-status", help="Получить статус комбинированного отчета об агрегации по UUID задания оборудования")
     parser.add_argument("--create-introduce", help="Создать задачу на ввод в оборот по orderId (UUID)")
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
     parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
@@ -3670,6 +4046,32 @@ def main():
 
     if args.aggregation_set_status:
         result = update_aggregation_set_status(args.aggregation_set_status, args.group)
+        if result and "error" not in str(result).lower():
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"Результат: {result}")
+        return
+
+    if args.create_setandagg:
+        result = create_setandagg_report(args.create_setandagg, args.group, inn_override=args.inn)
+        if result:
+            logger.info(f"[+++] Комбинированный отчет успешно создан для {result}")
+        else:
+            logger.error(f"[!] Не удалось создать комбинированный отчет для {args.create_setandagg}")
+        return
+
+    if args.send_setandagg:
+        result = sign_and_send_setandagg(args.send_setandagg, args.group, args.signing_dir, args.timeout,
+                                            refresh_token=args.refresh_token)
+        if result and "error" not in str(result).lower():
+            logger.info(f"[+++] Комбинированный отчет успешно отправлен!")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            logger.error(f"[!] Не удалось отправить комбинированный отчет.")
+        return
+
+    if args.setandagg_status:
+        result = update_setandagg_status(args.setandagg_status, args.group)
         if result and "error" not in str(result).lower():
             print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
