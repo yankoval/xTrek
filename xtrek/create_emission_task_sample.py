@@ -352,6 +352,11 @@ def process_incoming_task(s3_full_key: str):
         normalized_gtin = gtin.zfill(14)
         prod_data['Gtin'] = normalized_gtin
 
+        # Нормализация Quantity
+        quantity_val = prod_data.get('Quantity')
+        if quantity_val is None or str(quantity_val).strip() == "":
+            prod_data['Quantity'] = "0"
+
         # 5. Запрос в NK.feedProduct
         base_path = os.path.dirname(os.path.abspath(__file__))
         db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
