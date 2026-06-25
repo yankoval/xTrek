@@ -37,20 +37,13 @@ class TokenProcessor:
 
         self.s3_config = self.config.get('s3_config')
         self.tokens_path = self.config.get('tokens_path')
+        self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
 
-        logger.info(f"Конфигурация TokenProcessor: tokens_path={self.tokens_path}, s3_configured={bool(self.s3_config)}")
-
+        self.tokens = []
+        self.processed_tokens = []
         self.last_sync_time = 0
-        if self.tokens_path and self.tokens_path.startswith('s3://'):
-            self.storage = get_storage(self.tokens_path, self.s3_config)
-            self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
-            logger.info(f"Инициализирован S3 storage для токенов: {self.tokens_path}")
-            self._sync_on_init()
-        else:
-            self.storage = None
-            self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
-            logger.info(f"Используется локальное хранилище для токенов: {self.file_path}")
 
+        # Сначала инициализируем менеджер организаций, так как он может понадобиться при обработке токенов
         if org_manager:
             self.org_manager = org_manager
         else:
@@ -59,10 +52,20 @@ class TokenProcessor:
                 orgs_dir = os.path.join(base_path, orgs_dir)
             self.org_manager = OrganizationManager(orgs_dir)
 
-        self.tokens = []
-        self.processed_tokens = []
-        self.read_tokens_file()
-        self.process_tokens()
+        logger.info(f"Конфигурация TokenProcessor: tokens_path={self.tokens_path}, s3_configured={bool(self.s3_config)}")
+
+        if self.tokens_path and self.tokens_path.startswith('s3://'):
+            self.storage = get_storage(self.tokens_path, self.s3_config)
+            logger.info(f"Инициализирован S3 storage для токенов: {self.tokens_path}")
+            self._sync_on_init()
+        else:
+            self.storage = None
+            logger.info(f"Используется локальное хранилище для токенов: {self.file_path}")
+
+        # Если данные еще не загружены (например, не было S3 синхронизации), загружаем сейчас
+        if not self.processed_tokens:
+            self.read_tokens_file()
+            self.process_tokens()
 
     def _sync_on_init(self):
         """Синхронизация при инициализации: если нет в S3 - выгружаем, если есть - загружаем."""
