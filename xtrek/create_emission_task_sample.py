@@ -469,9 +469,13 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
 
         quantity = boxes_qty * pack_qty
 
-        if not gtin or not quantity:
-            logger.error(f"[!] Некорректные данные в производственном заказе {production_order_id}: gtin={gtin}, quantity={quantity}")
+        if not gtin:
+            logger.error(f"[!] Некорректные данные в производственном заказе {production_order_id}: gtin={gtin}")
             return None
+
+        if quantity == 0:
+            logger.info(f"[*] Количество равно 0 для {production_order_id}. Пропуск создания заказа на эмиссию.")
+            return production_order_id
 
         # Определяем ИНН по GTIN
         base_path = os.path.dirname(os.path.abspath(__file__))
