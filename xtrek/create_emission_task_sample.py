@@ -352,6 +352,11 @@ def process_incoming_task(s3_full_key: str):
         normalized_gtin = gtin.zfill(14)
         prod_data['Gtin'] = normalized_gtin
 
+        # Нормализация Quantity
+        quantity_val = prod_data.get('Quantity')
+        if quantity_val is None or str(quantity_val).strip() == "":
+            prod_data['Quantity'] = "0"
+
         # 5. Запрос в NK.feedProduct
         base_path = os.path.dirname(os.path.abspath(__file__))
         db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
@@ -464,9 +469,13 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
 
         quantity = boxes_qty * pack_qty
 
-        if not gtin or not quantity:
-            logger.error(f"[!] Некорректные данные в производственном заказе {production_order_id}: gtin={gtin}, quantity={quantity}")
+        if not gtin:
+            logger.error(f"[!] Некорректные данные в производственном заказе {production_order_id}: gtin={gtin}")
             return None
+
+        if quantity == 0:
+            logger.info(f"[*] Количество равно 0 для {production_order_id}. Пропуск создания заказа на эмиссию.")
+            return production_order_id
 
         # Определяем ИНН по GTIN
         base_path = os.path.dirname(os.path.abspath(__file__))
