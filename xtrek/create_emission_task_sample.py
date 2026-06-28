@@ -1236,6 +1236,216 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
         logger.error(f"[!] Ошибка в create_utilisation_task_from_report: {e}")
         return None
 
+def create_introduce_task_from_report(production_order_id: str, group: str = None):
+    """
+    Создает задачу на ввод в оборот на основе отчета оборудования.
+    """
+    try:
+        from urllib.parse import urlparse, unquote
+        config = load_config('suz_worker_config')
+        s3_config = config.get('s3_config')
+        equipment_tasks_path = config.get('equipment-tasks')
+        equipment_reports_path = config.get('equipment-reports')
+        production_orders_path = config.get('production_orders_path')
+        introduce_tasks_path = config.get('introduce-tasks')
+        emission_orders_path = config.get('emission_orders_path')
+
+        if not all([equipment_tasks_path, equipment_reports_path, production_orders_path, introduce_tasks_path]):
+            logger.error("[!] В конфигурации отсутствуют необходимые пути (equipment-tasks, equipment-reports, production_orders_path, introduce-tasks)")
+            return None
+
+        # 1. Находим задание на оборудование
+        storage_tasks = get_storage(equipment_tasks_path, s3_config)
+        task_filename = production_order_id if production_order_id.lower().endswith('.json') else f"{production_order_id}.json"
+        task_path = f"{equipment_tasks_path.rstrip('/')}/{task_filename}"
+
+        if not storage_tasks.exists(task_path):
+            logger.error(f"[!] Задание на оборудование не найдено: {task_path}")
+            return None
+
+        task_content = storage_tasks.read_text(task_path)
+        task_data = json.loads(task_content)
+
+        # Получаем ссылку на отчет
+        signed_link = task_data.get('task-export-signed-link') or task_data.get('task_export_signed_link')
+        if not signed_link:
+            logger.error(f"[!] В задании {production_order_id} не найден ключ task-export-signed-link")
+            return None
+
+        # Извлекаем имя файла отчета
+        parsed_url = urlparse(signed_link)
+        report_filename = unquote(os.path.basename(parsed_url.path))
+
+        # 2. Получаем отчет оборудования
+        storage_reports = get_storage(equipment_reports_path, s3_config)
+        report_path = f"{equipment_reports_path.rstrip('/')}/{report_filename}"
+
+        if not storage_reports.exists(report_path):
+            logger.error(f"[!] Отчет оборудования не найден: {report_path}")
+            return None
+
+        report_content = storage_reports.read_text(report_path)
+        report_data = json.loads(report_content)
+
+        # Извлекаем коды
+        codes = extract_and_flatten(report_data)
+        if not codes:
+            logger.warning(f"[*] Отчет {report_filename} не содержит кодов.")
+            return None
+
+        # 3. Определяем GTIN и дату производства
+        gtin = None
+        first_code = codes[0]
+        if first_code.startswith('01'):
+            gtin = first_code[2:16]
+        else:
+            logger.error(f"[!] Не удалось определить GTIN из кода: {first_code}")
+            return None
+
+        storage_prod = get_storage(production_orders_path, s3_config)
+        prod_path = f"{production_orders_path.rstrip('/')}/{task_filename}"
+
+        auto_prod_date = None
+        found_group = group
+
+        if storage_prod.exists(prod_path):
+            prod_data = json.loads(storage_prod.read_text(prod_path))
+            pasport = prod_data.get('PasportData', {})
+            auto_prod_date = format_date_suz(pasport.get('Batch_date_production'))
+            logger.info(f"[+] Извлечена дата производства: {auto_prod_date}")
+
+            # Пытаемся получить группу из заказа на эмиссию
+            if emission_orders_path:
+                storage_em_orders = get_storage(emission_orders_path, s3_config)
+                em_order_path = f"{emission_orders_path.rstrip('/')}/{task_filename}"
+                if storage_em_orders.exists(em_order_path):
+                    em_data = json.loads(storage_em_orders.read_text(em_order_path))
+                    found_group = em_data.get('productGroup') or found_group
+                    logger.info(f"[*] Определена товарная группа из заказа: {found_group}")
+        else:
+            logger.warning(f"[!] Файл производственного заказа {prod_path} не найден.")
+
+        if not auto_prod_date:
+            logger.error("[!] Не удалось определить дату производства")
+            return None
+
+        # 4. Получаем ИНН
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        if not inn:
+            logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}")
+            return None
+
+        # 5. Получаем данные из НК (ТН ВЭД и разрешительные документы)
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        if not token:
+            token = get_new_token(inn=inn, mode='jwt')
+            if token: token_processor.save_token(token)
+
+        if not token:
+            logger.error(f"[!] JWT токен для ИНН {inn} не найден")
+            return None
+
+        nk = NK(token=token)
+        feed = nk.feedProduct(gtin)
+        if not feed:
+            logger.error(f"[!] Не удалось получить информацию из НК для GTIN {gtin}")
+            return None
+
+        f_res = feed.get('result', {})
+        if isinstance(f_res, list) and len(f_res) > 0:
+            f_res = f_res[0]
+
+        tnved = feed.get('tnved_code') or f_res.get('tnvedCode') or f_res.get('tnved_code')
+        if not tnved and 'good_attrs' in f_res:
+            for attr in f_res['good_attrs']:
+                if attr.get('attr_id') == 13933 or attr.get('attr_name') == 'Код ТНВЭД':
+                    tnved = attr.get('attr_value')
+                    break
+
+        if not tnved and 'categories' in f_res:
+            for cat in f_res['categories']:
+                cat_name = cat.get('cat_name', '')
+                if cat_name and cat_name[0].isdigit():
+                    potential_tnved = cat_name.split(' ')[0]
+                    if len(potential_tnved) >= 4:
+                        tnved = potential_tnved
+                        break
+
+        if not tnved:
+            logger.error(f"[!] Не удалось получить код ТН ВЭД для GTIN {gtin}")
+            return None
+
+        permits = []
+        CERT_TYPE_MAP = {
+            23557: "CONFORMITY_DECLARATION",
+            23561: "CONFORMITY_CERTIFICATE",
+            23765: "STATE_REGISTRATION_CERTIFICATE"
+        }
+
+        if 'good_attrs' in f_res:
+            for attr in f_res['good_attrs']:
+                if attr.get('attr_group_id') == 1065:
+                    attr_id = attr.get('attr_id')
+                    cert_type = CERT_TYPE_MAP.get(attr_id)
+                    if cert_type:
+                        val = attr.get('attr_value', '')
+                        if cert_type == "STATE_REGISTRATION_CERTIFICATE":
+                            cert_num = val
+                            published_date = attr.get('published_date', '')
+                            cert_date = published_date.split('T')[0] if 'T' in published_date else published_date
+                            permits.append(GtinDocument(certificate_number=cert_num, certificate_date=cert_date, certificate_type=cert_type))
+                        elif ':::' in val:
+                            parts = val.split(':::')
+                            permits.append(GtinDocument(certificate_number=parts[0], certificate_date=parts[1], certificate_type=cert_type))
+
+        if not permits:
+            logger.error(f"[!] Отсутствует разрешительная документация для GTIN {gtin}")
+            return None
+
+        # 6. Формируем сообщение
+        introduce_products = []
+        for code in codes:
+            clean_code = code.split('\u001d')[0]
+            introduce_products.append(IntroduceProduct(
+                uit_code=clean_code,
+                tnved_code=tnved,
+                certificate_document_data=permits
+            ))
+
+        message = IntroduceMessage(
+            production_date=auto_prod_date,
+            owner_inn=inn,
+            producer_inn=inn,
+            participant_inn=inn,
+            products=introduce_products,
+            productionOrderId=production_order_id
+        )
+
+        # 7. Сохраняем
+        storage_intro = get_storage(introduce_tasks_path, s3_config)
+        stem = production_order_id[:-5] if production_order_id.lower().endswith('.json') else production_order_id
+        remote_path = f"{introduce_tasks_path.rstrip('/')}/{stem}.json"
+
+        temp_local = Path(f"temp_intro_rep_{stem}.json")
+        with open(temp_local, 'w', encoding='utf-8') as f:
+            f.write(message.to_json())
+
+        logger.info(f"[*] Выгрузка задачи на ввод в оборот в S3: {remote_path}")
+        storage_intro.upload(str(temp_local), remote_path)
+
+        try: temp_local.unlink()
+        except: pass
+
+        return production_order_id
+
+    except Exception as e:
+        logger.exception(f"[!] Ошибка в create_introduce_task_from_report: {e}")
+        return None
+
 def create_utilisation_task(order_id: str, group: str, production_date: str = None, expiration_date: str = None, production_order_id: str = None):
     """
     Создает задачу на отчет о нанесении на основе полученных кодов.
@@ -3494,6 +3704,7 @@ def main():
     parser.add_argument("--send-aggregation-set", help="Отправить отчет об агрегации наборов в ЛК по UUID отчета оборудования")
     parser.add_argument("--aggregation-set-status", help="Получить статус отчета об агрегации наборов по UUID отчета оборудования")
     parser.add_argument("--create-introduce", help="Создать задачу на ввод в оборот по orderId (UUID)")
+    parser.add_argument("--create-introduce-from-report", help="Создать задачу на ввод в оборот на основании отчета оборудования по productionOrderId")
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
     parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
 
@@ -3692,6 +3903,14 @@ def main():
             logger.info(f"[+++] Задача на ввод в оборот успешно создана для {result}")
         else:
             logger.error(f"[!] Не удалось создать задачу для {args.create_introduce}")
+        return
+
+    if args.create_introduce_from_report:
+        result = create_introduce_task_from_report(args.create_introduce_from_report, args.group)
+        if result:
+            logger.info(f"[+++] Задача на ввод в оборот успешно создана для {result}")
+        else:
+            logger.error(f"[!] Не удалось создать задачу для {args.create_introduce_from_report}")
         return
 
     if args.send_introduce:
