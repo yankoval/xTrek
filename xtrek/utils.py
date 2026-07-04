@@ -95,67 +95,74 @@ class AggregationAnalyzer:
 
         ready_boxes = data.get('readyBox', [])
 
-        # Проверка на минимальное количество коробок
+        # 1. Проверка на минимальное количество коробок
         if len(ready_boxes) < self.min_sscc:
             errors['minssccinaggrep'].append(f"Количество коробок {len(ready_boxes)} меньше {self.min_sscc}")
 
-        box_codes_counter = Counter()
-        child_codes_counter = Counter()
+        # 2. Сбор кодов и проверка уникальности внутри файла
+        box_codes = []
+        child_codes = []
 
-        clean_boxes = []
-        clean_children = []
+        box_counter = Counter()
+        child_counter = Counter()
 
         for box in ready_boxes:
             box_code = box.get('boxNumber')
             if box_code:
                 clean_box = normalize_sscc(cut_crypto_tail(box_code))
-                box_codes_counter[clean_box] += 1
-                clean_boxes.append(clean_box)
+                box_codes.append(clean_box)
+                box_counter[clean_box] += 1
 
             children = box.get('productNumbersFull') or []
             for child in children:
                 clean_child = cut_crypto_tail(child)
-                child_codes_counter[clean_child] += 1
-                clean_children.append(clean_child)
+                child_codes.append(clean_child)
+                child_counter[clean_child] += 1
 
-        # Проверка уникальности внутри файла
-        for code, count in box_codes_counter.items():
-            if count > 1:
-                errors['duplicateaggregation'].append(code)
-        for code, count in child_codes_counter.items():
-            if count > 1:
-                errors['duplicateattachment'].append(code)
+        for code, count in box_counter.items():
+            if count > 1: errors['duplicateaggregation'].append(code)
+        for code, count in child_counter.items():
+            if count > 1: errors['duplicateattachment'].append(code)
 
-        # Проверка статусов в ГИС МТ
-        all_introduced = True
-        status_checked = False
+        # 3. Запрос статусов в ГИС МТ
+        all_codes = list(set(box_codes + child_codes))
+        status_map = {}
 
-        if clean_boxes:
-            box_results = self.check_statuses(clean_boxes)
-            for res in box_results:
-                status_checked = True
+        if all_codes:
+            status_results = self.check_statuses(all_codes)
+            for res in status_results:
                 cis_info = res.get('cisInfo', {})
-                status = cis_info.get('status')
                 code = cis_info.get('cis') or res.get('requestedCis')
-                if status:
-                    errors['alreadyregistered'].append(f"{code} (Статус: {status})")
-                    if status != 'INTRODUCED':
-                        all_introduced = False
-                else:
+                if code:
+                    status_map[code] = cis_info
+
+        # 4. Проверка на финальное состояние (все INTRODUCED)
+        all_introduced = False
+        if all_codes:
+            all_introduced = True
+            for code in all_codes:
+                info = status_map.get(code)
+                if not info or info.get('status') != 'INTRODUCED':
                     all_introduced = False
+                    break
 
-        if clean_children:
-            child_results = self.check_statuses(clean_children)
-            for res in child_results:
-                status_checked = True
-                cis_info = res.get('cisInfo', {})
-                status = cis_info.get('status', 'NOT_FOUND')
-                code = cis_info.get('cis') or res.get('requestedCis')
+        if all_introduced:
+            result = {'finished': ['All codes are INTRODUCED']}
+        else:
+            # 5. Проверка начального состояния (эквивалентно готовности к агрегации)
 
-                if status != 'INTRODUCED':
-                    all_introduced = False
+            # Проверка кодов агрегации (SSCC должны отсутствовать в системе)
+            for box in set(box_codes):
+                info = status_map.get(box)
+                if info and info.get('status'):
+                    errors['alreadyregistered'].append(f"{box} (Статус: {info.get('status')})")
 
-                gtin = get_gtin_from_code(code)
+            # Проверка кодов товаров (должны быть в статусе EMITTED)
+            for child in set(child_codes):
+                info = status_map.get(child)
+                status = info.get('status') if info else None
+
+                gtin = get_gtin_from_code(child)
                 if not gtin:
                     continue
 
@@ -164,22 +171,14 @@ class AggregationAnalyzer:
                     errors['gtinnotfound'].append(gtin)
                     continue
 
-                if is_set_flag:
-                    # Для наборов (SET) на момент агрегации статус должен быть EMITTED
-                    if status != 'EMITTED':
-                        errors['wrongsetstatus'].append(f"{code} (Статус: {status})")
-                else:
-                    # Для единиц товара (UNIT) на момент агрегации допустимы статусы EMITTED и INTRODUCED
-                    if status not in ['EMITTED', 'INTRODUCED']:
-                        errors['wrongunitstatus'].append(f"{code} (Статус: {status})")
+                if status != 'EMITTED':
+                    err_key = 'wrongsetstatus' if is_set_flag else 'wrongunitstatus'
+                    status_desc = status or "Не найден"
+                    errors[err_key].append(f"{child} (Статус: {status_desc})")
 
-        # Если все коды в статусе INTRODUCED, то отчет считается завершенным
-        if status_checked and all_introduced:
-            result = {'finished': ['All codes are INTRODUCED']}
-        else:
             result = dict(errors) if errors else None
 
-        # Установка тега check
+        # 6. Установка тега check
         tag_value = ""
         if result:
             tag_value = "-".join(sorted(result.keys()))

@@ -102,7 +102,12 @@ class HonestSignAPI:
         try:
             logger.debug(f'get_list_cis_info code:{code}')
             response = requests.post(url, json=code, headers=self.headers, verify=False)
-            logger.debug(f"RAW POST |  | Body: {response.text}")
+            logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
+
+            if response.status_code == 404:
+                # Если ни один код не найден, API может вернуть 404
+                return []
+
             response.raise_for_status()
             return response.json()
         except Exception as e:
