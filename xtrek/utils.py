@@ -165,10 +165,12 @@ class AggregationAnalyzer:
                     continue
 
                 if is_set_flag:
+                    # Для наборов (SET) на момент агрегации статус должен быть EMITTED
                     if status != 'EMITTED':
                         errors['wrongsetstatus'].append(f"{code} (Статус: {status})")
                 else:
-                    if status != 'INTRODUCED':
+                    # Для единиц товара (UNIT) на момент агрегации допустимы статусы EMITTED и INTRODUCED
+                    if status not in ['EMITTED', 'INTRODUCED']:
                         errors['wrongunitstatus'].append(f"{code} (Статус: {status})")
 
         # Если все коды в статусе INTRODUCED, то отчет считается завершенным
