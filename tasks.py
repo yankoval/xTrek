@@ -102,6 +102,8 @@ def get_production_order_data(production_order_id):
     try:
         content = storage.read_text(path)
         return json.loads(content)
+    except FileNotFoundError:
+        return None
     except Exception as e:
         print(f"[!] Ошибка при чтении задания {production_order_id}: {e}")
         return None
