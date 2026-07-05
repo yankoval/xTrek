@@ -101,7 +101,23 @@ def get_production_order_data(production_order_id):
 
     try:
         content = storage.read_text(path)
-        return json.loads(content)
+        data = json.loads(content)
+
+        # Если в задании нет типа GTIN, попробуем определить его сейчас
+        if data and 'GtinType' not in data:
+            gtin = data.get('Gtin')
+            if gtin:
+                from xtrek.utils import AggregationAnalyzer
+                from xtrek.trueapi import HonestSignAPI
+                from xtrek.nkapi import NK
+
+                # Мы не можем легко получить API/NK здесь без токена,
+                # но AggregationAnalyzer.is_set(gtin) требует их.
+                # Однако, мы можем просто вернуть данные как есть,
+                # а логика в logic_utilisationReceipt сама разберется если нужно.
+                pass
+
+        return data
     except FileNotFoundError:
         return None
     except Exception as e:
@@ -261,6 +277,21 @@ def logic_utilisationReceipt(full_key):
     if utilisationReceipt_id.startswith('T-'):
         prod_data = get_production_order_data(utilisationReceipt_id)
         gtin_type = prod_data.get('GtinType') if prod_data else None
+
+        # Если тип не указан в задании, пробуем определить его (для старых заданий)
+        if not gtin_type and prod_data:
+            gtin = prod_data.get('Gtin')
+            if gtin:
+                print(f"[*] Тип GTIN не найден в задании {utilisationReceipt_id}, запрашиваем НК...")
+                try:
+                    from xtrek.utils import _ensure_resources, AggregationAnalyzer
+                    _, api, nk, _ = _ensure_resources(utilisationReceipt_id)
+                    analyzer = AggregationAnalyzer(api, nk)
+                    is_set = analyzer.is_set(gtin)
+                    gtin_type = 'SET' if is_set else 'UNIT'
+                    print(f"[*] Определен тип GTIN: {gtin_type}")
+                except Exception as e:
+                    print(f"[!] Не удалось определить тип GTIN для {gtin}: {e}")
 
         if gtin_type == 'UNIT':
             print(f"[*] Задание {utilisationReceipt_id} является UNIT. Запуск ввода в оборот...")

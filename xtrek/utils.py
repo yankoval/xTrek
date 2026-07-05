@@ -66,7 +66,7 @@ class AggregationAnalyzer:
         return is_set
 
     def check_statuses(self, codes: List[str]) -> List[Dict[str, Any]]:
-        """Проверка статусов кодов пачками по 1000."""
+        """Проверка статусов кодов пачками по 1000. Возвращает список результатов или словарь с ошибкой."""
         results = []
         for i in range(0, len(codes), 1000):
             batch = codes[i:i+1000]
@@ -75,10 +75,11 @@ class AggregationAnalyzer:
                 if isinstance(batch_results, list):
                     results.extend(batch_results)
                 else:
-                    error_msg = batch_results.get('error', 'Unknown error')
-                    logger.error(f"Ошибка API при проверке пачки из {len(batch)} кодов: {error_msg}")
+                    # Если вернулся словарь с ошибкой от API
+                    return batch_results
             except Exception as e:
                 logger.error(f"Исключение при проверке пачки: {e}")
+                return {"error": str(e)}
         return results
 
     def check_report(self, path: str, s3_config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
@@ -130,17 +131,22 @@ class AggregationAnalyzer:
 
         if all_codes:
             status_results = self.check_statuses(all_codes)
+            if isinstance(status_results, dict) and "error" in status_results:
+                logger.error(f"Ошибка API при проверке статусов: {status_results['error']}")
+                return {"api_error": [status_results["error"]]}
+
             for res in status_results:
                 cis_info = res.get('cisInfo', {})
                 code = cis_info.get('cis') or res.get('requestedCis')
                 if code:
                     status_map[code] = cis_info
 
-        # 4. Проверка на финальное состояние (все INTRODUCED)
+        # 4. Проверка на финальное состояние (все товары INTRODUCED)
+        # Мы проверяем только товары (child_codes), так как SSCC не всегда переходят в INTRODUCED
         all_introduced = False
-        if all_codes:
+        if child_codes:
             all_introduced = True
-            for code in all_codes:
+            for code in set(child_codes):
                 info = status_map.get(code)
                 if not info or info.get('status') != 'INTRODUCED':
                     all_introduced = False
@@ -329,9 +335,18 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
         logger.error(f"В заказе {production_order_id} не найден GTIN")
         return None
 
-    # Проверка типа SET через NK
-    analyzer = AggregationAnalyzer(api, nk, config)
-    is_set_flag = analyzer.is_set(gtin)
+    # Проверка типа SET
+    gtin_type = prod_data.get('GtinType')
+    is_set_flag = None
+
+    if gtin_type:
+        is_set_flag = (gtin_type == 'SET')
+        logger.info(f"[*] Используется тип GTIN из задания: {gtin_type} (is_set={is_set_flag})")
+    else:
+        # Проверка через NK если в задании нет метаданных
+        analyzer = AggregationAnalyzer(api, nk, config)
+        is_set_flag = analyzer.is_set(gtin)
+
     if not is_set_flag:
         logger.error(f"GTIN {gtin} не является набором (is_set={is_set_flag})")
         return None
