@@ -160,7 +160,8 @@ class AggregationAnalyzer:
             # Проверка кодов агрегации (SSCC должны отсутствовать в системе)
             for box in set(box_codes):
                 info = status_map.get(box)
-                if info and info.get('status'):
+                # Если info пустой или в нем нет статуса - это значит "не найден" (ОК)
+                if info and info.get('status') and info.get('status') != 'NOT_FOUND':
                     errors['alreadyregistered'].append(f"{box} (Статус: {info.get('status')})")
 
             # Проверка кодов товаров (должны быть в статусе EMITTED)

@@ -91,32 +91,31 @@ def get_production_order_data(production_order_id):
     from xtrek.storage import get_storage
     s3_config = config.get('s3_config')
     production_orders_path = config.get('production_orders_path')
+
     if not production_orders_path:
-        return None
+        # Пытаемся сконструировать путь из INTERNAL_BUCKET
+        bucket = INTERNAL_BUCKET
+        if bucket:
+            production_orders_path = f"s3://{bucket}/productionOrders/"
+            print(f"[*] production_orders_path не задан, используем: {production_orders_path}")
+        else:
+            return None
 
     storage = get_storage(production_orders_path, s3_config)
     path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
     if not storage.exists(path):
-        return None
+        # Попробуем без .json если id уже содержит его или просто на всякий случай
+        if not production_order_id.endswith('.json'):
+            path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage.exists(path):
+            print(f"[!] Файл задания не найден: {path}")
+            return None
 
     try:
         content = storage.read_text(path)
         data = json.loads(content)
-
-        # Если в задании нет типа GTIN, попробуем определить его сейчас
-        if data and 'GtinType' not in data:
-            gtin = data.get('Gtin')
-            if gtin:
-                from xtrek.utils import AggregationAnalyzer
-                from xtrek.trueapi import HonestSignAPI
-                from xtrek.nkapi import NK
-
-                # Мы не можем легко получить API/NK здесь без токена,
-                # но AggregationAnalyzer.is_set(gtin) требует их.
-                # Однако, мы можем просто вернуть данные как есть,
-                # а логика в logic_utilisationReceipt сама разберется если нужно.
-                pass
-
         return data
     except FileNotFoundError:
         return None
@@ -279,12 +278,32 @@ def logic_utilisationReceipt(full_key):
         gtin_type = prod_data.get('GtinType') if prod_data else None
 
         # Если тип не указан в задании, пробуем определить его (для старых заданий)
-        if not gtin_type and prod_data:
-            gtin = prod_data.get('Gtin')
+        if not gtin_type:
+            gtin = prod_data.get('Gtin') if prod_data else None
+
+            # Если в задании нет GTIN, попробуем найти его через файл статуса эмиссии
+            if not gtin:
+                print(f"[*] GTIN не найден в задании {utilisationReceipt_id}, ищем в эмиссии...")
+                try:
+                    from xtrek.storage import get_storage
+                    s3_config = config.get('s3_config')
+                    # UTIL_ID совпадает с orderId в этом контексте
+                    emissions_path = config.get('emissions_path', f"s3://{INTERNAL_BUCKET}/emissions/")
+                    storage_em = get_storage(emissions_path, s3_config)
+                    # Ищем файл {utilisationReceipt_id}.json
+                    em_file = f"{emissions_path.rstrip('/')}/{utilisationReceipt_id}.json"
+                    if storage_em.exists(em_file):
+                        em_data = json.loads(storage_em.read_text(em_file))
+                        gtin = em_data.get('gtin')
+                        print(f"[*] GTIN из эмиссии: {gtin}")
+                except Exception as e:
+                    print(f"[!] Ошибка при поиске GTIN в эмиссии: {e}")
+
             if gtin:
-                print(f"[*] Тип GTIN не найден в задании {utilisationReceipt_id}, запрашиваем НК...")
+                print(f"[*] Определение типа для GTIN {gtin}...")
                 try:
                     from xtrek.utils import _ensure_resources, AggregationAnalyzer
+                    # Используем ID квитанции для обеспечения ресурсов
                     _, api, nk, _ = _ensure_resources(utilisationReceipt_id)
                     analyzer = AggregationAnalyzer(api, nk)
                     is_set = analyzer.is_set(gtin)
