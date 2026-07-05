@@ -19,6 +19,7 @@ from xtrek.create_emission_task_sample import (
     update_introduce_status,
     create_virtual_tasks_from_equipment_report,
     create_utilisation_task_from_report,
+    create_introduce_task_from_report,
     update_aggregation_status,
     _find_production_order_id_by_suz_order_id,
     create_equipment_set_report_from_report,
@@ -83,6 +84,45 @@ app.conf.update(
 )
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_production_order_data(production_order_id):
+    """
+    Загружает данные производственного задания из S3/Локально.
+    """
+    from xtrek.storage import get_storage
+    s3_config = config.get('s3_config')
+    production_orders_path = config.get('production_orders_path')
+
+    if not production_orders_path:
+        # Пытаемся сконструировать путь из INTERNAL_BUCKET
+        bucket = INTERNAL_BUCKET
+        if bucket:
+            production_orders_path = f"s3://{bucket}/productionOrders/"
+            print(f"[*] production_orders_path не задан, используем: {production_orders_path}")
+        else:
+            return None
+
+    storage = get_storage(production_orders_path, s3_config)
+    path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+    if not storage.exists(path):
+        # Попробуем без .json если id уже содержит его или просто на всякий случай
+        if not production_order_id.endswith('.json'):
+            path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage.exists(path):
+            print(f"[!] Файл задания не найден: {path}")
+            return None
+
+    try:
+        content = storage.read_text(path)
+        data = json.loads(content)
+        return data
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[!] Ошибка при чтении задания {production_order_id}: {e}")
+        return None
+
 def trigger_set_aggregation_if_ready(parent_id):
     """
     Проверяет готовность набора и запускает процесс агрегации наборов.
@@ -232,10 +272,59 @@ def logic_utilisationReceipt(full_key):
     if result.reportStatus !="SUCCESS":
         raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result staus:{result.reportStatus}")
 
-    # Если это реальный заказ (набор), проверяем готовность к агрегации
+    # Если это реальный заказ
     if utilisationReceipt_id.startswith('T-'):
-        trigger_set_aggregation_if_ready(utilisationReceipt_id)
-        return f"Utilization report for set {utilisationReceipt_id} is SUCCESS, checked set readiness"
+        prod_data = get_production_order_data(utilisationReceipt_id)
+        gtin_type = prod_data.get('GtinType') if prod_data else None
+
+        # Если тип не указан в задании, пробуем определить его (для старых заданий)
+        if not gtin_type:
+            gtin = prod_data.get('Gtin') if prod_data else None
+
+            # Если в задании нет GTIN, попробуем найти его через файл статуса эмиссии
+            if not gtin:
+                print(f"[*] GTIN не найден в задании {utilisationReceipt_id}, ищем в эмиссии...")
+                try:
+                    from xtrek.storage import get_storage
+                    s3_config = config.get('s3_config')
+                    # UTIL_ID совпадает с orderId в этом контексте
+                    emissions_path = config.get('emissions_path', f"s3://{INTERNAL_BUCKET}/emissions/")
+                    storage_em = get_storage(emissions_path, s3_config)
+                    # Ищем файл {utilisationReceipt_id}.json
+                    em_file = f"{emissions_path.rstrip('/')}/{utilisationReceipt_id}.json"
+                    if storage_em.exists(em_file):
+                        em_data = json.loads(storage_em.read_text(em_file))
+                        gtin = em_data.get('gtin')
+                        print(f"[*] GTIN из эмиссии: {gtin}")
+                except Exception as e:
+                    print(f"[!] Ошибка при поиске GTIN в эмиссии: {e}")
+
+            if gtin:
+                print(f"[*] Определение типа для GTIN {gtin}...")
+                try:
+                    from xtrek.utils import _ensure_resources, AggregationAnalyzer
+                    # Используем ID квитанции для обеспечения ресурсов
+                    _, api, nk, _ = _ensure_resources(utilisationReceipt_id)
+                    analyzer = AggregationAnalyzer(api, nk)
+                    is_set = analyzer.is_set(gtin)
+                    gtin_type = 'SET' if is_set else 'UNIT'
+                    print(f"[*] Определен тип GTIN: {gtin_type}")
+                except Exception as e:
+                    print(f"[!] Не удалось определить тип GTIN для {gtin}: {e}")
+
+        if gtin_type == 'UNIT':
+            print(f"[*] Задание {utilisationReceipt_id} является UNIT. Запуск ввода в оборот...")
+            res1 = create_introduce_task_from_report(utilisationReceipt_id, PRODUCT_GROUP)
+            if not res1:
+                raise RuntimeError(f"create_introduce_task_from_report failed for {utilisationReceipt_id}")
+            res2 = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
+            if not res2:
+                raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
+            return f"Introduction task for UNIT {utilisationReceipt_id} started successfully"
+        else:
+            # По умолчанию считаем SET для совместимости
+            trigger_set_aggregation_if_ready(utilisationReceipt_id)
+            return f"Utilization report for set {utilisationReceipt_id} is SUCCESS, checked set readiness"
 
     # Если документ относиться к виртуальному заданию на производство то запускаем создание сообщения о вводе в оборот
     result = create_virtual_introduce_task(utilisationReceipt_id, PRODUCT_GROUP)
@@ -271,14 +360,30 @@ def logic_update_introduce(full_key):
         raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id}  result:{result}")
     result = result[0] if isinstance(result, list) and len(result) > 0 else result
     if isinstance(result, dict) and result.get('status')== 'CHECKED_OK':
-        # Если это виртуальный компонент, пробуем запустить агрегацию набора
         prod_id = _find_production_order_id_by_suz_order_id(introduceReceipt_id)
-        if prod_id and prod_id.startswith('V-'):
+        if not prod_id:
+            return f"introduce status for {introduceReceipt_id} is CHECKED_OK, but prod_id not found"
+
+        # Если это виртуальный компонент, пробуем запустить агрегацию набора
+        if prod_id.startswith('V-'):
             # Извлекаем parent_id из V-{parent_id}-{gtin}
             parts = prod_id[2:].split('-')
             if len(parts) > 1:
                 parent_id = "-".join(parts[:-1])
                 trigger_set_aggregation_if_ready(parent_id)
+
+        # Если это реальный UNIT, запускаем транспортную агрегацию
+        elif prod_id.startswith('T-'):
+            prod_data = get_production_order_data(prod_id)
+            if prod_data and prod_data.get('GtinType') == 'UNIT':
+                print(f"[*] Ввод в оборот для UNIT {prod_id} успешен. Запуск агрегации...")
+                res1 = create_aggregation_report(prod_id)
+                if not res1:
+                    raise RuntimeError(f"create_aggregation_report failed for {prod_id}")
+                res2 = sign_and_send_aggregation(prod_id, PRODUCT_GROUP, signing_dir, 120)
+                if not res2:
+                    raise RuntimeError(f"sign_and_send_aggregation failed for {prod_id}")
+                return f"Standard aggregation for UNIT {prod_id} started successfully"
 
         return f"introduce status for {introduceReceipt_id} is {result.get('status')}"
     else:
@@ -316,15 +421,22 @@ def logic_start_equipment_reports(full_key):
             print(f"sign_and_send_utilisation failed for {report_id}")
     
     
-    # Запускаем поцедуру создания виртуальных наборов для вложений по отчету оборудования
-    vtResult = create_virtual_tasks_from_equipment_report(report_id)
+    # Проверяем тип задания
+    prod_data = get_production_order_data(production_order_id)
+    gtin_type = prod_data.get('GtinType') if prod_data else None
+
+    if gtin_type == 'UNIT':
+        print(f"[*] Пропускаем создание виртуальных заданий для UNIT {production_order_id}")
+    else:
+        # Запускаем поцедуру создания виртуальных наборов для вложений по отчету оборудования
+        vtResult = create_virtual_tasks_from_equipment_report(report_id)
+
+        # Если при создании ошибки то сообщаем и выходим без ошибки. Дальнейшая обработка в автомате невозможна
+        if not vtResult:
+            print(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
+            print(f"Дальнейшая обработка в автомате невозможна. Отчет оборудования f{report_id}.")
+            return(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
     
-    
-    # Если при создании ошибки то сообщаем и выходим без ошибки. Дальнейшая обработка в автомате невозможна
-    if not vtResult:
-        print(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
-        print(f"Дальнейшая обработка в автомате невозможна. Отчет оборудования f{report_id}.")
-        return(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
     print(f" Успешно обработан отчет оборудования {report_id}")
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: productionOrders/ ---

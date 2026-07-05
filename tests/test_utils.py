@@ -191,9 +191,9 @@ def test_status_logic(analyzer, tmp_path):
             elif "SET_BAD" in c:
                 results.append({"cisInfo": {"cis": c, "status": "APPLIED"}}) # Error for SET (APPLIED instead of EMITTED)
             elif "PROD_OK" in c:
-                results.append({"cisInfo": {"cis": c, "status": "INTRODUCED"}}) # OK
+                results.append({"cisInfo": {"cis": c, "status": "EMITTED"}}) # OK (Must be EMITTED)
             elif "PROD_BAD" in c:
-                results.append({"cisInfo": {"cis": c, "status": "APPLIED"}}) # Error for PROD
+                results.append({"cisInfo": {"cis": c, "status": "INTRODUCED"}}) # Error (Now INTRODUCED is error if not all are)
         return results
     analyzer.check_statuses = MagicMock(side_effect=mock_check)
     analyzer.min_sscc = 0
