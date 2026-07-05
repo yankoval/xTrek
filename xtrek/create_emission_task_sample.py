@@ -1395,28 +1395,8 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
             logger.error(f"[!] Не удалось получить код ТН ВЭД для GTIN {gtin}")
             return None
 
-        permits = []
-        CERT_TYPE_MAP = {
-            23557: "CONFORMITY_DECLARATION",
-            23561: "CONFORMITY_CERTIFICATE",
-            23765: "STATE_REGISTRATION_CERTIFICATE"
-        }
-
-        if 'good_attrs' in f_res:
-            for attr in f_res['good_attrs']:
-                if attr.get('attr_group_id') == 1065:
-                    attr_id = attr.get('attr_id')
-                    cert_type = CERT_TYPE_MAP.get(attr_id)
-                    if cert_type:
-                        val = attr.get('attr_value', '')
-                        if cert_type == "STATE_REGISTRATION_CERTIFICATE":
-                            cert_num = val
-                            published_date = attr.get('published_date', '')
-                            cert_date = published_date.split('T')[0] if 'T' in published_date else published_date
-                            permits.append(GtinDocument(certificate_number=cert_num, certificate_date=cert_date, certificate_type=cert_type))
-                        elif ':::' in val:
-                            parts = val.split(':::')
-                            permits.append(GtinDocument(certificate_number=parts[0], certificate_date=parts[1], certificate_type=cert_type))
+        # Получаем разрешительные документы через специальный метод (с фильтрацией Прекращен)
+        permits = nk.get_permit_document_by_gtin(gtin, inn)
 
         if not permits:
             logger.error(f"[!] Отсутствует разрешительная документация для GTIN {gtin}")
@@ -2352,43 +2332,8 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             logger.error(f"[!] Не удалось получить код ТН ВЭД для GTIN {gtin}")
             return None
 
-        # Получаем разрешительные документы из good_attrs
-        permits = []
-        CERT_TYPE_MAP = {
-            23557: "CONFORMITY_DECLARATION",
-            23561: "CONFORMITY_CERTIFICATE",
-            23765: "STATE_REGISTRATION_CERTIFICATE"
-        }
-
-        if 'good_attrs' in f_res:
-            for attr in f_res['good_attrs']:
-                if attr.get('attr_group_id') == 1065:
-                    attr_id = attr.get('attr_id')
-                    cert_type = CERT_TYPE_MAP.get(attr_id)
-                    if cert_type:
-                        val = attr.get('attr_value', '')
-
-                        if cert_type == "STATE_REGISTRATION_CERTIFICATE":
-                            cert_num = val
-                            published_date = attr.get('published_date', '')
-                            # Преобразуем 2025-07-22T13:10:26+03:00 -> 2025-07-22
-                            cert_date = published_date.split('T')[0] if 'T' in published_date else published_date
-                            permits.append(GtinDocument(
-                                certificate_number=cert_num,
-                                certificate_date=cert_date,
-                                certificate_type=cert_type
-                            ))
-                        elif ':::' in val:
-                            parts = val.split(':::')
-                            cert_num = parts[0]
-                            cert_date = parts[1]
-                            permits.append(GtinDocument(
-                                certificate_number=cert_num,
-                                certificate_date=cert_date,
-                                certificate_type=cert_type
-                            ))
-                        else:
-                            logger.warning(f"[*] Некорректный формат значения документа (ожидалось :::): {val}")
+        # Получаем разрешительные документы через специальный метод (с фильтрацией Прекращен)
+        permits = nk.get_permit_document_by_gtin(gtin, inn)
 
         if not permits:
             error_msg = "отсутсвует разрешительная документация"

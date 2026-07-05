@@ -131,10 +131,26 @@ class NK:
             docs = result.get("documents", [])
             errors = result.get("errors", [])
             logger.info(f'Gtin:{gtin} error:{errors}')
+
+            CERT_TYPE_MAP = {
+                23557: "CONFORMITY_DECLARATION",
+                23561: "CONFORMITY_CERTIFICATE",
+                23765: "STATE_REGISTRATION_CERTIFICATE"
+            }
+
             for d in docs:
+                if d.get("status") == "Прекращен":
+                    logger.info(f"Документ {d.get('number')} пропущен (статус: Прекращен)")
+                    continue
+
                 number = d.get("number")
                 from_date = d.get("from_date")
-                type_doc = d.get("type") # Предполагаем 'type', логирование покажет точное имя
+                attr_id = d.get("attr_id")
+                type_doc = CERT_TYPE_MAP.get(attr_id)
+
+                if not type_doc:
+                    # Резервный вариант, если attr_id не в мапе
+                    type_doc = d.get("type") or d.get("product_type")
 
                 documents.append(GtinDocument(
                     certificate_number=number,

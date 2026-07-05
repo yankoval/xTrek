@@ -45,16 +45,18 @@ def test_create_introduce_task_with_new_permits_logic(mock_token_proc, mock_org_
                     "attr_id": 13933,
                     "attr_name": "Код ТНВЭД",
                     "attr_value": "3307300000"
-                },
-                {
-                    "attr_group_id": 1065,
-                    "attr_id": 23557,
-                    "attr_name": "Декларация о соответствии",
-                    "attr_value": "ЕАЭС N RU Д-RU.РА09.В.37749/24:::2024-10-11"
                 }
             ]
         }]
     }
+
+    mock_nk_inst.get_permit_document_by_gtin.return_value = [
+        GtinDocument(
+            certificate_number="ЕАЭС N RU Д-RU.РА09.В.37749/24",
+            certificate_date="2024-10-11",
+            certificate_type="CONFORMITY_DECLARATION"
+        )
+    ]
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 
@@ -122,16 +124,18 @@ def test_create_introduce_task_with_new_permits_logic_verified(mock_token_proc, 
                     "attr_id": 13933,
                     "attr_name": "Код ТНВЭД",
                     "attr_value": "3307300000"
-                },
-                {
-                    "attr_group_id": 1065,
-                    "attr_id": 23557,
-                    "attr_name": "Декларация о соответствии",
-                    "attr_value": "ЕАЭС N RU Д-RU.РА09.В.37749/24:::2024-10-11"
                 }
             ]
         }]
     }
+
+    mock_nk_inst.get_permit_document_by_gtin.return_value = [
+        GtinDocument(
+            certificate_number="ЕАЭС N RU Д-RU.РА09.В.37749/24",
+            certificate_date="2024-10-11",
+            certificate_type="CONFORMITY_DECLARATION"
+        )
+    ]
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 
@@ -177,6 +181,8 @@ def test_create_introduce_task_error_no_permits(mock_token_proc, mock_org_man, m
             "good_attrs": []
         }]
     }
+
+    mock_nk_inst.get_permit_document_by_gtin.return_value = []
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 

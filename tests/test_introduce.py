@@ -64,16 +64,13 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
                     "attr_id": 13933,
                     "attr_name": "Код ТНВЭД",
                     "attr_value": "3305900009"
-                },
-                {
-                    "attr_group_id": 1065,
-                    "attr_id": 23557,
-                    "attr_name": "Декларация о соответствии",
-                    "attr_value": "CERT123:::2024-09-27"
                 }
             ]
         }]
     }
+    mock_nk_inst.get_permit_document_by_gtin.return_value = [
+        GtinDocument(certificate_number="CERT123", certificate_date="2024-09-27", certificate_type="CONFORMITY_DECLARATION")
+    ]
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 
