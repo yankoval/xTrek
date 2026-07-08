@@ -357,10 +357,21 @@ def process_incoming_task(s3_full_key: str):
         if quantity_val is None or str(quantity_val).strip() == "":
             prod_data['Quantity'] = "0"
 
-        # 5. Запрос в NK.feedProduct
+        # 5. Определение ИНН (владельца карточки)
         base_path = os.path.dirname(os.path.abspath(__file__))
         db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
         inn = get_inn_by_gtin(normalized_gtin, db_path=db_path)
+
+        if not inn:
+            logger.warning(f"[*] GTIN {normalized_gtin} не найден в локальной базе GS1. Пробуем через True API...")
+            participant_token = _get_participant_token()
+            if participant_token:
+                temp_nk = NK(token=participant_token)
+                p_info = temp_nk.product_info(normalized_gtin)
+                if p_info:
+                    inn = p_info.get('inn')
+                    if inn:
+                        logger.info(f"[*] ИНН {inn} определен через True API для GTIN {normalized_gtin}")
 
         if not inn:
             logger.error(f"[!] Не удалось определить ИНН для GTIN {normalized_gtin}")
@@ -967,6 +978,32 @@ def _find_production_order_id_by_suz_order_id(order_id: str):
         logger.error(f"[!] Ошибка в _find_production_order_id_by_suz_order_id: {e}")
         return None
 
+def _get_participant_token():
+    """
+    Возвращает любой доступный JWT токен для выполнения запросов к True API (product/info).
+    Используется для определения владельца карточки товара (ИНН).
+    """
+    try:
+        config = load_config('suz_worker_config')
+        # 1. Проверяем в конфиге
+        token = config.get('client_token')
+        if token: return token
+
+        # 2. Проверяем в организации по умолчанию
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
+        tp = TokenProcessor(org_manager=org_manager)
+
+        # Берем любой первый попавшийся активный JWT токен
+        for org in org_manager.orgs:
+            t = tp.get_token_value_by_inn(org['ИНН'], token_type='JWT')
+            if t: return t
+
+        return None
+    except Exception as e:
+        logger.error(f"[!] Ошибка в _get_participant_token: {e}")
+        return None
+
 def _get_order_id_from_receipt(production_order_id: str):
     """
     Получает SUZ orderId из чека эмиссии по production_order_id.
@@ -1374,6 +1411,17 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
         # 4. Получаем ИНН
         base_path = os.path.dirname(os.path.abspath(__file__))
         inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        if not inn:
+            logger.warning(f"[*] GTIN {gtin} не найден в локальной базе GS1. Пробуем через True API...")
+            participant_token = _get_participant_token()
+            if participant_token:
+                temp_nk = NK(token=participant_token)
+                p_info = temp_nk.product_info(gtin)
+                if p_info:
+                    inn = p_info.get('inn')
+                    if inn:
+                        logger.info(f"[*] ИНН {inn} определен через True API для GTIN {gtin}")
+
         if not inn:
             logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}")
             return None
@@ -2311,6 +2359,17 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         # 2. Получаем ИНН
         base_path = os.path.dirname(os.path.abspath(__file__))
         inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        if not inn:
+            logger.warning(f"[*] GTIN {gtin} не найден в локальной базе GS1. Пробуем через True API...")
+            participant_token = _get_participant_token()
+            if participant_token:
+                temp_nk = NK(token=participant_token)
+                p_info = temp_nk.product_info(gtin)
+                if p_info:
+                    inn = p_info.get('inn')
+                    if inn:
+                        logger.info(f"[*] ИНН {inn} определен через True API для GTIN {gtin}")
+
         if not inn:
             logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}")
             return None
