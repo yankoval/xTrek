@@ -44,7 +44,8 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
         "kodes": "s3://bucket/kodes",
         "introduce-tasks": "s3://bucket/intro",
         "emission_receipts": "s3://bucket/receipts",
-        "production_orders_path": "s3://bucket/prod"
+        "production_orders_path": "s3://bucket/prod",
+        "emission_orders_path": "s3://bucket/em_orders"
     }
 
     mock_storage = MagicMock()
@@ -68,8 +69,8 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
             ]
         }]
     }
-    mock_nk_inst.get_permit_document_by_gtin.return_value = [
-        GtinDocument(certificate_number="CERT123", certificate_date="2024-09-27", certificate_type="CONFORMITY_DECLARATION")
+    mock_nk_inst.get_active_permit_documents_by_gtin.return_value = [
+        {"number": "CERT123", "date": "2024-09-27", "type": "CONFORMITY_DECLARATION"}
     ]
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
@@ -79,9 +80,6 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
 
     with patch("xtrek.create_emission_task_sample.Path") as mock_path:
         mock_path.return_value.stem = "receipt_uuid"
-
-        # We need to mock more for the loop over files if it's local, but let's assume S3 for simplicity or mock the loop
-        # Actually create_introduce_task tries to find production_order_id.
 
         res = create_introduce_task("uuid", production_date="2026-04-01")
 

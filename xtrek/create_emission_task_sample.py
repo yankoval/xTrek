@@ -1396,7 +1396,12 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
             return None
 
         # Получаем разрешительные документы через специальный метод (с фильтрацией Прекращен)
-        permits = nk.get_permit_document_by_gtin(gtin, inn)
+        permit_data = nk.get_active_permit_documents_by_gtin(gtin)
+        permits = [GtinDocument(
+            certificate_number=p['number'],
+            certificate_date=p['date'],
+            certificate_type=p['type']
+        ) for p in permit_data]
 
         if not permits:
             logger.error(f"[!] Отсутствует разрешительная документация для GTIN {gtin}")
@@ -2333,7 +2338,12 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             return None
 
         # Получаем разрешительные документы через специальный метод (с фильтрацией Прекращен)
-        permits = nk.get_permit_document_by_gtin(gtin, inn)
+        permit_data = nk.get_active_permit_documents_by_gtin(gtin)
+        permits = [GtinDocument(
+            certificate_number=p['number'],
+            certificate_date=p['date'],
+            certificate_type=p['type']
+        ) for p in permit_data]
 
         if not permits:
             error_msg = "отсутсвует разрешительная документация"
