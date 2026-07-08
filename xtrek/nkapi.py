@@ -156,11 +156,44 @@ class NK:
 
         return result
 
+    def product_info(self, gtin: str, rd_info: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Метод «/v4/true-api/product/info» возвращает расширенную информацию о товаре.
+        """
+        url = f"{self._true_api_base_url()}/product/info"
+        payload = {"gtins": [gtin], "rdInfo": rd_info}
+
+        logger.info(f"POST {url} (GTIN: {gtin}, rdInfo={rd_info})")
+        try:
+            response = requests.post(
+                url,
+                headers=self._true_api_headers(),
+                json=payload,
+                timeout=30,
+            )
+            logger.info(f"Status: {response.status_code}")
+
+            if response.status_code != 200:
+                logger.error(f"Ошибка product/info: {response.status_code} {response.text}")
+                return None
+
+            data = response.json()
+            results = data.get("results") or []
+            if not results:
+                logger.info(f"GTIN {gtin}: product/info не вернул карточку")
+                return None
+
+            return results[0]
+        except Exception as e:
+            logger.error(f"Error calling product/info: {e}")
+            return None
+
     def get_active_permit_documents_by_gtin(
         self,
         gtin: str,
         on_date: Optional[date] = None,
         verify_registry_status: bool = True,
+        product: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Возвращает активные разрешительные документы по GTIN.
@@ -177,34 +210,10 @@ class NK:
         """
         on_date = on_date or date.today()
 
-        url = f"{self._true_api_base_url()}/product/info"
-        payload = {"gtins": [gtin], "rdInfo": True}
-
-        logger.info(f"POST {url} (GTIN: {gtin}, rdInfo=true)")
-        try:
-            response = requests.post(
-                url,
-                headers=self._true_api_headers(),
-                json=payload,
-                timeout=30,
-            )
-            logger.info(f"Status: {response.status_code}")
-
-            if response.status_code != 200:
-                logger.error(f"Ошибка product/info: {response.status_code} {response.text}")
+        if not product:
+            product = self.product_info(gtin, rd_info=True)
+            if not product:
                 return []
-
-            data = response.json()
-        except Exception as e:
-            logger.error(f"Error calling product/info: {e}")
-            return []
-
-        results = data.get("results") or []
-        if not results:
-            logger.info(f"GTIN {gtin}: product/info не вернул карточку")
-            return []
-
-        product = results[0]
         cert_docs = product.get("certDocList") or []
         if not cert_docs:
             logger.info(f"GTIN {gtin}: certDocList пустой")

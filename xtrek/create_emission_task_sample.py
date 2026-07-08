@@ -161,7 +161,7 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
         nk = NK(token=token)
 
         # 1. Получаем информацию о gtin из исходного задания на производство с помощью NK.feedproduct
-        feed = nk.feedProduct(source_gtin)
+        feed = get_product_info_robust(nk, source_gtin)
         if not feed or not feed.get('result'):
             # Попробуем резервный метод
             feed = nk.get_set_by_gtin(source_gtin)
@@ -198,7 +198,7 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
             logger.info(f"[*] Обработка вложения: GTIN {comp_gtin}, кол-во в наборе: {comp_qty_in_set}")
 
             # 3.1 получаем NK.feedproduct для этого вложения.
-            comp_feed = nk.feedProduct(comp_gtin)
+            comp_feed = get_product_info_robust(nk, comp_gtin)
             if not comp_feed or not comp_feed.get('result'):
                 # Резерв для названия, как просил пользователь
                 comp_feed = nk.get_set_by_gtin(comp_gtin)
@@ -380,7 +380,7 @@ def process_incoming_task(s3_full_key: str):
             raise ValueError(f"JWT токен для ИНН {inn} не найден")
 
         nk = NK(token=token)
-        feed = nk.feedProduct(normalized_gtin)
+        feed = get_product_info_robust(nk, normalized_gtin)
 
         if feed is None:
             logger.error(f"[!] Ошибка связи с NK для GTIN {normalized_gtin}")
@@ -517,7 +517,7 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
                 raise ValueError(f"JWT токен для ИНН {inn} не найден, не удалось получить данные из НК")
 
             nk = NK(token=token)
-            feed = nk.feedProduct(gtin)
+            feed = get_product_info_robust(nk, gtin)
             if not feed:
                 raise ValueError(f"Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
 
@@ -994,6 +994,32 @@ def _get_order_id_from_receipt(production_order_id: str):
         logger.error(f"[!] Ошибка в _get_order_id_from_receipt: {e}")
         return None
 
+def get_product_info_robust(nk: NK, gtin: str, rd_info: bool = False):
+    """
+    Получает информацию о товаре, используя feedProduct с fallback на product_info.
+    Маппит поля product_info к формату feedProduct.
+    """
+    feed = nk.feedProduct(gtin)
+    if feed and feed.get('result'):
+        return feed
+
+    # Fallback на product_info (для GTIN через субаккаунт)
+    product = nk.product_info(gtin, rd_info=rd_info)
+    if product:
+        # Маппинг полей
+        mapped = {
+            "is_set": product.get("isSet"),
+            "tnved_code": product.get("tnVedCode10"),
+            "good_name": product.get("name"),
+            "owner_inn": product.get("inn"),
+            "product_id": product.get("gtin"), # product_info не дает внутреннего ID, используем GTIN
+            "gtin": product.get("gtin"),
+            "_raw": product
+        }
+        return {"result": [mapped]}
+
+    return None
+
 def format_date_suz(date_str: str) -> str:
     """Преобразует дату из dd.mm.yyyy в yyyy-MM-dd"""
     if not date_str:
@@ -1366,7 +1392,7 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
             return None
 
         nk = NK(token=token)
-        feed = nk.feedProduct(gtin)
+        feed = get_product_info_robust(nk, gtin, rd_info=True)
         if not feed:
             logger.error(f"[!] Не удалось получить информацию из НК для GTIN {gtin}")
             return None
@@ -1396,7 +1422,7 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
             return None
 
         # Получаем разрешительные документы через специальный метод (с фильтрацией Прекращен)
-        permit_data = nk.get_active_permit_documents_by_gtin(gtin)
+        permit_data = nk.get_active_permit_documents_by_gtin(gtin, product=f_res.get('_raw'))
         permits = [GtinDocument(
             certificate_number=p['number'],
             certificate_date=p['date'],
@@ -2304,7 +2330,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             return None
 
         nk = NK(token=token)
-        feed = nk.feedProduct(gtin)
+        feed = get_product_info_robust(nk, gtin, rd_info=True)
         if not feed:
             logger.error(f"[!] Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
             return None
@@ -2338,7 +2364,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             return None
 
         # Получаем разрешительные документы через специальный метод (с фильтрацией Прекращен)
-        permit_data = nk.get_active_permit_documents_by_gtin(gtin)
+        permit_data = nk.get_active_permit_documents_by_gtin(gtin, product=f_res.get('_raw'))
         permits = [GtinDocument(
             certificate_number=p['number'],
             certificate_date=p['date'],
@@ -2715,7 +2741,7 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
 
                 if token:
                     nk = NK(token=token)
-                    feed = nk.feedProduct(gtin)
+                    feed = get_product_info_robust(nk, gtin)
                     if feed:
                         # В feedProduct обычно ИНН владельца лежит в owner_inn или в result[0].owner_inn
                         f_res = feed.get('result', {})
@@ -2986,7 +3012,7 @@ def create_equipment_set_report(production_order_id: str):
         kits_packs = []
         for s in set_gtins:
             comp_gtin = str(s['gtin']).strip().zfill(14)
-            comp_feed = nk.feedProduct(comp_gtin)
+            comp_feed = get_product_info_robust(nk, comp_gtin)
             comp_name = ""
             if comp_feed and comp_feed.get('result'):
                 comp_name = comp_feed['result'][0].get('good_name', '')
@@ -3200,7 +3226,7 @@ def create_equipment_set_report_from_report(production_order_id: str):
         kits_packs = []
         for s in set_gtins:
             comp_gtin = str(s['gtin']).strip().zfill(14)
-            comp_feed = nk.feedProduct(comp_gtin)
+            comp_feed = get_product_info_robust(nk, comp_gtin)
             comp_name = ""
             if comp_feed and comp_feed.get('result'):
                 comp_name = comp_feed['result'][0].get('good_name', '')
