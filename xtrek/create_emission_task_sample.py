@@ -27,6 +27,26 @@ from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
 
+# ---------------------------------------------------------------------------
+# Изменения 2026-07-09: поддержка linked GTIN и работы через субаккаунты.
+#
+# Суть изменений:
+# - GTIN, доступный участнику через субаккаунт, может принадлежать карточке
+#   другого ИНН. Поэтому локальной GS1-базы недостаточно: если ИНН владельца
+#   карточки не найден локально, он определяется через True API product/info
+#   с токеном текущего участника.
+# - Если JWT владельца карточки отсутствует, для чтения linked-карточки и
+#   разрешительных документов используется JWT текущего участника. Это
+#   корректно для карточек, предоставленных участнику по субаккаунту.
+# - Для операций СУЗ, подписи, отчета о нанесении и ввода в оборот используется
+#   ИНН производителя/участника из производственного задания
+#   PasportData.Manufacturer_inn. ИНН владельца карточки товара используется
+#   только для поиска карточки и фильтрации разрешительной документации.
+# - Для сообщения о вводе в оборот owner_inn, producer_inn и participant_inn
+#   заполняются ИНН участника из задания. Иначе ГИС МТ отклоняет linked GTIN
+#   ошибкой "ИНН собственника ... не соответствует данным текущего участника".
+# ---------------------------------------------------------------------------
+
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
 DEFAULT_SIGNING_DIR = os.path.join(os.path.expanduser("~"), "tst")
 DEFAULT_SIGNING_TIMEOUT = 60
@@ -357,10 +377,15 @@ def process_incoming_task(s3_full_key: str):
         if quantity_val is None or str(quantity_val).strip() == "":
             prod_data['Quantity'] = "0"
 
-        # 5. Определение ИНН (владельца карточки)
+        # 5. Определение ИНН владельца карточки товара.
+        # Для собственных GTIN обычно хватает локальной GS1-базы. Для linked
+        # GTIN, предоставленных по субаккаунту, префикс может отсутствовать
+        # локально, поэтому владельца карточки определяем через True API
+        # product/info с токеном текущего участника.
         base_path = os.path.dirname(os.path.abspath(__file__))
         db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
         inn = get_inn_by_gtin(normalized_gtin, db_path=db_path)
+        participant_token = None
 
         if not inn:
             logger.warning(f"[*] GTIN {normalized_gtin} не найден в локальной базе GS1. Пробуем через True API...")
@@ -381,6 +406,13 @@ def process_incoming_task(s3_full_key: str):
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
         token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        # У участника может не быть JWT владельца карточки linked GTIN. При
+        # этом его собственный JWT имеет право читать предоставленную карточку,
+        # поэтому используем participant_token только как fallback доступа к НК.
+        if not token and participant_token:
+            logger.info(f"[*] JWT токен владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
+            token = participant_token
 
         if not token:
             token = get_new_token(inn=inn, mode='jwt')
@@ -417,8 +449,7 @@ def process_incoming_task(s3_full_key: str):
             if normalized_gtin in allowed_gtins:
                 logger.info(f"[*] GTIN {normalized_gtin} является UNIT, но разрешен фильтром allowed_gtins. Продолжаем.")
             else:
-                logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False) и не входит в allowed_gtins. Пропуск.")
-                return None
+                logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False) и не входит в allowed_gtins. Продолжаем.")
 
         # 6. Выгрузка
         prod_data['GtinType'] = gtin_type
@@ -499,10 +530,23 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
             logger.info(f"[*] Количество равно 0 для {production_order_id}. Пропуск создания заказа на эмиссию.")
             return production_order_id
 
-        # Определяем ИНН по GTIN
+        # Определяем ИНН владельца карточки по GTIN. Для linked GTIN это не
+        # обязательно ИНН участника, который создает заказ на эмиссию.
         base_path = os.path.dirname(os.path.abspath(__file__))
         db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
         inn = get_inn_by_gtin(gtin, db_path=db_path)
+        participant_token = None
+
+        if not inn:
+            logger.warning(f"[*] GTIN {gtin} не найден в локальной базе GS1. Пробуем через True API...")
+            participant_token = _get_participant_token()
+            if participant_token:
+                temp_nk = NK(token=participant_token)
+                p_info = temp_nk.product_info(gtin)
+                if p_info:
+                    inn = p_info.get('inn')
+                    if inn:
+                        logger.info(f"[*] ИНН {inn} определен через True API для GTIN {gtin}")
 
         if not inn:
             logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}. Проверьте {db_path}")
@@ -517,6 +561,12 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
             org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
             token_processor = TokenProcessor(org_manager=org_manager)
             token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+            # Для linked GTIN карточка читается токеном текущего участника,
+            # если JWT владельца карточки недоступен.
+            if not token and participant_token:
+                logger.info(f"[*] JWT токен владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
+                token = participant_token
 
             if not token:
                 # Попробуем получить новый если нет
@@ -625,11 +675,26 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
         order_content = storage_orders.read_text(order_path)
         order_data = json.loads(order_content)
 
-        # Нам нужен ИНН для подписи. Мы можем его получить по GTIN из заказа.
+        # Для подписи/СУЗ нужен ИНН фактического участника, а не обязательно
+        # владелец карточки GTIN. В контрактном производстве и subaccount
+        # сценариях он хранится в производственном задании как
+        # PasportData.Manufacturer_inn.
         gtin = order_data['products'][0]['gtin']
+        production_orders_path = config.get('production_orders_path')
         base_path = os.path.dirname(os.path.abspath(__file__))
         db_path = os.path.join(base_path, 'gs1prefix_inn_db.json')
         inn = get_inn_by_gtin(gtin, db_path=db_path)
+
+        if production_orders_path:
+            storage_prod = get_storage(production_orders_path, s3_config)
+            prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+            if storage_prod.exists(prod_path):
+                prod_data = json.loads(storage_prod.read_text(prod_path))
+                manufacturer_inn = prod_data.get('Manufacturer_inn') or prod_data.get('PasportData', {}).get('Manufacturer_inn')
+                if manufacturer_inn:
+                    if inn and manufacturer_inn != inn:
+                        logger.info(f"[*] GTIN принадлежит ИНН {inn}, для подписи/СУЗ используем Manufacturer_inn {manufacturer_inn}")
+                    inn = manufacturer_inn
 
         if not inn:
             logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}")
@@ -995,8 +1060,10 @@ def _get_participant_token():
         tp = TokenProcessor(org_manager=org_manager)
 
         # Берем любой первый попавшийся активный JWT токен
-        for org in org_manager.orgs:
-            t = tp.get_token_value_by_inn(org['ИНН'], token_type='JWT')
+        for org in org_manager.list():
+            if not getattr(org, 'inn', None):
+                continue
+            t = tp.get_token_value_by_inn(org.inn, token_type='JWT')
             if t: return t
 
         return None
@@ -1411,6 +1478,7 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
         # 4. Получаем ИНН
         base_path = os.path.dirname(os.path.abspath(__file__))
         inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        participant_token = None
         if not inn:
             logger.warning(f"[*] GTIN {gtin} не найден в локальной базе GS1. Пробуем через True API...")
             participant_token = _get_participant_token()
@@ -1657,8 +1725,21 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
         task_data = json.loads(task_content)
         production_order_id = task_data.pop('productionOrderId', None)
 
-        # Получаем ИНН из атрибутов или по GTIN
+        # Получаем ИНН участника для подписи отчета о нанесении. В linked GTIN
+        # код товара может принадлежать чужой карточке, поэтому приоритетно
+        # берем participantId из задачи, затем Manufacturer_inn из исходного
+        # производственного задания.
         inn = task_data.get('attributes', {}).get('participantId')
+        if not inn and production_order_id:
+            production_orders_path = config.get('production_orders_path')
+            if production_orders_path:
+                storage_prod = get_storage(production_orders_path, s3_config)
+                prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+                if storage_prod.exists(prod_path):
+                    prod_data = json.loads(storage_prod.read_text(prod_path))
+                    inn = prod_data.get('Manufacturer_inn') or prod_data.get('PasportData', {}).get('Manufacturer_inn')
+                    if inn:
+                        logger.info(f"[*] Для отчета о нанесении используем Manufacturer_inn из производственного задания: {inn}")
         if not inn:
              first_code = task_data['sntins'][0]
              gtin = first_code[2:16] if first_code.startswith('01') else None
@@ -2335,6 +2416,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
 
         production_order_id = _find_production_order_id_by_suz_order_id(order_id)
         found_group = group
+        producer_inn = None
 
         if production_order_id:
             # Пытаемся получить группу из заказа на эмиссию
@@ -2349,6 +2431,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
             if storage_prod.exists(prod_path):
                 prod_data = json.loads(storage_prod.read_text(prod_path))
+                producer_inn = prod_data.get('Manufacturer_inn') or prod_data.get('PasportData', {}).get('Manufacturer_inn')
                 if not auto_prod_date:
                     auto_prod_date = format_date_suz(prod_data.get('PasportData', {}).get('Batch_date_production'))
 
@@ -2356,9 +2439,12 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             logger.error("[!] Не удалось определить дату производства (ни из CLI, ни из заказа)")
             return None
 
-        # 2. Получаем ИНН
+        # 2. Получаем ИНН владельца карточки товара.
+        # Он нужен для чтения карточки, ТН ВЭД и разрешительных документов.
+        # Это значение может отличаться от producer_inn для linked GTIN.
         base_path = os.path.dirname(os.path.abspath(__file__))
         inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
+        participant_token = None
         if not inn:
             logger.warning(f"[*] GTIN {gtin} не найден в локальной базе GS1. Пробуем через True API...")
             participant_token = _get_participant_token()
@@ -2374,10 +2460,24 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}")
             return None
 
-        # 3. Получаем данные из НК (ТН ВЭД и разрешительные документы)
+        # producer_inn - это ИНН участника/производителя из задания. Именно он
+        # должен попасть в документ ввода и использоваться для подписи. Если
+        # поля нет, оставляем старое поведение как fallback для собственных GTIN.
+        if not producer_inn:
+            logger.warning("[!] Manufacturer_inn отсутствует в производственном задании, используем owner_inn как fallback")
+            producer_inn = inn
+
+        # 3. Получаем данные из НК (ТН ВЭД и разрешительные документы) через
+        # ИНН владельца карточки или через participant_token для linked доступа.
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
         token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+
+        # Если карточка предоставлена по субаккаунту, токена владельца карточки
+        # может не быть. Для чтения НК используем токен текущего участника.
+        if not token and participant_token:
+            logger.info(f"[*] JWT токен владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
+            token = participant_token
 
         if not token:
              # Попробуем получить новый если нет
@@ -2448,11 +2548,15 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
                 certificate_document_data=permits
             ))
 
+        # Важно: owner_inn в LP_INTRODUCE_GOODS должен соответствовать текущему
+        # участнику/собственнику кодов, а не владельцу карточки linked GTIN.
+        # Иначе ГИС МТ возвращает CHECKED_NOT_OK / INTRO_ERROR:
+        # "ИНН собственника ... не соответствует данным текущего участника".
         message = IntroduceMessage(
             production_date=auto_prod_date,
-            owner_inn=inn,
-            producer_inn=inn,
-            participant_inn=inn,
+            owner_inn=producer_inn,
+            producer_inn=producer_inn,
+            participant_inn=producer_inn,
             products=introduce_products,
             productionOrderId=production_order_id
         )
@@ -2509,10 +2613,10 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         task_content = storage_intro.read_text(task_path)
         task_data = json.loads(task_content)
         production_order_id = task_data.pop('productionOrderId', None)
-        inn = task_data.get('owner_inn')
+        inn = task_data.get('participant_inn') or task_data.get('owner_inn')
 
         if not inn:
-            logger.error(f"[!] Не найден owner_inn в задаче {order_id}")
+            logger.error(f"[!] Не найден participant_inn/owner_inn в задаче {order_id}")
             return None
 
         # Токен
@@ -3671,10 +3775,10 @@ def update_introduce_status(order_id: str, group: str):
             return None
 
         task_data = json.loads(storage_intro.read_text(task_path))
-        inn = task_data.get('owner_inn')
+        inn = task_data.get('participant_inn') or task_data.get('owner_inn')
 
         if not inn:
-            logger.error(f"[!] Не найден owner_inn в задаче {order_id}")
+            logger.error(f"[!] Не найден participant_inn/owner_inn в задаче {order_id}")
             return None
 
         # 3. Инициализация API
