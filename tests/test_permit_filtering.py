@@ -26,7 +26,7 @@ def test_get_active_permit_documents_filtering():
                     },
                     {
                         "type": "STATE_REGISTRATION_CERTIFICATE",
-                        "number": "EXPIRED_DOC",
+                        "number": "CARD_TRUSTED_SGR",
                         "active": False
                     }
                 ]
@@ -61,10 +61,50 @@ def test_get_active_permit_documents_filtering():
     with patch("requests.post", side_effect=side_effect):
         docs = nk.get_active_permit_documents_by_gtin("04630446581021")
 
-        assert len(docs) == 1
-        assert docs[0]["number"] == "ACTIVE_DOC"
-        assert docs[0]["type"] == "CONFORMITY_DECLARATION"
-        assert docs[0]["registryStatus"] == "Действует"
+        assert len(docs) == 2
+
+        docs_by_number = {doc["number"]: doc for doc in docs}
+        assert docs_by_number["ACTIVE_DOC"]["type"] == "CONFORMITY_DECLARATION"
+        assert docs_by_number["ACTIVE_DOC"]["registryStatus"] == "Действует"
+
+        sgr_doc = docs_by_number["CARD_TRUSTED_SGR"]
+        assert sgr_doc["type"] == "STATE_REGISTRATION_CERTIFICATE"
+        assert sgr_doc["active"] is False
+        assert sgr_doc["registryStatus"] is None
+
+def test_state_registration_certificate_is_included_from_card_when_inactive():
+    nk = NK(token="fake_token")
+
+    mock_info_response = MagicMock()
+    mock_info_response.status_code = 200
+    mock_info_response.json.return_value = {
+        "results": [
+            {
+                "gtin": "04660205470129",
+                "inn": "9718180660",
+                "name": "Test SGR Product",
+                "certDocList": [
+                    {
+                        "type": "STATE_REGISTRATION_CERTIFICATE",
+                        "number": "KG.11.01.09.001.R.000700.02.22",
+                        "active": False
+                    }
+                ]
+            }
+        ]
+    }
+
+    with patch("requests.post", return_value=mock_info_response) as mock_post:
+        docs = nk.get_active_permit_documents_by_gtin("04660205470129")
+
+    assert len(docs) == 1
+    assert docs[0]["number"] == "KG.11.01.09.001.R.000700.02.22"
+    assert docs[0]["type"] == "STATE_REGISTRATION_CERTIFICATE"
+    assert docs[0]["date"] == "2022-02-01"
+    assert docs[0]["active"] is False
+    assert docs[0]["registryStatus"] is None
+    assert mock_post.call_count == 1
+    assert "product/info" in mock_post.call_args.args[0]
 
 @patch("xtrek.create_emission_task_sample.load_config")
 @patch("xtrek.create_emission_task_sample.get_storage")

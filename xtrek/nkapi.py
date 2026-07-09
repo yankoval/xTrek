@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 import requests
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,14 @@ class NK:
     RD_LIST_DATEFROM_REQUIRED = {
         "CONFORMITY_CERTIFICATE",
         "CONFORMITY_DECLARATION",
+    }
+
+    # 2026-07-09: проверка в тестовом контуре показала, что ГИС МТ принимает
+    # СГР из подписанной карточки товара даже при active=false в product/info
+    # и ответе /rd/list "Документ не найден". Для этого типа документов
+    # карточка товара считается источником истины при вводе в оборот.
+    CARD_TRUSTED_PERMIT_TYPES = {
+        "STATE_REGISTRATION_CERTIFICATE",
     }
     """
     Клиент API Национального Каталога маркированных товаров (Честный Знак).
@@ -73,6 +82,20 @@ class NK:
             return datetime.strptime(value, "%Y-%m-%d").date()
         except:
             return None
+
+    def _infer_state_registration_date(self, number: Optional[str]) -> Optional[str]:
+        if not number:
+            return None
+
+        # 2026-07-09: в карточках СГР может отсутствовать отдельная дата,
+        # но номер содержит месяц и год выдачи, например
+        # KG.11.01.09.001.R.000700.02.22 -> 2022-02-01.
+        match = re.search(r"\.(0[1-9]|1[0-2])\.(\d{2})$", number)
+        if not match:
+            return None
+
+        month, year = match.groups()
+        return f"20{year}-{month}-01"
 
     def _doc_is_active_by_fields(self, doc: Dict[str, Any], on_date: date) -> bool:
         if isinstance(doc.get("active"), bool):
@@ -207,6 +230,8 @@ class NK:
         Уточнение статуса:
           POST /api/v4/true-api/rd/list, если verify_registry_status=True.
           Если /rd/list не вернул документ, используется active/date/dateTo из product/info.
+          Исключение: STATE_REGISTRATION_CERTIFICATE берется из карточки без
+          проверки active и без обязательного подтверждения через /rd/list.
         """
         on_date = on_date or date.today()
 
@@ -221,12 +246,17 @@ class NK:
 
         registry_by_key = {}
         if verify_registry_status:
-            registry_by_key = self._get_rd_list_statuses(cert_docs)
+            registry_checked_docs = [
+                doc for doc in cert_docs
+                if doc.get("type") not in self.CARD_TRUSTED_PERMIT_TYPES
+            ]
+            registry_by_key = self._get_rd_list_statuses(registry_checked_docs)
 
         active_docs = []
         for doc in cert_docs:
             key = self._rd_list_key(doc)
             registry_doc = registry_by_key.get(key)
+            is_card_trusted = doc.get("type") in self.CARD_TRUSTED_PERMIT_TYPES
 
             merged = dict(doc)
             if registry_doc:
@@ -237,8 +267,33 @@ class NK:
                     "dateTo": registry_doc.get("dateTo") or merged.get("dateTo"),
                     "registryRaw": registry_doc,
                 })
+            elif is_card_trusted and not (merged.get("date") or merged.get("dateFrom")):
+                inferred_date = self._infer_state_registration_date(merged.get("number"))
+                if inferred_date:
+                    merged["date"] = inferred_date
+                    logger.info(
+                        "GTIN %s: для СГР %s дата восстановлена из номера: %s",
+                        gtin,
+                        merged.get("number"),
+                        inferred_date,
+                    )
+                else:
+                    logger.warning(
+                        "GTIN %s: для СГР %s не удалось восстановить дату из номера",
+                        gtin,
+                        merged.get("number"),
+                    )
 
-            if merged.get("registryStatus"):
+            if is_card_trusted:
+                is_active = bool(merged.get("number"))
+                logger.info(
+                    "GTIN %s: документ %s типа %s включен из карточки товара "
+                    "без проверки active и /rd/list",
+                    gtin,
+                    merged.get("number"),
+                    merged.get("type"),
+                )
+            elif merged.get("registryStatus"):
                 is_active = merged["registryStatus"] == "Действует"
             else:
                 is_active = self._doc_is_active_by_fields(merged, on_date)
