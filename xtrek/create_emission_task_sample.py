@@ -449,7 +449,8 @@ def process_incoming_task(s3_full_key: str):
             if normalized_gtin in allowed_gtins:
                 logger.info(f"[*] GTIN {normalized_gtin} является UNIT, но разрешен фильтром allowed_gtins. Продолжаем.")
             else:
-                logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False) и не входит в allowed_gtins. Продолжаем.")
+                logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False) и не входит в allowed_gtins. Пропуск.")
+                return None
 
         # 6. Выгрузка
         prod_data['GtinType'] = gtin_type
