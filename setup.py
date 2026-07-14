@@ -22,6 +22,7 @@ setup(
             'kiz-from-rep=xtrek.kiz_from_rep:main',
             'crpt-auth=xtrek.crpt_auth:main',
             'xtrek-prn=xtrek.prn_util:main',
+            'vbg=xtrek.vbg:main',
         ],
     },
     package_data={

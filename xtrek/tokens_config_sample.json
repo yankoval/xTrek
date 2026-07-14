@@ -2,6 +2,7 @@
     "tokens_path": "s3://your-bucket-name/tokens.json",
     "orgs_path": "s3://your-bucket-name/my_orgs/",
     "tokens_update_interval": 60,
+    "vbg_api_key_path": "s3://your-bucket-name/secrets/gs1rus-api-key",
     "sign": "s3://your-bucket-name/tst/",
     "SIGNING_TIMEOUT": 60,
     "MIN_SSCC_IN_AGG_REP": 10,
