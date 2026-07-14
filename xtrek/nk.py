@@ -353,19 +353,12 @@ def main():
                 logger.warning("Карточка не найдена.")
 
             if args.inn:
-                docs = nk.get_permit_document_by_gtin(gtin, args.inn)
+                docs = nk.get_active_permit_documents_by_gtin(gtin)
                 if not docs:
                     logger.warning(f"gtin:{gtin} Разрешительные документы не найдены.")
                 else:
                     for d in docs:
-                        logger.info(f"gtin:{gtin} Документ № {d['number']} от {d['from_date']} до {d['to_date']}")
-                        if d["days_left"] is not None:
-                            if d['days_left'] < 30:
-                                logger.error(f"  Осталось {d['days_left']} дней до окончания")
-                            else:
-                                logger.info(f"  Осталось {d['days_left']} дней до окончания")
-                        logger.info(f"  Заявитель: {d['applicant']}")
-                        logger.info(f"  Изготовитель: {d['manufacturer']}")
+                        logger.info(f"gtin:{gtin} Документ № {d.get('number')} от {d.get('date')} до {d.get('dateTo')} (статус: {d.get('registryStatus')})")
 
     except Exception as e:
         logger.exception(f"Критическая ошибка: {e}")

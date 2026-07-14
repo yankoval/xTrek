@@ -16,7 +16,8 @@ def test_create_introduce_task_with_new_permits_logic(mock_token_proc, mock_org_
         "kodes": "s3://bucket/kodes",
         "introduce-tasks": "s3://bucket/intro",
         "emission_receipts": "s3://bucket/receipts",
-        "production_orders_path": "s3://bucket/prod"
+        "production_orders_path": "s3://bucket/prod",
+        "emission_orders_path": "s3://bucket/em_orders"
     }
 
     mock_storage_kodes = MagicMock()
@@ -36,7 +37,7 @@ def test_create_introduce_task_with_new_permits_logic(mock_token_proc, mock_org_
 
     mock_nk_inst = mock_nk.return_value
 
-    # Mock feedProduct response based on user example
+    # Mock feedProduct response
     mock_nk_inst.feedProduct.return_value = {
         "result": [{
             "good_attrs": [
@@ -45,32 +46,24 @@ def test_create_introduce_task_with_new_permits_logic(mock_token_proc, mock_org_
                     "attr_id": 13933,
                     "attr_name": "Код ТНВЭД",
                     "attr_value": "3307300000"
-                },
-                {
-                    "attr_group_id": 1065,
-                    "attr_id": 23557,
-                    "attr_name": "Декларация о соответствии",
-                    "attr_value": "ЕАЭС N RU Д-RU.РА09.В.37749/24:::2024-10-11"
                 }
             ]
         }]
     }
+
+    mock_nk_inst.get_active_permit_documents_by_gtin.return_value = [
+        {
+            "number": "ЕАЭС N RU Д-RU.РА09.В.37749/24",
+            "date": "2024-10-11",
+            "type": "CONFORMITY_DECLARATION"
+        }
+    ]
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 
     res = create_introduce_task("uuid", production_date="2026-04-01")
 
     assert res == "uuid"
-
-    # Check that upload was called with correct data
-    args, kwargs = mock_storage_intro.upload.call_args
-    # In the code, temp_local is unlinked after upload, so we can't read it.
-    # But wait, create_introduce_task uses temp_local = Path(f"temp_intro_{order_id}.json")
-    # Let's mock the upload to capture the content instead of looking at the file.
-
-    # Actually, better to check write_file or similar if we could,
-    # but here we can just use a side effect on upload to read the file before it's deleted.
-    pass
 
 @patch("xtrek.create_emission_task_sample.load_config")
 @patch("xtrek.create_emission_task_sample.get_storage")
@@ -85,7 +78,8 @@ def test_create_introduce_task_with_new_permits_logic_verified(mock_token_proc, 
         "kodes": "s3://bucket/kodes",
         "introduce-tasks": "s3://bucket/intro",
         "emission_receipts": "s3://bucket/receipts",
-        "production_orders_path": "s3://bucket/prod"
+        "production_orders_path": "s3://bucket/prod",
+        "emission_orders_path": "s3://bucket/em_orders"
     }
 
     mock_storage_kodes = MagicMock()
@@ -113,7 +107,7 @@ def test_create_introduce_task_with_new_permits_logic_verified(mock_token_proc, 
 
     mock_nk_inst = mock_nk.return_value
 
-    # Mock feedProduct response based on user example
+    # Mock feedProduct response
     mock_nk_inst.feedProduct.return_value = {
         "result": [{
             "good_attrs": [
@@ -122,16 +116,18 @@ def test_create_introduce_task_with_new_permits_logic_verified(mock_token_proc, 
                     "attr_id": 13933,
                     "attr_name": "Код ТНВЭД",
                     "attr_value": "3307300000"
-                },
-                {
-                    "attr_group_id": 1065,
-                    "attr_id": 23557,
-                    "attr_name": "Декларация о соответствии",
-                    "attr_value": "ЕАЭС N RU Д-RU.РА09.В.37749/24:::2024-10-11"
                 }
             ]
         }]
     }
+
+    mock_nk_inst.get_active_permit_documents_by_gtin.return_value = [
+        {
+            "number": "ЕАЭС N RU Д-RU.РА09.В.37749/24",
+            "date": "2024-10-11",
+            "type": "CONFORMITY_DECLARATION"
+        }
+    ]
 
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 
@@ -170,7 +166,6 @@ def test_create_introduce_task_error_no_permits(mock_token_proc, mock_org_man, m
     mock_get_inn.return_value = "7733154124"
     mock_nk_inst = mock_nk.return_value
 
-    # No group 1065 in good_attrs
     mock_nk_inst.feedProduct.return_value = {
         "result": [{
             "tnved_code": "3307300000",
@@ -178,10 +173,11 @@ def test_create_introduce_task_error_no_permits(mock_token_proc, mock_org_man, m
         }]
     }
 
+    mock_nk_inst.get_active_permit_documents_by_gtin.return_value = []
+
     mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
 
     res = create_introduce_task("uuid", production_date="2026-04-01")
 
     assert res is None
-    # Check if tag was set
     mock_storage_kodes.set_tags.assert_called_with("s3://bucket/kodes/uuid.json", {"статусСообщенияВводаВОборот": "Error"})

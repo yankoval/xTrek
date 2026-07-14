@@ -134,9 +134,10 @@ def test_create_emission_task_nk_failure(mock_dependencies):
     # Mock Token
     deps['tp'].return_value.get_token_value_by_inn.return_value = 'fake-token'
 
-    # Mock NK.feedProduct failure
+    # Mock NK failure (both methods)
     mock_nk_instance = deps['nk'].return_value
     mock_nk_instance.feedProduct.return_value = None
+    mock_nk_instance.product_info.return_value = None
 
     # We expect an exception now
     result = create_emission_task('order123_fail', 'chemistry', 'contact')

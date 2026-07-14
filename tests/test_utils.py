@@ -172,6 +172,12 @@ def test_status_logic(analyzer, tmp_path):
     file1.write_text(json.dumps(data))
 
     # Mock NK
+    def mock_info(gtin):
+        if gtin == "04640286999931": return {"isSet": True}
+        if gtin == "04630234040808": return {"isSet": False}
+        return None
+    analyzer.nk.product_info.side_effect = mock_info
+
     def mock_feed(gtin):
         if gtin == "04640286999931": return {"result": [{"is_set": True}]}
         if gtin == "04630234040808": return {"result": [{"is_set": False}]}

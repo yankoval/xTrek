@@ -1,14 +1,37 @@
 import os
 import json
 import logging
+import re
 import requests
-from datetime import datetime
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
 from .suz_api_models import GtinDocument
 
 logger = logging.getLogger(__name__)
 
 
 class NK:
+
+    TRUE_API_PERMIT_TYPES = {
+        "CONFORMITY_CERTIFICATE",
+        "CONFORMITY_DECLARATION",
+        "STATE_REGISTRATION_CERTIFICATE",
+        "REGISTRATION_CERTIFICATE",
+        "REGISTRATION_VET_CERTIFICATE",
+    }
+
+    RD_LIST_DATEFROM_REQUIRED = {
+        "CONFORMITY_CERTIFICATE",
+        "CONFORMITY_DECLARATION",
+    }
+
+    # 2026-07-09: проверка в тестовом контуре показала, что ГИС МТ принимает
+    # СГР из подписанной карточки товара даже при active=false в product/info
+    # и ответе /rd/list "Документ не найден". Для этого типа документов
+    # карточка товара считается источником истины при вводе в оборот.
+    CARD_TRUSTED_PERMIT_TYPES = {
+        "STATE_REGISTRATION_CERTIFICATE",
+    }
     """
     Клиент API Национального Каталога маркированных товаров (Честный Знак).
     Версия API: v5.38
@@ -37,6 +60,260 @@ class NK:
             self.base_url = "https://api.nk.sandbox.crptech.ru"
         else:
             self.base_url = os.getenv("NK_API_HOST", "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai")
+
+    def _true_api_base_url(self) -> str:
+        if self.sandbox:
+            return "https://markirovka.sandbox.crptech.ru/api/v4/true-api"
+        return "https://markirovka.crpt.ru/api/v4/true-api"
+
+    def _true_api_headers(self) -> Dict[str, str]:
+        if not self.token:
+            raise ValueError("Для True API нужен Bearer token")
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}",
+        }
+
+    def _parse_iso_date(self, value: Optional[str]) -> Optional[date]:
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except:
+            return None
+
+    def _infer_state_registration_date(self, number: Optional[str]) -> Optional[str]:
+        if not number:
+            return None
+
+        # 2026-07-09: в карточках СГР может отсутствовать отдельная дата,
+        # но номер содержит месяц и год выдачи, например
+        # KG.11.01.09.001.R.000700.02.22 -> 2022-02-01.
+        match = re.search(r"\.(0[1-9]|1[0-2])\.(\d{2})$", number)
+        if not match:
+            return None
+
+        month, year = match.groups()
+        return f"20{year}-{month}-01"
+
+    def _doc_is_active_by_fields(self, doc: Dict[str, Any], on_date: date) -> bool:
+        if isinstance(doc.get("active"), bool):
+            return doc["active"]
+
+        date_from = self._parse_iso_date(doc.get("date") or doc.get("dateFrom"))
+        date_to = self._parse_iso_date(doc.get("dateTo"))
+
+        if date_from and date_from > on_date:
+            return False
+        if date_to and date_to < on_date:
+            return False
+
+        return bool(date_from or date_to or doc.get("unlimited") is True)
+
+    def _rd_list_key(self, doc: Dict[str, Any]) -> tuple:
+        # For declaration/certificate dateFrom disambiguates documents.
+        # For SGR-like docs API may ignore dateFrom.
+        return (
+            doc.get("type"),
+            doc.get("number"),
+            doc.get("date") or doc.get("dateFrom") or "",
+        )
+
+    def _get_rd_list_statuses(self, docs: List[Dict[str, Any]]) -> Dict[tuple, Dict[str, Any]]:
+        if not docs:
+            return {}
+
+        result = {}
+        url = f"{self._true_api_base_url()}/rd/list"
+
+        payload_docs = []
+        for doc in docs:
+            doc_type = doc.get("type")
+            number = doc.get("number")
+            doc_date = doc.get("date") or doc.get("dateFrom")
+
+            if doc_type not in self.TRUE_API_PERMIT_TYPES or not number:
+                continue
+
+            item = {"type": doc_type, "number": number}
+            if doc_type in self.RD_LIST_DATEFROM_REQUIRED:
+                if not doc_date:
+                    continue
+                item["dateFrom"] = doc_date
+            elif doc_date:
+                item["dateFrom"] = doc_date
+
+            payload_docs.append(item)
+
+        # /rd/list accepts max 25 documents.
+        for i in range(0, len(payload_docs), 25):
+            chunk = payload_docs[i:i + 25]
+            logger.info(f"POST {url} (/rd/list docs: {len(chunk)})")
+            try:
+                response = requests.post(
+                    url,
+                    headers=self._true_api_headers(),
+                    json={"documents": chunk},
+                    timeout=30,
+                )
+                logger.info(f"Status: {response.status_code}")
+
+                if response.status_code != 200:
+                    logger.warning(f"/rd/list failed: {response.status_code} {response.text}")
+                    continue
+
+                data = response.json()
+                for rd_doc in data.get("result", {}).get("documents", []):
+                    key = (
+                        rd_doc.get("type"),
+                        rd_doc.get("number"),
+                        rd_doc.get("dateFrom") or "",
+                    )
+                    result[key] = rd_doc
+
+                for err in data.get("result", {}).get("errors", []):
+                    logger.info(f"/rd/list error for {err.get('number')}: {err.get('message')}")
+            except Exception as e:
+                logger.error(f"Error in _get_rd_list_statuses: {e}")
+
+        return result
+
+    def product_info(self, gtin: str, rd_info: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Метод «/v4/true-api/product/info» возвращает расширенную информацию о товаре.
+        """
+        url = f"{self._true_api_base_url()}/product/info"
+        payload = {"gtins": [gtin], "rdInfo": rd_info}
+
+        logger.info(f"POST {url} (GTIN: {gtin}, rdInfo={rd_info})")
+        try:
+            response = requests.post(
+                url,
+                headers=self._true_api_headers(),
+                json=payload,
+                timeout=30,
+            )
+            logger.info(f"Status: {response.status_code}")
+
+            if response.status_code != 200:
+                logger.error(f"Ошибка product/info: {response.status_code} {response.text}")
+                return None
+
+            data = response.json()
+            results = data.get("results") or []
+            if not results:
+                logger.info(f"GTIN {gtin}: product/info не вернул карточку")
+                return None
+
+            return results[0]
+        except Exception as e:
+            logger.error(f"Error calling product/info: {e}")
+            return None
+
+    def get_active_permit_documents_by_gtin(
+        self,
+        gtin: str,
+        on_date: Optional[date] = None,
+        verify_registry_status: bool = True,
+        product: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает активные разрешительные документы по GTIN.
+
+        Работает и для собственных GTIN, и для GTIN, предоставленных через субаккаунт,
+        если текущий token имеет доступ к карточке.
+
+        Источник списка документов:
+          POST /api/v4/true-api/product/info с rdInfo=true
+
+        Уточнение статуса:
+          POST /api/v4/true-api/rd/list, если verify_registry_status=True.
+          Если /rd/list не вернул документ, используется active/date/dateTo из product/info.
+          Исключение: STATE_REGISTRATION_CERTIFICATE берется из карточки без
+          проверки active и без обязательного подтверждения через /rd/list.
+        """
+        on_date = on_date or date.today()
+
+        if not product:
+            product = self.product_info(gtin, rd_info=True)
+            if not product:
+                return []
+        cert_docs = product.get("certDocList") or []
+        if not cert_docs:
+            logger.info(f"GTIN {gtin}: certDocList пустой")
+            return []
+
+        registry_by_key = {}
+        if verify_registry_status:
+            registry_checked_docs = [
+                doc for doc in cert_docs
+                if doc.get("type") not in self.CARD_TRUSTED_PERMIT_TYPES
+            ]
+            registry_by_key = self._get_rd_list_statuses(registry_checked_docs)
+
+        active_docs = []
+        for doc in cert_docs:
+            key = self._rd_list_key(doc)
+            registry_doc = registry_by_key.get(key)
+            is_card_trusted = doc.get("type") in self.CARD_TRUSTED_PERMIT_TYPES
+
+            merged = dict(doc)
+            if registry_doc:
+                merged.update({
+                    "registryStatus": registry_doc.get("status"),
+                    "indx": registry_doc.get("indx"),
+                    "date": registry_doc.get("dateFrom") or merged.get("date"),
+                    "dateTo": registry_doc.get("dateTo") or merged.get("dateTo"),
+                    "registryRaw": registry_doc,
+                })
+            elif is_card_trusted and not (merged.get("date") or merged.get("dateFrom")):
+                inferred_date = self._infer_state_registration_date(merged.get("number"))
+                if inferred_date:
+                    merged["date"] = inferred_date
+                    logger.info(
+                        "GTIN %s: для СГР %s дата восстановлена из номера: %s",
+                        gtin,
+                        merged.get("number"),
+                        inferred_date,
+                    )
+                else:
+                    logger.warning(
+                        "GTIN %s: для СГР %s не удалось восстановить дату из номера",
+                        gtin,
+                        merged.get("number"),
+                    )
+
+            if is_card_trusted:
+                is_active = bool(merged.get("number"))
+                logger.info(
+                    "GTIN %s: документ %s типа %s включен из карточки товара "
+                    "без проверки active и /rd/list",
+                    gtin,
+                    merged.get("number"),
+                    merged.get("type"),
+                )
+            elif merged.get("registryStatus"):
+                is_active = merged["registryStatus"] == "Действует"
+            else:
+                is_active = self._doc_is_active_by_fields(merged, on_date)
+
+            if is_active:
+                active_docs.append({
+                    "gtin": product.get("gtin"),
+                    "productName": product.get("name"),
+                    "ownerInn": product.get("inn"),
+                    "type": merged.get("type"),
+                    "number": merged.get("number"),
+                    "date": merged.get("date") or merged.get("dateFrom"),
+                    "dateTo": merged.get("dateTo"),
+                    "active": merged.get("active"),
+                    "registryStatus": merged.get("registryStatus"),
+                    "indx": merged.get("indx"),
+                    "raw": merged,
+                })
+
+        return active_docs
 
     # ---------------------------
     # Метод 1: Получить карточку по GTIN (v3/product)
@@ -131,10 +408,26 @@ class NK:
             docs = result.get("documents", [])
             errors = result.get("errors", [])
             logger.info(f'Gtin:{gtin} error:{errors}')
+
+            CERT_TYPE_MAP = {
+                23557: "CONFORMITY_DECLARATION",
+                23561: "CONFORMITY_CERTIFICATE",
+                23765: "STATE_REGISTRATION_CERTIFICATE"
+            }
+
             for d in docs:
+                if d.get("status") == "Прекращен":
+                    logger.info(f"Документ {d.get('number')} пропущен (статус: Прекращен)")
+                    continue
+
                 number = d.get("number")
                 from_date = d.get("from_date")
-                type_doc = d.get("type") # Предполагаем 'type', логирование покажет точное имя
+                attr_id = d.get("attr_id")
+                type_doc = CERT_TYPE_MAP.get(attr_id)
+
+                if not type_doc:
+                    # Резервный вариант, если attr_id не в мапе
+                    type_doc = d.get("type") or d.get("product_type")
 
                 documents.append(GtinDocument(
                     certificate_number=number,
