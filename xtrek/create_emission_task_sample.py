@@ -56,6 +56,34 @@ DEFAULT_SIGNING_TIMEOUT = 60
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def _vbg_diagnostics_enabled(config):
+    value = os.getenv("XTREK_VBG_DIAGNOSTICS")
+    if value is not None:
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(config.get("vbg_diagnostics"))
+
+
+def _log_vbg_gtin_diagnostics(gtin):
+    try:
+        from .vbg import diagnose_gtins
+        summary = diagnose_gtins([gtin])[0]
+    except Exception as e:
+        logger.warning(f"[*] VbG diagnostics failed for GTIN {gtin}: {e}")
+        return
+
+    logger.info(
+        "[*] VbG GTIN %s: success=%s owner=%s inn=%s gln=%s brand=%s name=%s",
+        summary.get("gtin") or gtin,
+        summary.get("success"),
+        summary.get("licenseeName") or "-",
+        summary.get("licenseeINN") or "-",
+        summary.get("licenseeGLN") or "-",
+        summary.get("brandName") or "-",
+        summary.get("productDescription") or "-",
+    )
+
+
 def create_virtual_tasks_from_equipment_report(production_order_id: str):
     """
     Обертка для create_virtual_production_tasks, которая берет количество из отчета оборудования.
@@ -450,6 +478,8 @@ def process_incoming_task(s3_full_key: str):
                 logger.info(f"[*] GTIN {normalized_gtin} является UNIT, но разрешен фильтром allowed_gtins. Продолжаем.")
             else:
                 logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False) и не входит в allowed_gtins. Пропуск.")
+                if _vbg_diagnostics_enabled(config):
+                    _log_vbg_gtin_diagnostics(normalized_gtin)
                 return None
 
         # 6. Выгрузка
@@ -3884,6 +3914,8 @@ def main():
     parser.add_argument("--production-date", help="Дата производства для отчета (yyyy-MM-dd)")
     parser.add_argument("--expiration-date", help="Дата истечения срока годности для отчета (yyyy-MM-dd)")
     parser.add_argument("--get-codes", help="Получить коды для заказа по orderId (UUID)")
+    parser.add_argument("--vbg-gtin-info", nargs="+", help="Диагностика GTIN через GS1 Russia VbG API")
+    parser.add_argument("--vbg-diagnostics", action="store_true", help="При --process-task логировать VbG владельца/ИНН для пропущенных UNIT")
 
     args = parser.parse_args()
 
@@ -3895,6 +3927,17 @@ def main():
         logger.setLevel(logging.DEBUG)
         logging.getLogger('trueapi').setLevel(logging.DEBUG)
         logging.getLogger('suz').setLevel(logging.DEBUG)
+
+    if args.vbg_diagnostics:
+        os.environ["XTREK_VBG_DIAGNOSTICS"] = "1"
+
+    if args.vbg_gtin_info:
+        from .vbg import format_summary, diagnose_gtins
+        for index, summary in enumerate(diagnose_gtins(args.vbg_gtin_info)):
+            if index:
+                print()
+            print(format_summary(summary))
+        return
 
     if args.status:
         result = update_emission_order_status(args.status)
