@@ -468,7 +468,12 @@ def process_incoming_task(s3_full_key: str):
             f_res = f_res[0]
 
         is_set = f_res.get('is_set', False)
-        allowed_gtins = config.get('allowed_gtins', [])
+        allowed_gtins = {str(x).strip().zfill(14) for x in (config.get('allowed_gtins') or []) if str(x).strip()}
+        unit_enabled_inns = {str(x).strip() for x in (config.get('unit_enabled_inns') or []) if str(x).strip()}
+        pasport = prod_data.get('PasportData', {})
+        manufacturer_inn = str(
+            prod_data.get('Manufacturer_inn') or pasport.get('Manufacturer_inn') or ''
+        ).strip()
 
         gtin_type = "SET" if is_set else "UNIT"
         task_type = "agg-set-virtual" if is_set else "agg-unit"
@@ -476,8 +481,12 @@ def process_incoming_task(s3_full_key: str):
         if not is_set:
             if normalized_gtin in allowed_gtins:
                 logger.info(f"[*] GTIN {normalized_gtin} является UNIT, но разрешен фильтром allowed_gtins. Продолжаем.")
+            elif manufacturer_inn and manufacturer_inn in unit_enabled_inns:
+                logger.info(f"[*] GTIN {normalized_gtin} является UNIT, но ИНН производителя {manufacturer_inn} разрешен фильтром unit_enabled_inns. Продолжаем.")
+            elif inn and str(inn) in unit_enabled_inns:
+                logger.info(f"[*] GTIN {normalized_gtin} является UNIT, но ИНН владельца GTIN {inn} разрешен фильтром unit_enabled_inns. Продолжаем.")
             else:
-                logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False) и не входит в allowed_gtins. Пропуск.")
+                logger.info(f"[*] GTIN {normalized_gtin} не является набором (is_set=False), не входит в allowed_gtins и не разрешен по ИНН. Пропуск.")
                 if _vbg_diagnostics_enabled(config):
                     _log_vbg_gtin_diagnostics(normalized_gtin)
                 return None
@@ -487,7 +496,6 @@ def process_incoming_task(s3_full_key: str):
         prod_data['TaskType'] = task_type
 
         article = prod_data.get('Article', 'unknown')
-        pasport = prod_data.get('PasportData', {})
         batch_number = pasport.get('Batch_number', 'unknown')
 
         new_filename = f"T-{article}-{batch_number}-{original_filename}"

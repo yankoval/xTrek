@@ -1,4 +1,5 @@
 import os
+import json
 from celery import Celery
 from urllib.parse import quote
 
@@ -360,7 +361,7 @@ def logic_update_introduce(full_key):
         raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id}  result:{result}")
     result = result[0] if isinstance(result, list) and len(result) > 0 else result
     if isinstance(result, dict) and result.get('status')== 'CHECKED_OK':
-        prod_id = _find_production_order_id_by_suz_order_id(introduceReceipt_id)
+        prod_id = result.get('productionOrderId') or _find_production_order_id_by_suz_order_id(introduceReceipt_id)
         if not prod_id:
             return f"introduce status for {introduceReceipt_id} is CHECKED_OK, but prod_id not found"
 
