@@ -41,11 +41,12 @@ class _FakeCelery:
         return decorator
 
 
-def import_tasks(monkeypatch):
+def import_tasks(monkeypatch, module_name="tasks"):
     monkeypatch.setenv("YMQ_ACCESS_KEY", "test-access")
     monkeypatch.setenv("YMQ_SECRET_KEY", "test-secret")
     monkeypatch.setenv("YMQ_QUEUE_URL", "https://example.test/queue")
     sys.modules.pop("tasks", None)
+    sys.modules.pop("xtrek.tasks", None)
     monkeypatch.setitem(sys.modules, "celery", types.SimpleNamespace(Celery=_FakeCelery))
     config = {
         "input_bucket": "input-bucket",
@@ -55,7 +56,14 @@ def import_tasks(monkeypatch):
         "sign": "/tmp/sign",
     }
     with patch("xtrek.config_loader.load_config", return_value=config):
-        return importlib.import_module("tasks")
+        return importlib.import_module(module_name)
+
+
+def test_tasks_module_is_available_from_package_and_legacy_entrypoint(monkeypatch):
+    legacy_tasks = import_tasks(monkeypatch, "tasks")
+    package_tasks = importlib.import_module("xtrek.tasks")
+
+    assert legacy_tasks is package_tasks
 
 
 def test_process_s3_event_routes_equipment_report_through_celery(monkeypatch):
