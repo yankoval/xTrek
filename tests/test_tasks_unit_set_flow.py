@@ -1,6 +1,44 @@
 import importlib
 import sys
+import types
 from unittest.mock import MagicMock, patch
+
+
+class _EagerResult:
+    def __init__(self, value=None, error=None):
+        self.result = value if error is None else error
+        self._successful = error is None
+
+    def successful(self):
+        return self._successful
+
+
+class _EagerTask:
+    def __init__(self, func, bind=False):
+        self._func = func
+        self._bind = bind
+
+    def __call__(self, *args, **kwargs):
+        if self._bind:
+            return self._func(types.SimpleNamespace(), *args, **kwargs)
+        return self._func(*args, **kwargs)
+
+    def apply(self, args=None, kwargs=None):
+        try:
+            return _EagerResult(self(*(args or ()), **(kwargs or {})))
+        except Exception as exc:
+            return _EagerResult(error=exc)
+
+
+class _FakeCelery:
+    def __init__(self, *args, **kwargs):
+        self.conf = types.SimpleNamespace(update=lambda **kw: None)
+
+    def task(self, *args, **kwargs):
+        def decorator(func):
+            return _EagerTask(func, bind=kwargs.get("bind", False))
+
+        return decorator
 
 
 def import_tasks(monkeypatch):
@@ -8,6 +46,7 @@ def import_tasks(monkeypatch):
     monkeypatch.setenv("YMQ_SECRET_KEY", "test-secret")
     monkeypatch.setenv("YMQ_QUEUE_URL", "https://example.test/queue")
     sys.modules.pop("tasks", None)
+    monkeypatch.setitem(sys.modules, "celery", types.SimpleNamespace(Celery=_FakeCelery))
     config = {
         "input_bucket": "input-bucket",
         "internal_bucket": "internal-bucket",
