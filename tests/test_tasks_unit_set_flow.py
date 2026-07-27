@@ -140,8 +140,44 @@ def test_equipment_report_retries_when_precheck_returns_api_error(monkeypatch):
     assert "equipment report precheck True API failure for T-UNIT" in error
     assert "HTTP 401 Unauthorized" in error
     assert (
-        "retryable HTTP codes: 401, 403, 408, 429, 500, 502, 503, 504"
+        "retryable HTTP codes: 401, 408, 429, 500, 502, 503, 504"
         in error
+    )
+    create_util.assert_not_called()
+    sign_util.assert_not_called()
+
+
+def test_equipment_report_stops_without_retry_on_forbidden_precheck(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    create_util = MagicMock()
+    sign_util = MagicMock()
+    set_check_tag = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        tasks,
+        "check_aggregation_reports",
+        MagicMock(return_value={
+            "s3://internal-bucket/equipment-reports/T-UNIT.json": {
+                "api_error": ["403 Client Error: Forbidden"]
+            }
+        }),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_set_equipment_report_check_tag",
+        set_check_tag,
+    )
+    monkeypatch.setattr(tasks, "create_utilisation_task_from_report", create_util)
+    monkeypatch.setattr(tasks, "sign_and_send_utilisation", sign_util)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports/T-UNIT.json",
+    }])
+
+    assert result.successful()
+    set_check_tag.assert_called_once_with(
+        "s3://internal-bucket/equipment-reports/T-UNIT.json",
+        "true-api-403-forbidden",
     )
     create_util.assert_not_called()
     sign_util.assert_not_called()

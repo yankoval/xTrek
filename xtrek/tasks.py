@@ -88,7 +88,6 @@ app.conf.update(
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 _EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS = {
     401: "Unauthorized",
-    403: "Forbidden",
     408: "Request Timeout",
     429: "Too Many Requests",
     500: "Internal Server Error",
@@ -96,19 +95,35 @@ _EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS = {
     503: "Service Unavailable",
     504: "Gateway Timeout",
 }
+_EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS = {
+    403: "Forbidden",
+}
 
 
-def _describe_equipment_report_api_error(error):
+def _equipment_report_api_error_details(error):
     if isinstance(error, str):
         error_text = error
     else:
         error_text = json.dumps(error, ensure_ascii=False, default=str)
 
+    status_codes = {
+        int(match)
+        for match in re.findall(r"\b([45]\d{2})\b", error_text)
+    }
+    return error_text, status_codes
+
+
+def _describe_equipment_report_api_error(error):
+    error_text, status_codes = _equipment_report_api_error_details(error)
+    known_errors = {
+        **_EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS,
+        **_EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS,
+    }
     detected = [
-        f"HTTP {status_code} {description}"
-        for status_code, description
-        in _EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS.items()
-        if re.search(rf"\b{status_code}\b", error_text)
+        "HTTP "
+        f"{status_code}"
+        f"{f' {known_errors[status_code]}' if status_code in known_errors else ''}"
+        for status_code in sorted(status_codes)
     ]
     if detected:
         failure = ", ".join(detected)
@@ -123,6 +138,21 @@ def _describe_equipment_report_api_error(error):
         f"{failure}; retryable HTTP codes: {retryable_codes}; "
         f"details: {error_text}"
     )
+
+
+def _set_equipment_report_check_tag(report_path, tag_value):
+    try:
+        from xtrek.storage import get_storage
+
+        storage = get_storage(report_path, config.get("s3_config"))
+        storage.set_tags(report_path, {"check": tag_value})
+        return True
+    except Exception as exc:
+        print(
+            f"[WARN] Не удалось установить check={tag_value} "
+            f"для {report_path}: {exc}"
+        )
+        return False
 
 
 def _is_failed_send_result(result):
@@ -458,9 +488,9 @@ def logic_start_equipment_reports(full_key):
     # Проверяем отчет перед обработкой
     result = check_aggregation_reports([production_order_id])
     
-    # Ошибки авторизации/доступа (401, 403), таймауты и rate limit
-    # (408, 429), ошибки True API/upstream (500, 502, 503, 504), а также
-    # сетевые ошибки без HTTP-кода означают, что отчет фактически не проверен.
+    # Ошибки авторизации (401), таймауты и rate limit (408, 429), ошибки
+    # True API/upstream (500, 502, 503, 504), а также сетевые ошибки без
+    # HTTP-кода означают, что отчет фактически не проверен.
     # Поднимаем исключение, чтобы Celery повторил проверку после восстановления,
     # не переходя к созданию документов.
     if not result:
@@ -471,9 +501,24 @@ def logic_start_equipment_reports(full_key):
     error = next(iter(result.values()))
     if error:
         if isinstance(error, dict) and error.get("api_error"):
+            _, status_codes = _equipment_report_api_error_details(
+                error["api_error"]
+            )
             api_error = _describe_equipment_report_api_error(
                 error["api_error"]
             )
+            if status_codes & set(
+                _EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS
+            ):
+                report_path = next(iter(result))
+                _set_equipment_report_check_tag(
+                    report_path,
+                    "true-api-403-forbidden",
+                )
+                return (
+                    f"Обработка отчета оборудования {production_order_id} "
+                    f"остановлена без retry: {api_error}"
+                )
             raise RuntimeError(
                 f"equipment report precheck True API failure for "
                 f"{production_order_id}: {api_error}"
