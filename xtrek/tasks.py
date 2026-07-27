@@ -85,6 +85,22 @@ app.conf.update(
 )
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def _is_failed_send_result(result):
+    if not result:
+        return True
+    if isinstance(result, dict):
+        if result.get("error"):
+            return True
+        status_code = result.get("status_code") or result.get("code")
+        if isinstance(status_code, int) and status_code >= 400:
+            return True
+        if isinstance(status_code, str) and status_code.isdigit() and int(status_code) >= 400:
+            return True
+    if isinstance(result, str) and "error" in result.lower():
+        return True
+    return False
+
+
 def get_production_order_data(production_order_id):
     """
     Загружает данные производственного задания из S3/Локально.
@@ -319,7 +335,7 @@ def logic_utilisationReceipt(full_key):
             if not res1:
                 raise RuntimeError(f"create_introduce_task_from_report failed for {utilisationReceipt_id}")
             res2 = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
-            if not res2:
+            if _is_failed_send_result(res2):
                 raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
             return f"Introduction task for UNIT {utilisationReceipt_id} started successfully"
         else:
@@ -334,7 +350,7 @@ def logic_utilisationReceipt(full_key):
     if type(result) is ProductionOrder:
         if result.virtual:
             result = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
-            if not result:
+            if _is_failed_send_result(result):
                 raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
 
             return f"Introduce task for virtual {utilisationReceipt_id} has been send successfully:{result}"
@@ -382,7 +398,7 @@ def logic_update_introduce(full_key):
                 if not res1:
                     raise RuntimeError(f"create_aggregation_report failed for {prod_id}")
                 res2 = sign_and_send_aggregation(prod_id, PRODUCT_GROUP, signing_dir, 120)
-                if not res2:
+                if _is_failed_send_result(res2):
                     raise RuntimeError(f"sign_and_send_aggregation failed for {prod_id}")
                 return f"Standard aggregation for UNIT {prod_id} started successfully"
 
@@ -414,12 +430,12 @@ def logic_start_equipment_reports(full_key):
     print(f"Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство")
     utResult = create_utilisation_task_from_report(report_id, group)
     if not utResult:
-        print(f"Ошибка при попытке создания отчёта о нанесении по отчету оборудования f{report_id}. Продолжаем обработку. {utResult}")
+        raise RuntimeError(f"create_utilisation_task_from_report failed for {report_id}")
     else:
         print("Подписываем/отправляем")
         sutResult = sign_and_send_utilisation(report_id, signing_dir, 120)
-        if not sutResult:
-            print(f"sign_and_send_utilisation failed for {report_id}")
+        if _is_failed_send_result(sutResult):
+            raise RuntimeError(f"sign_and_send_utilisation failed for {report_id}")
     
     
     # Проверяем тип задания
@@ -483,7 +499,7 @@ def logic_update_agg_set(full_key):
 
         # 2. Подписываем и отправляем
         res2 = sign_and_send_aggregation(production_order_id, group, signing_dir, 120)
-        if not res2:
+        if _is_failed_send_result(res2):
             raise RuntimeError(f"sign_and_send_aggregation failed for {production_order_id}")
 
         return f"Standard aggregation for {production_order_id} started successfully"

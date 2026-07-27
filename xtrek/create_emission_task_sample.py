@@ -7,6 +7,7 @@ import uuid
 import logging
 import inspect
 from pathlib import Path
+from urllib.parse import urlparse
 
 import base64
 from .suz_api_models import (
@@ -64,6 +65,116 @@ DEFAULT_SIGNING_TIMEOUT = 60
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _load_existing_document_receipt(storage, receipt_path):
+    if not storage.exists(receipt_path):
+        return None
+
+    try:
+        receipt = json.loads(storage.read_text(receipt_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"[!] Существующий чек отправки поврежден: {receipt_path}. "
+            "Повторная отправка заблокирована."
+        ) from exc
+
+    if not isinstance(receipt, dict) or not receipt.get("document_id"):
+        raise RuntimeError(
+            f"[!] В существующем чеке нет document_id: {receipt_path}. "
+            "Повторная отправка заблокирована."
+        )
+    return receipt
+
+
+def _document_submission_lock_path(receipts_path, operation, task_id):
+    safe_task_id = str(task_id).replace("/", "_")
+    if str(receipts_path).startswith("s3://"):
+        parsed = urlparse(str(receipts_path))
+        return (
+            f"s3://{parsed.netloc}/documentSubmissionLocks/"
+            f"{operation}/{safe_task_id}.lock"
+        )
+
+    receipts_root = Path(receipts_path).parent
+    return str(
+        receipts_root
+        / "documentSubmissionLocks"
+        / operation
+        / f"{safe_task_id}.lock"
+    )
+
+
+def _claim_document_submission(receipts_path, s3_config, operation, task_id):
+    storage = get_storage(receipts_path, s3_config)
+    receipt_path = f"{str(receipts_path).rstrip('/')}/{task_id}.json"
+    existing_receipt = _load_existing_document_receipt(storage, receipt_path)
+    if existing_receipt is not None:
+        logger.info(
+            "[IDEMPOTENCY] %s для %s уже отправлен как %s; повторная "
+            "отправка пропущена.",
+            operation,
+            task_id,
+            existing_receipt["document_id"],
+        )
+        return existing_receipt, storage, receipt_path, None
+
+    lock_path = _document_submission_lock_path(receipts_path, operation, task_id)
+    lock_content = json.dumps(
+        {
+            "operation": operation,
+            "taskId": str(task_id),
+            "createdAtUnix": time.time(),
+            "pid": os.getpid(),
+        },
+        ensure_ascii=False,
+    )
+    if not storage.acquire_lock(lock_path, lock_content):
+        existing_receipt = _load_existing_document_receipt(storage, receipt_path)
+        if existing_receipt is not None:
+            logger.info(
+                "[IDEMPOTENCY] %s для %s завершен другим воркером как %s; "
+                "повторная отправка пропущена.",
+                operation,
+                task_id,
+                existing_receipt["document_id"],
+            )
+            return existing_receipt, storage, receipt_path, None
+        raise RuntimeError(
+            f"[IDEMPOTENCY] Отправка {operation} для {task_id} уже выполняется "
+            f"другим воркером; lock={lock_path}"
+        )
+
+    try:
+        existing_receipt = _load_existing_document_receipt(storage, receipt_path)
+    except Exception:
+        storage.release_lock(lock_path)
+        raise
+    if existing_receipt is not None:
+        storage.release_lock(lock_path)
+        logger.info(
+            "[IDEMPOTENCY] %s для %s появился после захвата lock как %s; "
+            "повторная отправка пропущена.",
+            operation,
+            task_id,
+            existing_receipt["document_id"],
+        )
+        return existing_receipt, storage, receipt_path, None
+
+    return None, storage, receipt_path, lock_path
+
+
+def _release_document_submission_lock(storage, lock_path):
+    if not lock_path:
+        return
+    try:
+        storage.release_lock(lock_path)
+    except Exception as exc:
+        logger.warning(
+            "[IDEMPOTENCY] Не удалось удалить lock %s: %s",
+            lock_path,
+            exc,
+        )
 
 
 def _vbg_diagnostics_enabled(config):
@@ -705,15 +816,13 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
         timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([emission_orders_path, emission_receipts_path]):
-            logger.error(f"[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emission_receipts)")
-            return None
+            raise RuntimeError("[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emission_receipts)")
 
         storage_orders = get_storage(emission_orders_path, s3_config)
         order_path = f"{emission_orders_path.rstrip('/')}/{production_order_id}.json"
 
         if not storage_orders.exists(order_path):
-            logger.error(f"[!] Файл заказа не найден: {order_path}")
-            return None
+            raise RuntimeError(f"[!] Файл заказа не найден: {order_path}")
 
         # 1. Устанавливаем тег status:processing
         logger.info(f"[*] Пометка заказа {production_order_id} как processing")
@@ -745,9 +854,8 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
                     inn = manufacturer_inn
 
         if not inn:
-            logger.error(f"[!] Не удалось определить ИНН для GTIN {gtin}")
             storage_orders.mark_error(order_path)
-            return None
+            raise RuntimeError(f"[!] Не удалось определить ИНН для GTIN {gtin}")
 
         # Сначала проверяем учетные данные
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
@@ -772,17 +880,15 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
                 final_client_token = final_client_token or found_org.connection_id
 
         if not final_oms_id or not final_client_token:
-            logger.error(f"[!] Недостаточно данных для ИНН {inn} (OMS ID или Client Token)")
             storage_orders.mark_error(order_path)
-            return None
+            raise RuntimeError(f"[!] Недостаточно данных для ИНН {inn} (OMS ID или Client Token)")
 
         token_processor = TokenProcessor(org_manager=org_manager)
         token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=final_client_token)
 
         if not token:
-            logger.error(f"[!] Активный токен для ИНН {inn} и Connection ID {final_client_token} не найден.")
             storage_orders.mark_error(order_path)
-            return None
+            raise RuntimeError(f"[!] Активный токен для ИНН {inn} и Connection ID {final_client_token} не найден.")
 
         # 2. Подготовка к подписи
         storage_sign = get_storage(signing_dir, s3_config)
@@ -813,9 +919,8 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
             start_time = time.time()
             while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
-                    logger.error(f"[!] Таймаут ({timeout}с): Файл подписи {signature_filename} не найден.")
                     storage_orders.mark_error(order_path)
-                    return None
+                    raise RuntimeError(f"[!] Таймаут ({timeout}с): Файл подписи {signature_filename} не найден.")
                 time.sleep(2)
 
             time.sleep(0.5)
@@ -850,9 +955,10 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
 
                 return result
             else:
-                logger.error(f"[!] Ошибка СУЗ: {result}")
+                message = f"[!] Ошибка СУЗ: {result}"
+                logger.error(message)
                 storage_orders.mark_error(order_path)
-                return result
+                raise RuntimeError(message)
 
         finally:
             if local_body_path.exists(): local_body_path.unlink()
@@ -868,7 +974,7 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_emission: {e}")
-        return None
+        raise
 
 def get_emission_kodes(order_id: str):
     """
@@ -1756,15 +1862,13 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
         timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([utilisation_tasks_path, utilisation_receipts_path]):
-            logger.error(f"[!] В конфигурации отсутствуют пути (utilisation_tasks_path, utilisation_receipts)")
-            return None
+            raise RuntimeError("[!] В конфигурации отсутствуют пути (utilisation_tasks_path, utilisation_receipts)")
 
         storage_tasks = get_storage(utilisation_tasks_path, s3_config)
         task_path = f"{utilisation_tasks_path.rstrip('/')}/{order_id}.json"
 
         if not storage_tasks.exists(task_path):
-            logger.error(f"[!] Файл задачи не найден: {task_path}")
-            return None
+            raise RuntimeError(f"[!] Файл задачи не найден: {task_path}")
 
         # Помечаем как processing
         storage_tasks.mark_processing(task_path)
@@ -1795,9 +1899,8 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
              inn = get_inn_by_gtin(gtin, db_path=os.path.join(base_path, 'gs1prefix_inn_db.json'))
 
         if not inn:
-            logger.error(f"[!] Не удалось определить ИНН для задачи {order_id}")
             storage_tasks.mark_error(task_path)
-            return None
+            raise RuntimeError(f"[!] Не удалось определить ИНН для задачи {order_id}")
 
         # Разрешение учетных данных
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -1820,17 +1923,15 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
                 final_client_token = final_client_token or found_org.connection_id
 
         if not final_oms_id or not final_client_token:
-            logger.error(f"[!] Недостаточно данных для ИНН {inn}")
             storage_tasks.mark_error(task_path)
-            return None
+            raise RuntimeError(f"[!] Недостаточно данных для ИНН {inn}")
 
         token_processor = TokenProcessor(org_manager=org_manager)
         token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=final_client_token)
 
         if not token:
-            logger.error(f"[!] Токен не найден.")
             storage_tasks.mark_error(task_path)
-            return None
+            raise RuntimeError("[!] Токен не найден.")
 
         # Подпись
         storage_sign = get_storage(signing_dir, s3_config)
@@ -1859,9 +1960,8 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
             start_time = time.time()
             while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
-                    logger.error("[!] Таймаут ожидания подписи.")
                     storage_tasks.mark_error(task_path)
-                    return None
+                    raise RuntimeError("[!] Таймаут ожидания подписи.")
                 time.sleep(2)
 
             time.sleep(0.5)
@@ -1896,9 +1996,10 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
 
                 return report_id
             else:
-                logger.error(f"[!] Ошибка СУЗ: {report_id}")
+                message = f"[!] Ошибка СУЗ: {report_id}"
+                logger.error(message)
                 storage_tasks.mark_error(task_path)
-                return None
+                raise RuntimeError(message)
 
         finally:
             if local_body_path.exists(): local_body_path.unlink()
@@ -1914,7 +2015,7 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_utilisation: {e}")
-        return None
+        raise
 
 def update_emission_order_status(production_order_id: str):
     """
@@ -2220,10 +2321,15 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
     """
     Загружает отчет об агрегации, подписывает его и отправляет в ЛК ЧЗ в обертке.
     """
+    submission_storage = None
+    submission_lock_path = None
+    submission_ambiguous = False
+    accepted_not_persisted = False
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
         agg_tasks_path = config.get('agg-tasks')
+        agg_receipts_path = config.get('agg-receipts')
 
         # Переопределяем параметры подписи из конфига если они есть
         sign_path = config.get('sign')
@@ -2232,17 +2338,31 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
 
         timeout = config.get('SIGNING_TIMEOUT', timeout)
 
-        if not agg_tasks_path:
-            logger.error("[!] В конфигурации отсутствует путь agg-tasks")
-            return None
+        if not all([agg_tasks_path, agg_receipts_path]):
+            raise RuntimeError(
+                "[!] В конфигурации отсутствует путь agg-tasks или agg-receipts"
+            )
+
+        (
+            existing_receipt,
+            submission_storage,
+            remote_receipt_path,
+            submission_lock_path,
+        ) = _claim_document_submission(
+            agg_receipts_path,
+            s3_config,
+            "aggregation",
+            task_uuid,
+        )
+        if existing_receipt is not None:
+            return existing_receipt
 
         # 1. Сначала загружаем отчет и проверяем ИНН
         storage_agg = get_storage(agg_tasks_path, s3_config)
         report_path = f"{agg_tasks_path.rstrip('/')}/{task_uuid}.json"
 
         if not storage_agg.exists(report_path):
-            logger.error(f"[!] Файл отчета об агрегации не найден: {report_path}")
-            return None
+            raise RuntimeError(f"[!] Файл отчета об агрегации не найден: {report_path}")
 
         logger.info(f"[*] Загрузка отчета {task_uuid} из {report_path}...")
         report_content = storage_agg.read_text(report_path)
@@ -2250,8 +2370,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         inn = report_data.get('participantId')
 
         if not inn:
-            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
-            return None
+            raise RuntimeError(f"[!] Не найден participantId в отчете {task_uuid}")
 
         # 2. Проверяем токен ДО цикла подписи, чтобы не ждать зря
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -2269,8 +2388,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                 token_processor.save_token(token)
                 logger.info(f"[+] Новый токен успешно получен и сохранен.")
             else:
-                logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}.")
-                return None
+                raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}.")
 
         # Декодируем JWT для логов, чтобы проверить PID/INN
         try:
@@ -2307,8 +2425,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             start_time = time.time()
             while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
-                    logger.error("[!] Таймаут ожидания подписи.")
-                    return None
+                    raise RuntimeError("[!] Таймаут ожидания подписи.")
                 time.sleep(2)
 
             time.sleep(0.5)
@@ -2336,37 +2453,42 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"[*] Текст запроса агрегации: {wrapped_json}")
 
+            submission_ambiguous = True
             result = api.documents_create(wrapped_json, pg=group)
+            submission_ambiguous = False
 
             if result and "error" not in str(result).lower():
                 logger.info(f"[+++] Отчет об агрегации успешно отправлен в ЛК! Результат: {result}")
+                accepted_not_persisted = True
 
                 # Сохраняем чек отправки
-                agg_receipts_path = config.get('agg-receipts')
-                if agg_receipts_path:
-                    storage_receipts = get_storage(agg_receipts_path, s3_config)
-                    remote_receipt_path = f"{agg_receipts_path.rstrip('/')}/{task_uuid}.json"
+                temp_receipt = local_dir / f"receipt_agg_{unique_id}.json"
+                # Если result это строка UUID, оборачиваем её (как в trueapi.py)
+                if isinstance(result, str):
+                    result = {"document_id": result}
+                result["productionOrderId"] = task_uuid
 
-                    temp_receipt = local_dir / f"receipt_agg_{unique_id}.json"
-                    # Если result это строка UUID, оборачиваем её (как в trueapi.py)
-                    if isinstance(result, str):
-                        result = {"document_id": result}
-                    result["productionOrderId"] = task_uuid
+                with open(temp_receipt, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=4, ensure_ascii=False)
 
-                    with open(temp_receipt, 'w', encoding='utf-8') as f:
-                        json.dump(result, f, indent=4, ensure_ascii=False)
-
-                    logger.info(f"[*] Выгрузка чека агрегации в S3: {remote_receipt_path}")
-                    storage_receipts.upload(str(temp_receipt), remote_receipt_path)
-                    try:
-                        temp_receipt.unlink()
-                    except:
-                        pass
+                logger.info(f"[*] Выгрузка чека агрегации в S3: {remote_receipt_path}")
+                submission_storage.upload(str(temp_receipt), remote_receipt_path)
+                accepted_not_persisted = False
+                _release_document_submission_lock(
+                    submission_storage,
+                    submission_lock_path,
+                )
+                submission_lock_path = None
+                try:
+                    temp_receipt.unlink()
+                except:
+                    pass
 
                 return result
             else:
-                logger.error(f"[!] Ошибка отправки отчета в ЛК: {result}")
-                return result
+                message = f"[!] Ошибка отправки отчета в ЛК: {result}"
+                logger.error(message)
+                raise RuntimeError(message)
 
         finally:
             if local_body_path.exists(): local_body_path.unlink()
@@ -2381,8 +2503,17 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             except: pass
 
     except Exception as e:
+        if (
+            submission_lock_path
+            and not submission_ambiguous
+            and not accepted_not_persisted
+        ):
+            _release_document_submission_lock(
+                submission_storage,
+                submission_lock_path,
+            )
         logger.error(f"[!] Ошибка в sign_and_send_aggregation: {e}")
-        return None
+        raise
 
 def update_utilisation_report_status(order_id: str):
     """
@@ -2696,6 +2827,10 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
     """
     Подписывает и отправляет сообщение о вводе в оборот в ЛК ЧЗ.
     """
+    submission_storage = None
+    submission_lock_path = None
+    submission_ambiguous = False
+    accepted_not_persisted = False
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
@@ -2710,15 +2845,27 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([introduce_tasks_path, introduce_receipts_path]):
-            logger.error("[!] В конфигурации отсутствуют необходимые пути (introduce-tasks, introduce-receipts)")
-            return None
+            raise RuntimeError("[!] В конфигурации отсутствуют необходимые пути (introduce-tasks, introduce-receipts)")
+
+        (
+            existing_receipt,
+            submission_storage,
+            remote_receipt_path,
+            submission_lock_path,
+        ) = _claim_document_submission(
+            introduce_receipts_path,
+            s3_config,
+            "introduce",
+            order_id,
+        )
+        if existing_receipt is not None:
+            return existing_receipt
 
         storage_intro = get_storage(introduce_tasks_path, s3_config)
         task_path = f"{introduce_tasks_path.rstrip('/')}/{order_id}.json"
 
         if not storage_intro.exists(task_path):
-            logger.error(f"[!] Файл задачи на ввод в оборот не найден: {task_path}")
-            return None
+            raise RuntimeError(f"[!] Файл задачи на ввод в оборот не найден: {task_path}")
 
         # Читаем задачу
         task_content = storage_intro.read_text(task_path)
@@ -2727,8 +2874,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         inn = task_data.get('participant_inn') or task_data.get('owner_inn')
 
         if not inn:
-            logger.error(f"[!] Не найден participant_inn/owner_inn в задаче {order_id}")
-            return None
+            raise RuntimeError(f"[!] Не найден participant_inn/owner_inn в задаче {order_id}")
 
         # Токен
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -2744,8 +2890,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             if token: token_processor.save_token(token)
 
         if not token:
-            logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}")
-            return None
+            raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}")
 
         # Подпись
         storage_sign = get_storage(signing_dir, s3_config)
@@ -2773,8 +2918,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             start_time = time.time()
             while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
-                    logger.error("[!] Таймаут ожидания подписи.")
-                    return None
+                    raise RuntimeError("[!] Таймаут ожидания подписи.")
                 time.sleep(2)
 
             time.sleep(0.5)
@@ -2794,32 +2938,38 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             )
 
             api = HonestSignAPI(token=token)
+            submission_ambiguous = True
             result = api.documents_create(wrapper.to_json(), pg=group)
+            submission_ambiguous = False
 
             if result and "error" not in str(result).lower():
                 logger.info(f"[+++] Сообщение о вводе в оборот успешно отправлено! ID: {result}")
+                accepted_not_persisted = True
 
-                if introduce_receipts_path:
-                    storage_receipts = get_storage(introduce_receipts_path, s3_config)
-                    remote_receipt_path = f"{introduce_receipts_path.rstrip('/')}/{order_id}.json"
+                temp_receipt = local_dir / f"receipt_intro_{unique_id}.json"
+                if isinstance(result, str):
+                    result = {"document_id": result}
+                result["productionOrderId"] = production_order_id
 
-                    temp_receipt = local_dir / f"receipt_intro_{unique_id}.json"
-                    if isinstance(result, str):
-                        result = {"document_id": result}
-                    result["productionOrderId"] = production_order_id
+                with open(temp_receipt, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=4, ensure_ascii=False)
 
-                    with open(temp_receipt, 'w', encoding='utf-8') as f:
-                        json.dump(result, f, indent=4, ensure_ascii=False)
-
-                    logger.info(f"[*] Выгрузка чека ввода в оборот в S3: {remote_receipt_path}")
-                    storage_receipts.upload(str(temp_receipt), remote_receipt_path)
-                    try: temp_receipt.unlink()
-                    except: pass
+                logger.info(f"[*] Выгрузка чека ввода в оборот в S3: {remote_receipt_path}")
+                submission_storage.upload(str(temp_receipt), remote_receipt_path)
+                accepted_not_persisted = False
+                _release_document_submission_lock(
+                    submission_storage,
+                    submission_lock_path,
+                )
+                submission_lock_path = None
+                try: temp_receipt.unlink()
+                except: pass
 
                 return result
             else:
-                logger.error(f"[!] Ошибка отправки: {result}")
-                return result
+                message = f"[!] Ошибка отправки: {result}"
+                logger.error(message)
+                raise RuntimeError(message)
 
         finally:
             if local_body_path.exists(): local_body_path.unlink()
@@ -2834,8 +2984,17 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             except: pass
 
     except Exception as e:
+        if (
+            submission_lock_path
+            and not submission_ambiguous
+            and not accepted_not_persisted
+        ):
+            _release_document_submission_lock(
+                submission_storage,
+                submission_lock_path,
+            )
         logger.error(f"[!] Ошибка в sign_and_send_introduce: {e}")
-        return None
+        raise
 
 def update_aggregation_status(task_uuid: str, group: str):
     """
@@ -3087,6 +3246,10 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
     """
     Загружает отчет об агрегации наборов, подписывает его и отправляет в ЛК ЧЗ.
     """
+    submission_storage = None
+    submission_lock_path = None
+    submission_ambiguous = False
+    accepted_not_persisted = False
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
@@ -3101,24 +3264,35 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
         timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([agg_set_tasks_path, agg_set_receipts_path]):
-            logger.error("[!] В конфигурации отсутствуют пути agg_set_tasks или agg_set_receipts")
-            return None
+            raise RuntimeError("[!] В конфигурации отсутствуют пути agg_set_tasks или agg_set_receipts")
+
+        (
+            existing_receipt,
+            submission_storage,
+            remote_receipt_path,
+            submission_lock_path,
+        ) = _claim_document_submission(
+            agg_set_receipts_path,
+            s3_config,
+            "aggregation-set",
+            task_uuid,
+        )
+        if existing_receipt is not None:
+            return existing_receipt
 
         # 1. Загружаем отчет и проверяем ИНН
         storage_agg = get_storage(agg_set_tasks_path, s3_config)
         report_path = f"{agg_set_tasks_path.rstrip('/')}/{task_uuid}.json"
 
         if not storage_agg.exists(report_path):
-            logger.error(f"[!] Файл отчета об агрегации наборов не найден: {report_path}")
-            return None
+            raise RuntimeError(f"[!] Файл отчета об агрегации наборов не найден: {report_path}")
 
         report_content = storage_agg.read_text(report_path)
         report_data = json.loads(report_content)
         inn = report_data.get('participantId')
 
         if not inn:
-            logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
-            return None
+            raise RuntimeError(f"[!] Не найден participantId в отчете {task_uuid}")
 
         # 2. Токен
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -3134,8 +3308,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
             if token: token_processor.save_token(token)
 
         if not token:
-            logger.error(f"[!] Не удалось получить JWT токен для ИНН {inn}")
-            return None
+            raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}")
 
         # 3. Подготовка к подписи
         storage_sign = get_storage(signing_dir, s3_config)
@@ -3163,8 +3336,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
             start_time = time.time()
             while not storage_sign.exists(remote_signature_path):
                 if time.time() - start_time > timeout:
-                    logger.error("[!] Таймаут ожидания подписи.")
-                    return None
+                    raise RuntimeError("[!] Таймаут ожидания подписи.")
                 time.sleep(2)
 
             time.sleep(0.5)
@@ -3186,13 +3358,13 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
 
             # Отправка через TrueAPI
             api = HonestSignAPI(token=token)
+            submission_ambiguous = True
             result = api.documents_create(wrapper.to_json(), pg=group)
+            submission_ambiguous = False
 
             if result and "error" not in str(result).lower():
                 logger.info(f"[+++] Отчет об агрегации наборов успешно отправлен! ID: {result}")
-
-                storage_receipts = get_storage(agg_set_receipts_path, s3_config)
-                remote_receipt_path = f"{agg_set_receipts_path.rstrip('/')}/{task_uuid}.json"
+                accepted_not_persisted = True
 
                 temp_receipt = local_dir / f"temp_receipt_agg_set_{task_uuid}.json"
                 if isinstance(result, str):
@@ -3203,14 +3375,21 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                     json.dump(result, f, indent=4, ensure_ascii=False)
 
                 logger.info(f"[*] Выгрузка чека агрегации наборов в S3: {remote_receipt_path}")
-                storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                submission_storage.upload(str(temp_receipt), remote_receipt_path)
+                accepted_not_persisted = False
+                _release_document_submission_lock(
+                    submission_storage,
+                    submission_lock_path,
+                )
+                submission_lock_path = None
                 try: temp_receipt.unlink()
                 except: pass
 
                 return result
             else:
-                logger.error(f"[!] Ошибка отправки: {result}")
-                return result
+                message = f"[!] Ошибка отправки: {result}"
+                logger.error(message)
+                raise RuntimeError(message)
 
         finally:
             if local_body_path.exists(): local_body_path.unlink()
@@ -3225,8 +3404,17 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
             except: pass
 
     except Exception as e:
+        if (
+            submission_lock_path
+            and not submission_ambiguous
+            and not accepted_not_persisted
+        ):
+            _release_document_submission_lock(
+                submission_storage,
+                submission_lock_path,
+            )
         logger.error(f"[!] Ошибка в sign_and_send_aggregation_set: {e}")
-        return None
+        raise
 
 def create_equipment_set_report(production_order_id: str):
     """
