@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from celery import Celery
 from urllib.parse import quote
 
@@ -85,6 +86,45 @@ app.conf.update(
 )
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+_EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS = {
+    401: "Unauthorized",
+    403: "Forbidden",
+    408: "Request Timeout",
+    429: "Too Many Requests",
+    500: "Internal Server Error",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+}
+
+
+def _describe_equipment_report_api_error(error):
+    if isinstance(error, str):
+        error_text = error
+    else:
+        error_text = json.dumps(error, ensure_ascii=False, default=str)
+
+    detected = [
+        f"HTTP {status_code} {description}"
+        for status_code, description
+        in _EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS.items()
+        if re.search(rf"\b{status_code}\b", error_text)
+    ]
+    if detected:
+        failure = ", ".join(detected)
+    else:
+        failure = "network/transport error or unclassified True API response"
+
+    retryable_codes = ", ".join(
+        str(status_code)
+        for status_code in _EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS
+    )
+    return (
+        f"{failure}; retryable HTTP codes: {retryable_codes}; "
+        f"details: {error_text}"
+    )
+
+
 def _is_failed_send_result(result):
     if not result:
         return True
@@ -418,13 +458,30 @@ def logic_start_equipment_reports(full_key):
     # Проверяем отчет перед обработкой
     result = check_aggregation_reports([production_order_id])
     
-    # Если есть ошибки не обрабатывам
-    if result:
-        error = list(result.values())[0] 
-        if error:
-            return f"Отчет оборудования об агрегации {production_order_id} пропускаем. Нацдены ошибки: {error}."
-    else:
-        return f"Отчет оборудования об агрегации {production_order_id} пропускаем. Нацдены ошибки: {error}."
+    # Ошибки авторизации/доступа (401, 403), таймауты и rate limit
+    # (408, 429), ошибки True API/upstream (500, 502, 503, 504), а также
+    # сетевые ошибки без HTTP-кода означают, что отчет фактически не проверен.
+    # Поднимаем исключение, чтобы Celery повторил проверку после восстановления,
+    # не переходя к созданию документов.
+    if not result:
+        raise RuntimeError(
+            f"check_aggregation_reports returned no result for {production_order_id}"
+        )
+
+    error = next(iter(result.values()))
+    if error:
+        if isinstance(error, dict) and error.get("api_error"):
+            api_error = _describe_equipment_report_api_error(
+                error["api_error"]
+            )
+            raise RuntimeError(
+                f"equipment report precheck True API failure for "
+                f"{production_order_id}: {api_error}"
+            )
+        return (
+            f"Отчет оборудования об агрегации {production_order_id} "
+            f"пропускаем. Найдены ошибки: {error}."
+        )
     
     # Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство
     print(f"Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство")

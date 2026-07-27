@@ -116,6 +116,61 @@ def test_equipment_report_raises_when_utilisation_send_returns_error(monkeypatch
     assert "sign_and_send_utilisation failed for T-UNIT" in str(result.result)
 
 
+def test_equipment_report_retries_when_precheck_returns_api_error(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    create_util = MagicMock()
+    sign_util = MagicMock()
+    monkeypatch.setattr(
+        tasks,
+        "check_aggregation_reports",
+        MagicMock(return_value={
+            "report": {"api_error": ["401 Client Error: Unauthorized"]}
+        }),
+    )
+    monkeypatch.setattr(tasks, "create_utilisation_task_from_report", create_util)
+    monkeypatch.setattr(tasks, "sign_and_send_utilisation", sign_util)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports/T-UNIT.json",
+    }])
+
+    assert not result.successful()
+    error = str(result.result)
+    assert "equipment report precheck True API failure for T-UNIT" in error
+    assert "HTTP 401 Unauthorized" in error
+    assert (
+        "retryable HTTP codes: 401, 403, 408, 429, 500, 502, 503, 504"
+        in error
+    )
+    create_util.assert_not_called()
+    sign_util.assert_not_called()
+
+
+def test_equipment_report_skips_business_validation_errors_without_retry(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    create_util = MagicMock()
+    sign_util = MagicMock()
+    monkeypatch.setattr(
+        tasks,
+        "check_aggregation_reports",
+        MagicMock(return_value={
+            "report": {"wrongunitstatus": ["010... (Статус: INTRODUCED)"]}
+        }),
+    )
+    monkeypatch.setattr(tasks, "create_utilisation_task_from_report", create_util)
+    monkeypatch.setattr(tasks, "sign_and_send_utilisation", sign_util)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports/T-UNIT.json",
+    }])
+
+    assert result.successful()
+    create_util.assert_not_called()
+    sign_util.assert_not_called()
+
+
 def test_unit_utilisation_success_starts_introduce_from_report(monkeypatch):
     tasks = import_tasks(monkeypatch)
     status = tasks.UtilisationReportStatus(
