@@ -349,6 +349,24 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
     production_order_id = os.path.splitext(os.path.basename(resolved_path))[0]
     s3_config = config.get('s3_config')
 
+    # Состояние проверки монотонно: успешную финальную проверку нельзя
+    # понижать обратно до setReady при повторной доставке старого события.
+    storage_rep = get_storage(resolved_path, s3_config)
+    try:
+        current_check = storage_rep.get_tags(resolved_path).get('check')
+    except Exception as e:
+        logger.warning(
+            f"Не удалось прочитать тег check для {resolved_path}: {e}"
+        )
+        current_check = None
+
+    if current_check == 'finished':
+        logger.info(
+            f"Отчет {production_order_id} уже имеет check=finished. "
+            "Повторная проверка setReady пропущена"
+        )
+        return "finished"
+
     # 1. Проверка типа GTIN в производственном заказе
     production_orders_path = config.get('production_orders_path')
     if not production_orders_path:
@@ -471,7 +489,6 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
 
     # Успех
     try:
-        storage_rep = get_storage(resolved_path, s3_config)
         storage_rep.set_tags(resolved_path, {'check': 'setReady'})
         logger.info(f"Успешная проверка готовности для {production_order_id}. Тег check установлен в setReady")
         return "setReady"
