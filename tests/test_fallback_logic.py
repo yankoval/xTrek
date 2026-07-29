@@ -144,6 +144,44 @@ def test_process_incoming_task_skips_unit_not_in_allowed_gtins(mock_token_proc, 
     assert result is None
     prod_storage.upload.assert_not_called()
 
+@patch("xtrek.create_emission_task_sample.load_config")
+@patch("xtrek.create_emission_task_sample.get_storage")
+@patch("xtrek.create_emission_task_sample.get_inn_by_gtin")
+@patch("xtrek.create_emission_task_sample.NK")
+@patch("xtrek.create_emission_task_sample.OrganizationManager")
+@patch("xtrek.create_emission_task_sample.TokenProcessor")
+def test_process_incoming_task_allows_unit_by_manufacturer_inn(mock_token_proc, mock_org_man, mock_nk, mock_get_inn, mock_get_storage, mock_load_config):
+    from xtrek.create_emission_task_sample import process_incoming_task
+
+    mock_load_config.return_value = {
+        "production_orders_path": "s3://bucket/prod",
+        "allowed_gtins": [],
+        "unit_enabled_inns": ["9718180660"],
+    }
+
+    task_storage = MagicMock()
+    prod_storage = MagicMock()
+    mock_get_storage.side_effect = lambda path, config: prod_storage if path == "s3://bucket/prod" else task_storage
+    task_storage.get_tags.return_value = {}
+    task_storage.read_text.return_value = json.dumps({
+        "Gtin": "04660205470129",
+        "Quantity": "10",
+        "PasportData": {
+            "Batch_number": "BATCH1",
+            "Manufacturer_inn": "9718180660",
+        },
+        "Article": "ART1"
+    })
+
+    mock_get_inn.return_value = "9718180660"
+    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_nk.return_value.feedProduct.return_value = {"result": [{"is_set": False}]}
+
+    result = process_incoming_task("s3://bucket/tasks/task1.json")
+
+    assert result is not None
+    prod_storage.upload.assert_called_once()
+
 @patch("xtrek.create_emission_task_sample._log_vbg_gtin_diagnostics")
 @patch.dict("os.environ", {"XTREK_VBG_DIAGNOSTICS": "1"})
 @patch("xtrek.create_emission_task_sample.load_config")

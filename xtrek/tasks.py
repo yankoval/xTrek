@@ -1,0 +1,594 @@
+import os
+import json
+from celery import Celery
+from urllib.parse import quote
+
+# 1. Импорт вашей бизнес-логики
+from xtrek.config_loader import load_config
+from xtrek.create_emission_task_sample import (
+    process_incoming_task, 
+    create_equipment_aggregation_task, 
+    create_emission_task, 
+    sign_and_send_emission,
+    update_emission_order_status,
+    get_emission_kodes,
+    create_virtual_utilisation_task,
+    sign_and_send_utilisation,
+    update_utilisation_report_status,
+    create_virtual_introduce_task,
+    sign_and_send_introduce,
+    update_introduce_status,
+    create_virtual_tasks_from_equipment_report,
+    create_utilisation_task_from_report,
+    create_introduce_task_from_report,
+    update_aggregation_status,
+    _find_production_order_id_by_suz_order_id,
+    create_equipment_set_report_from_report,
+    create_aggregation_set_report,
+    sign_and_send_aggregation_set,
+    update_aggregation_set_status,
+    create_aggregation_report,
+    sign_and_send_aggregation,
+)
+from xtrek.prn_util import generate_prn_files
+from xtrek.utils import (
+        check_aggregation_reports,
+        set_ready_check,
+        check_aggregation_report,
+        )
+from xtrek.suz_api_models import (
+    EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
+    EmissionOrderStatus, ProductionOrder, PasportData,
+    UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
+    AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
+    EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
+)
+# 2. Настройки доступа
+ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
+SECRET_KEY = os.environ.get('YMQ_SECRET_KEY')
+QUEUE_URL = os.environ.get('YMQ_QUEUE_URL')
+REAL_QUEUE_NAME = 'queue_task_create_1C'
+
+safe_secret = quote(SECRET_KEY, safe='')
+BROKER_URL = f'sqs://{ACCESS_KEY}:{safe_secret}@'
+
+app = Celery('tasks', broker=BROKER_URL)
+
+# Загрузка конфигурации
+config = load_config('suz_worker_config')
+
+# Настройки бакетов
+INPUT_BUCKET = config.get('input_bucket', "1bf11148-3595-4a07-a089-d460153b7c7a")
+INTERNAL_BUCKET = config.get('internal_bucket', "20ab2a0c-2726-4ba1-9c7c-7deae82941ff")
+
+# Глобальные настройки для процессов
+PRODUCT_GROUP = config.get('product_group', "chemistry")
+CONTACT_PERSON = config.get('contact_person', "scan")
+
+# Директория для подписи
+signing_dir = config.get('sign', r"Y:\BatchPassToPrint\tst")
+
+app.conf.update(
+    broker_transport_options={
+        'region': 'ru-central1',
+        'predefined_queues': {
+            REAL_QUEUE_NAME: {'url': QUEUE_URL}
+        }
+    },
+    task_default_queue=REAL_QUEUE_NAME,
+    accept_content=['json'],
+    task_serializer='json',
+    result_serializer='json',
+    broker_connection_retry_on_startup=True,
+    worker_enable_remote_control=False,
+    task_acks_late=True, # Подтверждаем удаление только после успеха
+)
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_production_order_data(production_order_id):
+    """
+    Загружает данные производственного задания из S3/Локально.
+    """
+    from xtrek.storage import get_storage
+    s3_config = config.get('s3_config')
+    production_orders_path = config.get('production_orders_path')
+
+    if not production_orders_path:
+        # Пытаемся сконструировать путь из INTERNAL_BUCKET
+        bucket = INTERNAL_BUCKET
+        if bucket:
+            production_orders_path = f"s3://{bucket}/productionOrders/"
+            print(f"[*] production_orders_path не задан, используем: {production_orders_path}")
+        else:
+            return None
+
+    storage = get_storage(production_orders_path, s3_config)
+    path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+    if not storage.exists(path):
+        # Попробуем без .json если id уже содержит его или просто на всякий случай
+        if not production_order_id.endswith('.json'):
+            path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
+
+        if not storage.exists(path):
+            print(f"[!] Файл задания не найден: {path}")
+            return None
+
+    try:
+        content = storage.read_text(path)
+        data = json.loads(content)
+        return data
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[!] Ошибка при чтении задания {production_order_id}: {e}")
+        return None
+
+def trigger_set_aggregation_if_ready(parent_id):
+    """
+    Проверяет готовность набора и запускает процесс агрегации наборов.
+    """
+    print(f"[*] Проверка готовности набора для {parent_id}...")
+    # set_ready_check принимает путь к отчету оборудования.
+    # В xtrek/utils.py resolve_file_path достроит его если передать просто ID.
+    ready_status = set_ready_check(parent_id)
+
+    if ready_status == "setReady":
+        print(f"[+++] Набор {parent_id} готов к агрегации. Запуск процедур...")
+
+        # 1. Создаем отчет об агрегации наборов
+        res1 = create_equipment_set_report_from_report(parent_id)
+        if not res1:
+            raise RuntimeError(f"create_equipment_set_report_from_report failed for {parent_id}")
+
+        # 2. Создаем задачу на агрегацию наборов (в формате для ЛК)
+        res2 = create_aggregation_set_report(parent_id, PRODUCT_GROUP)
+        if not res2:
+            raise RuntimeError(f"create_aggregation_set_report failed for {parent_id}")
+
+        # 3. Подписываем и отправляем
+        res3 = sign_and_send_aggregation_set(parent_id, PRODUCT_GROUP, signing_dir, 120)
+        if not res3:
+            raise RuntimeError(f"sign_and_send_aggregation_set failed for {parent_id}")
+
+        return f"Set aggregation for {parent_id} started successfully"
+    else:
+        print(f"[*] Набор {parent_id} еще не готов к агрегации.")
+        return f"Set {parent_id} not ready yet"
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 1bf11148... / ПАПКА: Задания ---
+def logic_create_order(full_key):
+    group, contact = PRODUCT_GROUP, CONTACT_PERSON
+    print(f"[LOGIC-0] Запуск создания заказа для: {full_key}")
+    
+    production_order_id = process_incoming_task(s3_full_key=full_key)
+    if not production_order_id:
+        return "No production_order_id created"
+
+    create_equipment_aggregation_task(production_order_id)
+    resultCEmT = create_emission_task(production_order_id, group, contact)
+    
+    if not resultCEmT:
+        raise RuntimeError(f"create_emission_task failed for {production_order_id}")
+    
+    return f"Order {production_order_id} created and emission task started"
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: emissionOrders ---
+def logic_sign_emission(full_key):
+    # Здесь предполагается, что full_key содержит ID заказа или путь к нему
+    # ВАЖНО: Если sign_and_send_emission нужен ID, извлеките его из ключа
+    production_order_id = full_key.split('/')[-1].replace('.json', '') 
+    ###signing_dir = r"/Users/ivankiselev/tst"
+    
+    print(f"[LOGIC-2] Запуск подписания эмиссии для ID: {production_order_id}")
+    
+    resultSEmT = sign_and_send_emission(production_order_id, signing_dir, 120)
+    
+    if not resultSEmT:
+        raise RuntimeError(f"sign_and_send_emission failed for {production_order_id}")
+    
+    return f"Emission for {production_order_id} signed and sent"
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: emissionRecepts ---
+def logic_update_emission(full_key):
+    # Здесь предполагается, что full_key содержит ID заказа или путь к нему
+    # ВАЖНО: Если update_emission_order_status нужен ID, извлеките его из ключа
+    production_order_id = full_key.split('/')[-1].replace('.json', '') 
+    ##signing_dir = r"/Users/ivankiselev/tst"
+    
+    print(f"[LOGIC-3] Запуск обновления статуса эмиссии для ID: {production_order_id}")
+    
+    result = update_emission_order_status(production_order_id)
+    if isinstance(result, EmissionOrderStatus):
+        print(f"[LOGIC-3] Статус эмиссии для {production_order_id}: {result.bufferStatus}")
+        if result.bufferStatus == "ACTIVE":
+            return f"Emission for {production_order_id} ready for download (ACTIVE)"
+        elif result.bufferStatus == "EXHAUSTED":
+            return f"Emission for {production_order_id} has been downloaded (EXHAUSTED)"
+        else:
+            raise RuntimeError(f"Unexpected bufferStatus '{result.bufferStatus}' for {production_order_id}")
+    else:
+        raise RuntimeError(f"update_emission_order_status failed for {production_order_id}, got {type(result)} : {result}")
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: emissions/ ---
+def logic_get_emission_kodes(full_key):
+    # Здесь предполагается, что full_key содержит ID эмиссии или путь к нему
+    # ВАЖНО: Если get_emission_kodes нужен ID, извлеките его из ключа
+    emission_order_id = full_key.split('/')[-1].replace('.json', '') 
+    ##signing_dir = r"/Users/ivankiselev/tst"
+    
+    print(f"[LOGIC-4] Запуск получение кодов эмиссии для ID: {emission_order_id}")
+    
+    result = get_emission_kodes(emission_order_id)
+    if not result:
+        raise RuntimeError(f"get_emission_kodes failed for {emission_order_id}")
+    if 'codes' in result.keys():
+        total_codes = len(result['codes'])
+    else: 
+        total_codes = result.get('totalCodes', 'unknown count')
+    return f"Emission codes for {emission_order_id} retrieved: {total_codes} codes"
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: kodes/ ---
+def logic_kodes(full_key):
+    # Здесь предполагается, что full_key содержит ID эмиссии или путь к нему
+    kodes_order_id = full_key.split('/')[-1].replace('.json', '') 
+    
+    print(f"[LOGIC-5] печать а так же проверка и запуск создания отчёта о нанесении: {kodes_order_id}")
+    
+    # Создание задания на печать
+    try:
+        result = generate_prn_files(kodes_order_id)
+        if not result:
+            raise RuntimeError(f"generate_prn_files failed for {kodes_order_id}")
+    except Exception as e:
+        print(e)
+    # Создаем отчет о нанесении
+    result = create_virtual_utilisation_task(kodes_order_id, PRODUCT_GROUP)
+    if not result:
+        raise RuntimeError(f"create_virtual_utilisation_task failed for {kodes_order_id}")
+    if type(result) is ProductionOrder:
+        if result.virtual:
+                result = sign_and_send_utilisation(kodes_order_id, signing_dir, 120)
+                if not result:
+                    raise RuntimeError(f"sign_and_send_utilisation failed for {kodes_order_id}")
+
+                return f"Virtual utilisation task for {kodes_order_id} created successfully"
+        else:
+            #TODO: Create print task if not virtual
+            return f"For virtual production order {kodes_order_id}, no need to create utilisation report"
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: utilisationReceipts/ ---
+def logic_utilisationReceipt(full_key):
+    # Здесь предполагается, что full_key содержит ID эмиссии или путь к нему
+    utilisationReceipt_id = full_key.split('/')[-1].replace('.json', '') 
+    
+    print(f"[LOGIC-6] проверка статуса отчёта о нанесении: {utilisationReceipt_id}")
+    
+    result = update_utilisation_report_status(utilisationReceipt_id)
+    if not result:
+        raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id}")
+    print(f"Virtual utilisation task for {utilisationReceipt_id} status is {result}")
+    if type(result) is not UtilisationReportStatus:
+        raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result:{result}")
+    if result.reportStatus !="SUCCESS":
+        raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result staus:{result.reportStatus}")
+
+    # Если это реальный заказ
+    if utilisationReceipt_id.startswith('T-'):
+        prod_data = get_production_order_data(utilisationReceipt_id)
+        gtin_type = prod_data.get('GtinType') if prod_data else None
+
+        # Если тип не указан в задании, пробуем определить его (для старых заданий)
+        if not gtin_type:
+            gtin = prod_data.get('Gtin') if prod_data else None
+
+            # Если в задании нет GTIN, попробуем найти его через файл статуса эмиссии
+            if not gtin:
+                print(f"[*] GTIN не найден в задании {utilisationReceipt_id}, ищем в эмиссии...")
+                try:
+                    from xtrek.storage import get_storage
+                    s3_config = config.get('s3_config')
+                    # UTIL_ID совпадает с orderId в этом контексте
+                    emissions_path = config.get('emissions_path', f"s3://{INTERNAL_BUCKET}/emissions/")
+                    storage_em = get_storage(emissions_path, s3_config)
+                    # Ищем файл {utilisationReceipt_id}.json
+                    em_file = f"{emissions_path.rstrip('/')}/{utilisationReceipt_id}.json"
+                    if storage_em.exists(em_file):
+                        em_data = json.loads(storage_em.read_text(em_file))
+                        gtin = em_data.get('gtin')
+                        print(f"[*] GTIN из эмиссии: {gtin}")
+                except Exception as e:
+                    print(f"[!] Ошибка при поиске GTIN в эмиссии: {e}")
+
+            if gtin:
+                print(f"[*] Определение типа для GTIN {gtin}...")
+                try:
+                    from xtrek.utils import _ensure_resources, AggregationAnalyzer
+                    # Используем ID квитанции для обеспечения ресурсов
+                    _, api, nk, _ = _ensure_resources(utilisationReceipt_id)
+                    analyzer = AggregationAnalyzer(api, nk)
+                    is_set = analyzer.is_set(gtin)
+                    gtin_type = 'SET' if is_set else 'UNIT'
+                    print(f"[*] Определен тип GTIN: {gtin_type}")
+                except Exception as e:
+                    print(f"[!] Не удалось определить тип GTIN для {gtin}: {e}")
+
+        if gtin_type == 'UNIT':
+            print(f"[*] Задание {utilisationReceipt_id} является UNIT. Запуск ввода в оборот...")
+            res1 = create_introduce_task_from_report(utilisationReceipt_id, PRODUCT_GROUP)
+            if not res1:
+                raise RuntimeError(f"create_introduce_task_from_report failed for {utilisationReceipt_id}")
+            res2 = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
+            if not res2:
+                raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
+            return f"Introduction task for UNIT {utilisationReceipt_id} started successfully"
+        else:
+            # По умолчанию считаем SET для совместимости
+            trigger_set_aggregation_if_ready(utilisationReceipt_id)
+            return f"Utilization report for set {utilisationReceipt_id} is SUCCESS, checked set readiness"
+
+    # Если документ относиться к виртуальному заданию на производство то запускаем создание сообщения о вводе в оборот
+    result = create_virtual_introduce_task(utilisationReceipt_id, PRODUCT_GROUP)
+    if not result:
+        raise RuntimeError(f"create_virtual_introduce_task failed for {utilisationReceipt_id}")
+    if type(result) is ProductionOrder:
+        if result.virtual:
+            result = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
+            if not result:
+                raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
+
+            return f"Introduce task for virtual {utilisationReceipt_id} has been send successfully:{result}"
+        else:
+            #TODO: Create print task if not virtual
+            return f"For real production order {utilisationReceipt_id}, skip send introduce task in virtual task flow."
+
+    return f"Virtual utilisation task for {utilisationReceipt_id} status is {result}"
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: emissionRecepts ---
+def logic_update_introduce(full_key):
+    # Здесь предполагается, что full_key содержит ID заказа или путь к нему
+    # ВАЖНО: Если update_introduce_status нужен ID, извлеките его из ключа
+    introduceReceipt_id = full_key.split('/')[-1].replace('.json', '') 
+    ##signing_dir = r"/Users/ivankiselev/tst"
+    
+    print(f"[LOGIC-7] Запуск обновления статуса сообщения о вводе в оборот для ID: {introduceReceipt_id}")
+    
+    result = update_introduce_status(introduceReceipt_id, PRODUCT_GROUP)
+    if not result:
+        raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id} result:{result}")
+    if isinstance(result, dict) and "error" in result:
+        print("Ошибка API при запросе статуса")
+        raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id}  result:{result}")
+    result = result[0] if isinstance(result, list) and len(result) > 0 else result
+    if isinstance(result, dict) and result.get('status')== 'CHECKED_OK':
+        prod_id = result.get('productionOrderId') or _find_production_order_id_by_suz_order_id(introduceReceipt_id)
+        if not prod_id:
+            return f"introduce status for {introduceReceipt_id} is CHECKED_OK, but prod_id not found"
+
+        # Если это виртуальный компонент, пробуем запустить агрегацию набора
+        if prod_id.startswith('V-'):
+            # Извлекаем parent_id из V-{parent_id}-{gtin}
+            parts = prod_id[2:].split('-')
+            if len(parts) > 1:
+                parent_id = "-".join(parts[:-1])
+                trigger_set_aggregation_if_ready(parent_id)
+
+        # Если это реальный UNIT, запускаем транспортную агрегацию
+        elif prod_id.startswith('T-'):
+            prod_data = get_production_order_data(prod_id)
+            if prod_data and prod_data.get('GtinType') == 'UNIT':
+                print(f"[*] Ввод в оборот для UNIT {prod_id} успешен. Запуск агрегации...")
+                res1 = create_aggregation_report(prod_id)
+                if not res1:
+                    raise RuntimeError(f"create_aggregation_report failed for {prod_id}")
+                res2 = sign_and_send_aggregation(prod_id, PRODUCT_GROUP, signing_dir, 120)
+                if not res2:
+                    raise RuntimeError(f"sign_and_send_aggregation failed for {prod_id}")
+                return f"Standard aggregation for UNIT {prod_id} started successfully"
+
+        return f"introduce status for {introduceReceipt_id} is {result.get('status')}"
+    else:
+        raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id} result:{result}")
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: equipment-reports/ ---
+def logic_start_equipment_reports(full_key):
+    group = PRODUCT_GROUP
+    print(f"[LOGIC-20] Запуск обработки equipment-reports: {full_key}")
+    report_id = full_key.split('/')[-1].replace('.json', '') 
+    if not report_id:
+        return f"No production_order_id found for {full_key}"
+    # Номер заказа на производство равен номеру отчета оборудования
+    production_order_id = report_id
+    # Проверяем отчет перед обработкой
+    result = check_aggregation_reports([production_order_id])
+    
+    # Если есть ошибки не обрабатывам
+    if result:
+        error = list(result.values())[0] 
+        if error:
+            return f"Отчет оборудования об агрегации {production_order_id} пропускаем. Нацдены ошибки: {error}."
+    else:
+        return f"Отчет оборудования об агрегации {production_order_id} пропускаем. Нацдены ошибки: {error}."
+    
+    # Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство
+    print(f"Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство")
+    utResult = create_utilisation_task_from_report(report_id, group)
+    if not utResult:
+        print(f"Ошибка при попытке создания отчёта о нанесении по отчету оборудования f{report_id}. Продолжаем обработку. {utResult}")
+    else:
+        print("Подписываем/отправляем")
+        sutResult = sign_and_send_utilisation(report_id, signing_dir, 120)
+        if not sutResult:
+            print(f"sign_and_send_utilisation failed for {report_id}")
+    
+    
+    # Проверяем тип задания
+    prod_data = get_production_order_data(production_order_id)
+    gtin_type = prod_data.get('GtinType') if prod_data else None
+
+    if gtin_type == 'UNIT':
+        print(f"[*] Пропускаем создание виртуальных заданий для UNIT {production_order_id}")
+    else:
+        # Запускаем поцедуру создания виртуальных наборов для вложений по отчету оборудования
+        vtResult = create_virtual_tasks_from_equipment_report(report_id)
+
+        # Если при создании ошибки то сообщаем и выходим без ошибки. Дальнейшая обработка в автомате невозможна
+        if not vtResult:
+            print(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
+            print(f"Дальнейшая обработка в автомате невозможна. Отчет оборудования f{report_id}.")
+            return(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
+    
+    print(f" Успешно обработан отчет оборудования {report_id}")
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: productionOrders/ ---
+def logic_start_virtualProdTask_emission(full_key):
+    group, contact = PRODUCT_GROUP, CONTACT_PERSON
+    print(f"[LOGIC-21] Запуск обработки productionOrders: {full_key}")
+    production_order_id = full_key.split('/')[-1].replace('.json', '') 
+    if not production_order_id:
+        return f"No production_order_id found for {full_key}"
+    # Проверяем задание оно должно быть виртуальным
+    if production_order_id[0:2] != 'V-':
+        print(f"Задание на производство не виртуальное, завершаем обработку. {production_order_id}")
+        return f"Задание на производство не виртуальное, завершаем обработку. {production_order_id}"
+    # Запускаем создание эмиссии
+    resultCEmT = create_emission_task(production_order_id, group, contact)
+    
+    if not resultCEmT:
+        raise RuntimeError(f"create_emission_task failed for {production_order_id}")
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggSetReceipts/ ---
+def logic_update_agg_set(full_key):
+    group = PRODUCT_GROUP
+    print(f"[LOGIC-93] Запуск обработки aggSetReceipts: {full_key}")
+    production_order_id = full_key.split('/')[-1].replace('.json', '')
+    if not production_order_id:
+        return f"No production_order_id found for {full_key}"
+
+    result = update_aggregation_set_status(production_order_id, group)
+    if not result:
+        raise RuntimeError(f"update_aggregation_set_status failed for {production_order_id} result:{result}")
+    if isinstance(result, dict) and "error" in result:
+        print("Ошибка API при запросе статуса")
+        raise RuntimeError(f"update_aggregation_set_status failed for {production_order_id} result:{result}")
+
+    result = result[0] if isinstance(result, list) and len(result) > 0 else result
+    if isinstance(result, dict) and result.get('status') == 'CHECKED_OK':
+        print(f"[+++] Агрегация наборов для {production_order_id} успешна. Запуск стандартной агрегации...")
+
+        # 1. Создаем отчет об агрегации (стандартный для ЛК)
+        res1 = create_aggregation_report(production_order_id)
+        if not res1:
+            raise RuntimeError(f"create_aggregation_report failed for {production_order_id}")
+
+        # 2. Подписываем и отправляем
+        res2 = sign_and_send_aggregation(production_order_id, group, signing_dir, 120)
+        if not res2:
+            raise RuntimeError(f"sign_and_send_aggregation failed for {production_order_id}")
+
+        return f"Standard aggregation for {production_order_id} started successfully"
+    else:
+        status = result.get('status') if isinstance(result, dict) else 'unknown'
+        raise RuntimeError(f"update_aggregation_set_status for {production_order_id} is {status}")
+
+# --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggReceipts/ ---
+def logic_update_agg(full_key):
+    group, contact = PRODUCT_GROUP, CONTACT_PERSON
+    print(f"[LOGIC-92] Запуск обработки aggReceipts: {full_key}")
+    production_order_id = full_key.split('/')[-1].replace('.json', '') 
+    if not production_order_id:
+        return f"No production_order_id found for {full_key}"
+
+    result = update_aggregation_status(production_order_id, group)
+    if not result:
+        raise RuntimeError(f"update_aggregation_status failed for {production_order_id} result:{result}")
+    if isinstance(result, dict) and "error" in result:
+        print("Ошибка API при запросе статуса")
+        raise RuntimeError(f"update_aggregation_status failed for {production_order_id}  result:{result}")
+    result = result[0] if isinstance(result, list) and len(result) > 0 else result
+    if isinstance(result, dict) and result.get('status') == 'CHECKED_OK':
+        # Выполняем проверку отчета и установку тега check
+        print(f"[+++] Агрегация для {production_order_id} успешна. Проверка отчета...")
+        check_aggregation_report(production_order_id)
+        return f"aggregation status for {production_order_id} is CHECKED_OK, report checked and tagged"
+    else:
+        status = result.get('status') if isinstance(result, dict) else 'unknown'
+        raise RuntimeError(f"update_aggregation_status failed for {production_order_id} result status:{status}")
+
+# --- ГЛАВНЫЙ ВОРКЕР (РОУТЕР) ---
+#@app.task(name='tasks.process_s3_event', bind=True)
+@app.task(
+    name='tasks.process_s3_event',
+    bind=True,
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_kwargs={'max_retries': 200}, # Увеличено до 200 для ожидания до 12+ часов
+    retry_backoff=60,                 # 60, 120, 240, 300...
+    retry_backoff_max=300,
+    retry_jitter=True
+)
+def process_s3_event(self, data):
+    bucket = data.get('bucket')
+    key = data.get('key') or ""
+
+    if not bucket or not key:
+        return "Error: Missing bucket or key"
+
+    full_key = f"{bucket}/{key}"
+    print(f"\n[ROUTER] Новое событие S3: {full_key}")
+
+    try:
+        # Условие №1: Создание заказа
+        if bucket == INPUT_BUCKET and key.startswith("Задания/"):
+            result = logic_create_order(full_key)
+            print(f"[OK] {result}")
+
+        # Условие №2: Подписание эмиссии
+        elif bucket == INTERNAL_BUCKET and key.startswith("emissionOrders/"):
+            result = logic_sign_emission(full_key)
+            print(f"[OK] {result}")
+        # Условие №3: Обновление статуса эмиссии
+        elif bucket == INTERNAL_BUCKET and key.startswith("emissionReceipts/"):
+            result = logic_update_emission(full_key)
+            print(f"[OK] {result}")
+        # Условие №4: Получение кодов эмиссии
+        elif bucket == INTERNAL_BUCKET and key.startswith("emissions/"):
+            result = logic_get_emission_kodes(full_key)
+            print(f"[OK] {result}")
+        # Условие №5: Создание отчёта о нанесении
+        elif bucket == INTERNAL_BUCKET and key.startswith("kodes/"):
+            result = logic_kodes(full_key)
+            print(f"[OK] {result}")
+        # Условие №6: Создание отчёта о нанесении
+        elif bucket == INTERNAL_BUCKET and key.startswith("utilisationReceipts/"):
+            result = logic_utilisationReceipt(full_key)
+            print(f"[OK] {result}")
+        # Условие №7: Обновление статуса отчёта о нанесении
+        elif bucket == INTERNAL_BUCKET and key.startswith("introduceReceipts/"):
+            result = logic_update_introduce(full_key)
+            print(f"[OK] {result}")
+        # Условие №20: Обработка отчета оборудования 
+        elif bucket == INTERNAL_BUCKET and key.startswith("equipment-reports/"):
+            result = logic_start_equipment_reports(full_key)
+            print(f"[OK] {result}")
+        # Условие №21: Обработка виртуального заказа на производство
+        elif bucket == INTERNAL_BUCKET and key.startswith("productionOrders/"):
+            result = logic_start_virtualProdTask_emission(full_key)
+            print(f"[OK] {result}")
+        # Условие №92: Обработка чека об агрегации
+        elif bucket == INTERNAL_BUCKET and key.startswith("aggReceipts/"):
+            result = logic_update_agg(full_key)
+            print(f"[OK] {result}")
+        # Условие №93: Обработка чека об агрегации наборов
+        elif bucket == INTERNAL_BUCKET and key.startswith("aggSetReceipts/"):
+            result = logic_update_agg_set(full_key)
+            print(f"[OK] {result}")
+
+        else:
+            print(f"[SKIP] Бакет или папка не соответствуют фильтрам. Игнорирую.")
+            return "Skipped: No match"
+
+    except Exception as e:
+        print(f"[ERROR] Критическая ошибка: {e}")
+        # Celery перехватит это и сделает retry (если настроено) или залогирует
+        raise e

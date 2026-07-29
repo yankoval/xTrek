@@ -5,7 +5,7 @@ Usage:
   python3 gen_report_individual.py                              # scan all non-finished
 Requires: suz_worker_config env var or ~/python-projects/suz_worker_config.json
 """
-import boto3, json, sys, os, re, io, xlsxwriter
+import boto3, json, sys, os, re, io, html as html_lib, xlsxwriter
 from datetime import datetime, timezone
 
 cfg_path = os.environ.get('suz_worker_config', os.path.expanduser('~/python-projects/suz_worker_config.json'))
@@ -36,7 +36,8 @@ P = {
     'eq':   pf('equipment-reports'),      'ut': pf('utilisation_tasks_path'),
     'ur':   pf('utilisation_receipts'),     'up': pf('utilisation_reports'),
     'em':   pf('emission_receipts'),        'po': pf('production_orders_path'),
-    'ir':   pf('introduce-receipts'),       'iv': pf('introduces'),
+    'it':   pf('introduce-tasks'),          'ir': pf('introduce-receipts'),
+    'iv':   pf('introduces'),
     'esr':  pf('equipment_set_reports'),    'ast': pf('agg_set_tasks'),
     'asr':  pf('agg_set_receipts'),         'ass': pf('agg_sets'),
     'at':   pf('agg-tasks'),                'ar': pf('agg-receipts'),
@@ -78,6 +79,13 @@ def ex(key):
     try: s3.head_object(Bucket=B, Key=key); return True
     except: return False
 
+def has_prefix(prefix):
+    try:
+        resp = s3.list_objects_v2(Bucket=B, Prefix=prefix, MaxKeys=1)
+        return bool(resp.get('Contents'))
+    except:
+        return False
+
 def rj(key):
     return json.loads(s3.get_object(Bucket=B, Key=key)['Body'].read())
 
@@ -100,6 +108,76 @@ def kd_link(key,label):
 def kd_xls_link(xlsx_key, label):
     """Direct download link to pre-generated XLSX on S3 (via xlsxwriter, same as jsontoxlsx.py)."""
     return f'<a href="{U}/{xlsx_key}" class="kd-inline" style="color:#0d6efd;margin-left:4px">\U0001F4CA {label}.xls</a>'
+
+def safe_txt(value):
+    value = re.sub(r'<[^>]+>', ' ', value or '')
+    value = html_lib.unescape(value)
+    value = value.replace('\\"', '"')
+    value = re.sub(r'\s+', ' ', value).strip()
+    return value
+
+def text_status(status):
+    return {'ok': 'OK', 'w': 'WARN', 'e': 'ERROR'}.get(status, status.upper())
+
+def esc(value):
+    return html_lib.escape(str(value or '').replace('\\"', '"'), quote=True)
+
+def join_nonempty(*values, sep=' '):
+    return sep.join(str(v).strip() for v in values if str(v or '').strip())
+
+def safe_key_part(value, limit=180):
+    value = str(value or '').strip()
+    value = re.sub(r'[^0-9A-Za-zА-Яа-я_.=-]+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('._')
+    return (value or 'unknown')[:limit]
+
+def product_name_from_order(po_data):
+    psp = (po_data or {}).get('PasportData') or {}
+    return join_nonempty(
+        psp.get('Product_name_part1'),
+        psp.get('Product_name_part2'),
+        psp.get('Product_name_part3'),
+    ) or psp.get('Product_description') or (po_data or {}).get('Article') or ''
+
+def passport_info_rows(po_data):
+    psp = (po_data or {}).get('PasportData') or {}
+    rows = []
+    name = product_name_from_order(po_data)
+    if name:
+        rows.append(('Product', name))
+    article = psp.get('Product_article') or (po_data or {}).get('Article')
+    gtin = (po_data or {}).get('Gtin') or psp.get('Product_gtin')
+    if article or gtin:
+        rows.append(('Article / GTIN', join_nonempty(article, gtin, sep=' · ')))
+    pack = join_nonempty(psp.get('Product_PackInfo'), f'pack qty {psp.get("Product_PackQty")}' if psp.get('Product_PackQty') else '', sep=' · ')
+    if pack:
+        rows.append(('Packaging', pack))
+    batch = join_nonempty(
+        psp.get('Batch_number'),
+        f'BN {psp.get("Batch_BN_1С_full") or psp.get("Batch_BN_1С")}' if (psp.get('Batch_BN_1С_full') or psp.get('Batch_BN_1С')) else '',
+        sep=' · ',
+    )
+    if batch:
+        rows.append(('Batch', batch))
+    dates = []
+    if psp.get('Batch_date_production'):
+        dates.append(f'prod {psp.get("Batch_date_production")}')
+    if psp.get('Batch_date_packing'):
+        dates.append(f'pack {psp.get("Batch_date_packing")}')
+    if psp.get('Batch_date_expired') or psp.get('Batch_date_expired_descr'):
+        dates.append(f'exp {psp.get("Batch_date_expired") or psp.get("Batch_date_expired_descr")}')
+    if dates:
+        rows.append(('Dates', ' · '.join(dates)))
+    manufacturer = join_nonempty(psp.get('Manufacturer_name'), psp.get('Manufacturer_inn'), sep=' · ')
+    if manufacturer:
+        rows.append(('Manufacturer', manufacturer))
+    extra = join_nonempty(psp.get('Product_gost'), psp.get('Format'), sep=' · ')
+    if extra:
+        rows.append(('Extra', extra))
+    return rows
+
+def info_row(label, value, lvl='l1'):
+    return f'<div class="st ok {lvl}"><span class="lb">{esc(label)}</span><span>{esc(value)}</span></div>'
 
 def generate_kodes_xlsx(kd_data, bucket, xlsx_key):
     """Read codes from kodes JSON, write XLSX via xlsxwriter, upload to S3."""
@@ -130,6 +208,51 @@ def generate_kodes_xlsx(kd_data, bucket, xlsx_key):
         print(f'  XLSX uploaded: {xlsx_key}')
     except Exception as e:
         print(f'  XLSX upload failed: {e}')
+
+def tag_dict(key):
+    try:
+        return {t['Key']:t['Value'] for t in s3.get_object_tagging(Bucket=B,Key=key).get('TagSet',[])}
+    except:
+        return {}
+
+def receipt_meta(key):
+    try:
+        rd = rj(key)
+        for fld in ('orderId', 'reportId', 'document_id', 'documentId', 'id'):
+            if rd.get(fld):
+                return f'{fld} {str(rd.get(fld))[:20]}'
+        if rd:
+            first = next(iter(rd.values()))
+            return f'ID {str(first)[:20]}'
+        return 'empty'
+    except:
+        return 'read error'
+
+def utilisation_meta(key):
+    try:
+        ud = rj(key); st = ud.get('reportStatus','?'); msg = ud.get('reportStatusMessage','')
+        m = st; okf = (st == 'SUCCESS')
+        if msg: m += f' | {msg[:60]}'
+        return okf, m
+    except:
+        return False, 'read error'
+
+def introduce_meta(key):
+    try:
+        ivd = rj(key)
+        if isinstance(ivd,list) and len(ivd) > 0:
+            d0 = ivd[0]; st = d0.get('status','?'); tp = d0.get('type','')
+            inn = d0.get('senderInn','')
+            m = st; okf = (st == 'CHECKED_OK')
+            if tp: m += f' type:{tp}'
+            if inn: m += f' INN:{inn}'
+            return okf, m
+        if isinstance(ivd,dict):
+            st = ivd.get('status','?')
+            return st == 'CHECKED_OK', st
+        return False, 'empty'
+    except:
+        return False, 'read error'
 
 def norm_name(raw):
     n = raw.strip().replace(P['eq'],'').replace('.json','')
@@ -172,43 +295,103 @@ if not r:
 
 for n,k,ch in r:
     secs = []; all_ok = []
+    po_key = f'{P["po"]}{n}.json'
+    po_data = None
+    if ex(po_key):
+        try: po_data = rj(po_key)
+        except: po_data = None
+    gtin_type = str((po_data or {}).get('GtinType','')).upper()
+    task_type = str((po_data or {}).get('TaskType','')).lower()
+    is_unit = gtin_type == 'UNIT' or task_type == 'agg-unit'
+    is_set = gtin_type == 'SET' or task_type == 'agg-set-virtual'
+    if not (is_unit or is_set):
+        has_unit_artifacts = any(ex(f'{P[sf]}{n}.json') for sf in ('it','ir','iv','at','ar','ag'))
+        has_set_artifacts = any(ex(f'{P[sf]}{n}.json') for sf in ('esr','ast','asr','ass')) or has_prefix(f'{P["em"]}V-{n}')
+        is_unit = has_unit_artifacts and not has_set_artifacts
+        is_set = has_set_artifacts and not has_unit_artifacts
+    tech = 'UNIT' if is_unit else ('SET' if is_set else 'UNKNOWN')
+    main_oid = None
 
     # ====== 0. Production order ======
     s0 = ''; oks0 = []
-    po_found = False
-    if n.startswith('T-'):
+    po_missing = not bool(po_data)
+    if po_data:
+        product_name = product_name_from_order(po_data)
+        meta = f'{tech} · {product_name or po_data.get("Article","")} · GTIN {po_data.get("Gtin","?")}'
+        if po_data.get('Quantity') not in (None, ''):
+            meta += f' · qty {po_data.get("Quantity")}'
+        s0 += st_html('Main order',po_key,'ok',esc(meta),'l1'); oks0.append(True)
+        for row_label, row_value in passport_info_rows(po_data):
+            s0 += info_row(row_label, row_value, 'l1')
+    else:
+        s0 += st_html('Main order',po_key,'w','not found, optional product passport is unavailable','l1'); oks0.append(True)
+
+    virtual_po_found = False
+    if n.startswith('T-') and is_set:
         for pg2 in p.paginate(Bucket=B, Prefix=f'{P["po"]}V-{n}'):
             for o2 in pg2.get('Contents',[]):
                 vk = o2['Key']
                 if vk.endswith('/'): continue
                 vn = vk.split('/')[-1].replace('.json','')
-                s0 += st_html('Production order',vk,'ok',vn,'l1'); oks0.append(True); po_found = True
-    if not po_found:
-        s0 += st_html('Production order',None,'e','not found','l1'); oks0.append(False)
-    s0s = 'ok' if all(oks0) else ('w' if any(oks0) else 'e')
+                s0 += st_html('Virtual order',vk,'ok',vn,'l1'); oks0.append(True); virtual_po_found = True
+    if is_set and not virtual_po_found:
+        s0 += st_html('Virtual orders',None,'e','not found','l1'); oks0.append(False)
+    if is_unit:
+        s0 += st_html('Virtual orders',None,'ok','not applicable for UNIT','l1'); oks0.append(True)
+    s0s = 'w' if po_missing else ('ok' if all(oks0) else ('w' if any(oks0) else 'e'))
     secs.append(('0. Production order',s0s,s0)); all_ok.extend(oks0)
 
-    # ====== 1. Equipment report & Virtual attachments ======
+    # ====== 1. Equipment report & codes ======
     s1 = ''; oks1 = []
     # Equipment report stats
     try:
         eq = rj(k)
-        bx = len(eq.get('readyBox',[]))
-        cds = sum(len(b.get('productNumbersFull',[])) for b in eq.get('readyBox',[]))
+        ready_boxes = eq.get('readyBox',[])
+        bx = len(ready_boxes)
+        report_codes = [c for b in ready_boxes for c in b.get('productNumbersFull',[])]
+        cds = len(report_codes)
         g = eq.get('readyBox',[{}])[0].get('productNumbersFull',[''])[0]
         gt = g[2:16] if g.startswith('01') and len(g)>=16 else '?'
+        s1 += f'<span style="background:#e9ecef;padding:3px 8px;border-radius:4px;margin:0 6px 6px 0;font-size:.85em">\U0001F527 {tech}</span>'
         s1 += f'<span style="background:#e9ecef;padding:3px 8px;border-radius:4px;margin:0 6px 6px 0;font-size:.85em">\U0001F4E6 {bx}</span>'
         s1 += f'<span style="background:#e9ecef;padding:3px 8px;border-radius:4px;margin:0 6px 6px 0;font-size:.85em">\U0001F3F7 {cds}</span>'
         s1 += f'<span style="background:#e9ecef;padding:3px 8px;border-radius:4px;font-size:.85em">\U0001F522 GTIN {gt}</span>'
         s1 += f'<br><a href="{U}/{k}" target="_blank" class="kl">\U0001F4C4 {k.split("/")[-1]}</a>'
+        if report_codes:
+            xlsx_key = f'{P["out"]}{n}_equipment_report_codes.xls'
+            if not ex(xlsx_key):
+                try: generate_kodes_xlsx({'productNumbersFull': report_codes}, B, xlsx_key)
+                except Exception as xe: print(f'  XLSX gen failed: {xe}')
+            s1 += f'<div class="st ok l1"><span class="lb">Report codes</span><span>{kd_xls_link(xlsx_key, "equipment_report_codes")}</span><span class="mt">{len(report_codes)} codes from equipment report</span></div>'
         oks1.append(True)
     except:
         s1 += '<span class="st e"><span class="lb">ERROR</span>read failed</span>'
         oks1.append(False)
 
-    # V-files (sub-stage of equipment report)
+    main_em_key = f'{P["em"]}{n}.json'
+    if ex(main_em_key):
+        try:
+            er = rj(main_em_key); main_oid = er.get('orderId','')
+            s1 += st_html('Main emission receipt',main_em_key,'ok',f'orderId {main_oid[:16]}' if main_oid else 'no orderId','l1')
+            oks1.append(bool(main_oid))
+        except:
+            s1 += st_html('Main emission receipt',main_em_key,'w','read error','l1'); oks1.append(False)
+    else:
+        s1 += st_html('Main emission receipt',None,'e','not found','l1'); oks1.append(False)
+
+    if main_oid:
+        kk = f'{P["kd"]}{main_oid}.json'
+        if ex(kk):
+            xlsx_key = f'{P["out"]}{n}_kodes_T-level.xls'
+            if not ex(xlsx_key):
+                try: generate_kodes_xlsx(rj(kk), B, xlsx_key)
+                except Exception as xe: print(f'  XLSX gen failed: {xe}')
+            s1 += f'<div class="st ok l1"><span class="lb">Main kodes</span><span>{kd_link(kk, "T-level codes")} {kd_xls_link(xlsx_key, "kodes_T-level")}</span></div>'
+        else:
+            s1 += st_html('Main kodes',None,'e','not found','l1'); oks1.append(False)
+
+    # V-files (sub-stage of SET equipment report)
     vfiles = []
-    first_oid = None
     if n.startswith('T-'):
         for pg2 in p.paginate(Bucket=B, Prefix=f'{P["em"]}V-{n}'):
             for o2 in pg2.get('Contents',[]):
@@ -217,7 +400,6 @@ for n,k,ch in r:
                 try:
                     dd = rj(vk); oid_v = dd.get('orderId','')
                     vfiles.append((vk, oid_v))
-                    if not first_oid: first_oid = oid_v
                 except: pass
 
     if vfiles:
@@ -229,55 +411,35 @@ for n,k,ch in r:
             if oid_v:
                 kk = f'{P["kd"]}{oid_v}.json'
                 if ex(kk):
-                    xlsx_key = f'{P["out"]}{n}_kodes_V{vi+1}.xls'
+                    vfile_id = safe_key_part(vname)
+                    xlsx_key = f'{P["out"]}{n}_kodes_{vfile_id}.xls'
                     if not ex(xlsx_key):
                         try: generate_kodes_xlsx(rj(kk), B, xlsx_key)
                         except Exception as xe: print(f'  XLSX gen failed: {xe}')
-                    s1 += f'<div class="st ok l2"><span class="lb">Kodes</span><span>{kd_link(kk, f"V{vi+1} codes")} {kd_xls_link(xlsx_key, f"kodes_V{vi+1}")}</span></div>'
+                    s1 += f'<div class="st ok l2"><span class="lb">Kodes</span><span>{kd_link(kk, f"{vname} codes")} {kd_xls_link(xlsx_key, f"kodes_{vname}")}</span></div>'
                 for lb,sf in [('Util task','ut'),('Util receipt','ur'),('Util report','up'),('Intro receipt','ir'),('Intro doc','iv')]:
                     kv = f'{P[sf]}{oid_v}.json'
                     if ex(kv):
                         okf = True
                         if sf == 'up':
-                            try:
-                                ud = rj(kv); st = ud.get('reportStatus','?'); msg = ud.get('reportStatusMessage','')
-                                m = st; okf = (st == 'SUCCESS')
-                                if msg: m += f' | {msg[:60]}'
-                            except: m='read error'; okf=False
+                            okf, m = utilisation_meta(kv)
                         elif sf == 'iv':
-                            try:
-                                ivd = rj(kv)
-                                if isinstance(ivd,list) and len(ivd) > 0:
-                                    d0 = ivd[0]; st = d0.get('status','?'); tp = d0.get('type','')
-                                    inn = d0.get('senderInn','')
-                                    m = st; okf = (st == 'CHECKED_OK')
-                                    if tp: m += f' type:{tp}'
-                                    if inn: m += f' INN:{inn}'
-                                else: m='empty'
-                            except: m='read error'; okf=False
+                            okf, m = introduce_meta(kv)
                         elif 'receipt' in sf:
-                            try:
-                                rd = rj(kv)
-                                m = f'ID {str(rd.get(list(rd.keys())[0],"?"))[:16]}'
-                            except: m='read error'
+                            m = receipt_meta(kv)
                         else: m='created'
                         s1 += st_html(lb,kv,'ok' if okf else 'w',m,'l2'); oks1.append(okf)
                     else:
                         s1 += st_html(lb,None,'e','not found','l2'); oks1.append(False)
-    else:
+    elif is_unit:
+        s1 += st_html('Virtual attachments',None,'ok','not applicable for UNIT','l1'); oks1.append(True)
+    elif is_set:
         s1 += st_html('Attachments',None,'e','no V-files found','l1'); oks1.append(False)
-
-    if first_oid:
-        kk = f'{P["kd"]}{first_oid}.json'
-        if ex(kk):
-            xlsx_key = f'{P["out"]}{n}_kodes_T-level.xls'
-            if not ex(xlsx_key):
-                try: generate_kodes_xlsx(rj(kk), B, xlsx_key)
-                except Exception as xe: print(f'  XLSX gen failed: {xe}')
-            s1 += f'<div class="st ok l1"><span class="lb">T Kodes</span><span>{kd_link(kk, "T-level codes")} {kd_xls_link(xlsx_key, "kodes_T-level")}</span></div>'
+    else:
+        s1 += st_html('Virtual attachments',None,'w','technology unknown, not required','l1'); oks1.append(True)
 
     s1s = 'ok' if all(oks1) else ('w' if any(oks1) else 'e')
-    secs.append(('1. Equipment report & Attachments',s1s,s1)); all_ok.extend(oks1)
+    secs.append(('1. Equipment report & codes',s1s,s1)); all_ok.extend(oks1)
 
     # ====== 2. T-level utilisation ======
     s2 = ''; oks2 = []
@@ -301,9 +463,32 @@ for n,k,ch in r:
     s2s = 'ok' if all(oks2) else ('w' if any(oks2) else 'e')
     secs.append(('2. T-level utilisation',s2s,s2)); all_ok.extend(oks2)
 
-    # ====== 3. SET aggregation ======
+    # ====== 3. UNIT introduction ======
+    s3b = ''; oks3 = []
+    if is_unit:
+        for lb,sf in [('Intro task','it'),('Intro receipt','ir'),('Intro status','iv')]:
+            k3 = f'{P[sf]}{n}.json'
+            if ex(k3):
+                okf = True
+                if sf == 'iv':
+                    okf, m = introduce_meta(k3)
+                elif sf == 'ir':
+                    m = receipt_meta(k3)
+                else:
+                    m = 'created'
+                s3b += st_html(lb,k3,'ok' if okf else 'w',m); oks3.append(okf)
+            else:
+                s3b += st_html(lb,None,'e','not found'); oks3.append(False)
+    elif is_set:
+        s3b += st_html('UNIT introduction',None,'ok','not applicable for SET','l1'); oks3.append(True)
+    else:
+        s3b += st_html('UNIT introduction',None,'w','technology unknown, not required','l1'); oks3.append(True)
+    s3s = 'ok' if all(oks3) else ('w' if any(oks3) else 'e')
+    secs.append(('3. UNIT introduction',s3s,s3b)); all_ok.extend(oks3)
+
+    # ====== 4. SET aggregation ======
     s4 = ''; oks4 = []
-    if n.startswith('T-'):
+    if is_set:
         for lb,sf in [('Set report','esr'),('Set task','ast'),('Set receipt','asr'),('Set status','ass')]:
             ks = f'{P[sf]}{n}.json'
             if ex(ks):
@@ -334,12 +519,16 @@ for n,k,ch in r:
                 s4 += st_html(lb,ks,'ok' if okf else 'w',m); oks4.append(okf)
             else:
                 s4 += st_html(lb,None,'e','not found'); oks4.append(False)
+    elif is_unit:
+        s4 += st_html('SET aggregation',None,'ok','not applicable for UNIT','l1'); oks4.append(True)
+    else:
+        s4 += st_html('SET aggregation',None,'w','technology unknown, not required','l1'); oks4.append(True)
     s4s = 'ok' if all(oks4) else ('w' if any(oks4) else 'e')
-    secs.append(('3. SET aggregation',s4s,s4)); all_ok.extend(oks4)
+    secs.append(('4. SET aggregation',s4s,s4)); all_ok.extend(oks4)
 
-    # ====== 4. Transport aggregation ======
+    # ====== 5. Transport aggregation ======
     s5 = ''; oks5 = []
-    if n.startswith('T-'):
+    if is_unit:
         for lb,sf in [('Agg task','at'),('Agg receipt','ar'),('Agg status','ag')]:
             ks = f'{P[sf]}{n}.json'
             if ex(ks):
@@ -354,13 +543,18 @@ for n,k,ch in r:
                 s5 += st_html(lb,ks,'ok' if okf else 'w',m); oks5.append(okf)
             else:
                 s5 += st_html(lb,None,'e','not found'); oks5.append(False)
+    elif is_set:
+        s5 += st_html('Transport aggregation',None,'ok','not applicable for SET virtual flow','l1'); oks5.append(True)
+    else:
+        s5 += st_html('Transport aggregation',None,'w','technology unknown, not required','l1'); oks5.append(True)
     s5s = 'ok' if all(oks5) else ('w' if any(oks5) else 'e')
-    secs.append(('4. Transport aggregation',s5s,s5)); all_ok.extend(oks5)
+    secs.append(('5. Transport aggregation',s5s,s5)); all_ok.extend(oks5)
 
-    # ====== 5. Tag ======
-    s6 = st_html('Tag',k,'ok' if ch=='finished' else 'w',f'check: <b>{ch}</b>')
-    s6s = 'ok' if ch == 'finished' else 'w'
-    secs.append(('5. Tag',s6s,s6)); all_ok.append(ch == 'finished')
+    # ====== 6. Tag ======
+    current_ch = tag_dict(k).get('check', ch)
+    s6 = st_html('Tag',k,'ok' if current_ch=='finished' else 'w',f'check: <b>{current_ch}</b>')
+    s6s = 'ok' if current_ch == 'finished' else 'w'
+    secs.append(('6. Tag',s6s,s6)); all_ok.append(current_ch == 'finished')
 
     # ====== Render ======
     sh = ''
@@ -377,8 +571,41 @@ for n,k,ch in r:
     btx = '\u2705 COMPLETE' if overall else ('\u26a0\ufe0f PARTIAL' if any(all_ok) else '\u274c INCOMPLETE')
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    html = f'<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>{n}</title>{CSS}</head><body><h1>{n}</h1>{sh}<div class="bnr {bcl}">{btx}<div class="sub">Generated {now}</div></div><div class="ft">{now} \u00b7 DeepSeek TUI</div></body></html>'
-    s3.put_object(Bucket=B, Key=f'{P["out"]}{n}_report.html', Body=html.encode(), ContentType='text/html; charset=utf-8')
+    report_key = f'{P["out"]}{n}_report.html'
+    txt_key = f'{P["out"]}{n}_report.txt'
+    report_url = f'{U}/{report_key}'
+    txt_url = f'{U}/{txt_key}'
+    csp = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\">"
+    html = f'<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">{csp}<title>{n}</title>{CSS}</head><body><h1>{n}</h1>{sh}<div class="bnr {bcl}">{btx}<div class="sub">Generated {now}</div></div><div class="ft">{now} \u00b7 Фитокосметик (С)</div></body></html>'
+    s3.put_object(Bucket=B, Key=report_key, Body=html.encode(), ContentType='text/html; charset=utf-8')
+
+    share_lines = [
+        f'Equipment report dashboard: {n}',
+        f'Generated: {now}',
+        f'Technology: {tech}',
+        f'Overall: {text_status(bcl)}',
+        f'HTML dashboard: {report_url}',
+        '',
+        'Sections:',
+    ]
+    for title,status,body in secs:
+        cnt_ok = body.count('st ok')
+        cnt_all = body.count('class="st')
+        cnt = f' {cnt_ok}/{cnt_all}' if cnt_all else ''
+        share_lines.append(f'- [{text_status(status)}]{cnt} {title}')
+        body_txt = safe_txt(body)
+        if body_txt:
+            share_lines.append(f'  {body_txt[:900]}')
+    share_lines.append('')
+    share_lines.append('Generated files:')
+    for pg2 in p.paginate(Bucket=B, Prefix=f'{P["out"]}{n}_'):
+        for o2 in pg2.get('Contents',[]):
+            gk = o2['Key']
+            if gk == txt_key:
+                continue
+            share_lines.append(f'- {U}/{gk}')
+    txt = '\n'.join(share_lines) + '\n'
+    s3.put_object(Bucket=B, Key=txt_key, Body=txt.encode(), ContentType='text/plain; charset=utf-8')
 
     # CLI summary with colors
     C={'ok':'\033[32m','w':'\033[33m','e':'\033[31m','R':'\033[0m'}
@@ -390,9 +617,9 @@ for n,k,ch in r:
     for title,status,_ in secs:
         sn=title.split()[0].rstrip('.')
         parts.append(f'{sn}:{dot(status)}')
-    report_url = f'{U}/{P["out"]}{n}_report.html'
     link = f'\033]8;;{report_url}\033\\{n[:80]}\033]8;;\033\\'
     parts.append(f'{C["ok"]}{link}{C["R"]}')
+    parts.append(f'TXT: {txt_url}')
     print('  '+'  '.join(parts))
 
 print(f'Done: {len(r)} reports')

@@ -5,6 +5,7 @@ import argparse
 import tempfile
 from pathlib import Path
 import shutil
+from datetime import datetime, timezone
 
 from .storage import get_storage
 from .config_loader import load_config
@@ -57,6 +58,8 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
     Основная процедура создания файлов задания на печать.
     key: имя файла эмиссии без расширения .json
     """
+    lock_path = None
+    lock_acquired = False
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
@@ -77,6 +80,23 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
 
         # Пути к файлам в S3
         json_s3_path = f"{kodes_path.rstrip('/')}/{key}.json"
+        lock_path = f"{prn_tasks_path.rstrip('/')}/.locks/{key}.lock"
+        lock_content = json.dumps({
+            "key": key,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False)
+
+        lock_acquired = storage_tasks.acquire_lock(lock_path, lock_content)
+        if not lock_acquired:
+            logger.info(f"[*] Задание печати {key} уже заблокировано другим обработчиком. Пропуск.")
+            return None
+
+        def finish(value):
+            try:
+                storage_tasks.release_lock(lock_path)
+            except Exception as release_err:
+                logger.warning(f"[!] Не удалось снять lock печати {lock_path}: {release_err}")
+            return value
 
         # 0. Проверка тегов управления печатью
         tags = storage_kodes.get_tags(json_s3_path)
@@ -88,7 +108,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
 
         if print_status == 'processing':
             logger.info(f"[*] Файл {key} уже в обработке (print-status:processing). Пропуск.")
-            return None
+            return finish(None)
 
         # Проверка на виртуальность
         if not ignore_duplicate and production_order_id:
@@ -111,7 +131,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
                         # Обрабатываем и bool и строку
                         if is_virtual is True or str(is_virtual).lower() == 'true':
                             logger.info(f"Попытка напечатать коды созданные для виртуального заказа {production_order_id}")
-                            return key
+                            return finish(key)
                     else:
                         logger.warning(f"[!] Файл производственного заказа не найден: {prod_path}")
             except Exception as e:
@@ -119,7 +139,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
 
         if not ignore_duplicate and print_status != 'not-printed':
             logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
-            return key
+            return finish(key)
 
         # Устанавливаем статус processing
         logger.info(f"[*] Установка статуса print-status:processing для {key}")
@@ -138,7 +158,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             local_json = temp_path / f"{key}.json"
             if not storage_kodes.exists(json_s3_path):
                 logger.error(f"[!] Файл {json_s3_path} не найден в S3")
-                return None
+                return finish(None)
             storage_kodes.download(json_s3_path, str(local_json))
 
             # 2. Скачиваем шаблоны и конфиги
@@ -149,13 +169,13 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             logger.info(f"[*] Скачивание шаблона {vdf_template_s3_path}...")
             if not storage_templates.exists(vdf_template_s3_path):
                 logger.error(f"[!] Шаблон {vdf_template_s3_path} не найден")
-                return None
+                return finish(None)
             storage_templates.download(vdf_template_s3_path, str(local_template))
 
             logger.info(f"[*] Скачивание конфигурации {amica_json_s3_path}...")
             if not storage_templates.exists(amica_json_s3_path):
                 logger.error(f"[!] Файл конфигурации {amica_json_s3_path} не найден")
-                return None
+                return finish(None)
             storage_templates.download(amica_json_s3_path, str(local_amica_json))
 
             logger.info(f"[*] Скачивание маппинга {mapping_json_s3_path}...")
@@ -171,7 +191,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             logger.info("[*] Конвертация JSON в CSV...")
             local_csv = temp_path / f"{key}.csv"
             if not convert_json_to_raw_csv(str(local_json), str(local_csv)):
-                return None
+                return finish(None)
 
             # 4. Генерация VDF
             logger.info("[*] Генерация VDF файла...")
@@ -193,7 +213,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
                     local_vdf = vdf_files[0]
                 else:
                     logger.error("[!] VDF файл не был создан")
-                    return None
+                    return finish(None)
 
             # 5. Загружаем CSV и VDF в целевой бакет
             dest_csv_s3 = f"{prn_tasks_path.rstrip('/')}/{key}.csv"
@@ -210,7 +230,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             storage_kodes.set_tags(json_s3_path, {'print-status': 'printed'})
 
             logger.info(f"[+++] Процедура успешно завершена для {key}")
-            return key
+            return finish(key)
 
     except Exception as e:
         # В случае ошибки сбрасываем статус в not-printed, чтобы можно было попробовать снова
@@ -218,6 +238,11 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             storage_kodes.set_tags(json_s3_path, {'print-status': 'not-printed'})
         except:
             pass
+        if lock_acquired and lock_path:
+            try:
+                storage_tasks.release_lock(lock_path)
+            except:
+                pass
         logger.error(f"[!] Ошибка в generate_prn_files: {e}")
         import traceback
         logger.error(traceback.format_exc())

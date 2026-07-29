@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 import shutil
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,10 @@ class BaseStorage:
     def set_tags(self, path, tags):
         pass
     def get_tags(self, path):
+        pass
+    def acquire_lock(self, path, content=''):
+        pass
+    def release_lock(self, path):
         pass
 
 class LocalStorage(BaseStorage):
@@ -149,6 +154,24 @@ class LocalStorage(BaseStorage):
             except Exception as e:
                 logger.error(f"Error reading tags file {tags_path}: {e}")
         return tags
+
+    def acquire_lock(self, path, content=''):
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(p, 'x', encoding='utf-8') as f:
+                f.write(str(content))
+            return True
+        except FileExistsError:
+            return False
+
+    def release_lock(self, path):
+        p = Path(path)
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        return path
 
 class S3Storage(BaseStorage):
     def __init__(self, s3_config):
@@ -284,6 +307,29 @@ class S3Storage(BaseStorage):
         except Exception as e:
             logger.error(f"Error getting S3 tags: {e}")
             return {}
+
+    def acquire_lock(self, path, content=''):
+        bucket, key = self._parse_s3_url(path)
+        try:
+            self.s3.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=str(content).encode('utf-8'),
+                IfNoneMatch='*',
+            )
+            return True
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code')
+            status = e.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+            if code in {'PreconditionFailed', '412'} or status == 412:
+                return False
+            logger.error(f"Error acquiring S3 lock {path}: {e}")
+            raise
+
+    def release_lock(self, path):
+        bucket, key = self._parse_s3_url(path)
+        self.s3.delete_object(Bucket=bucket, Key=key)
+        return path
 
 def get_storage(path, s3_config=None):
     if str(path).startswith('s3://'):
