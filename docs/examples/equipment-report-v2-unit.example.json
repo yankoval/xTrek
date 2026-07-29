@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 2,
+  "id": "T-EXAMPLE-UNIT-20260729-0001",
+  "startTime": "2026-07-29T08:00:00Z",
+  "endTime": "2026-07-29T08:30:00Z",
+  "operator": "operator-1",
+  "operators": [
+    "operator-1"
+  ],
+  "model": "equipment-model",
+  "build": "2.0.0",
+  "readyPallet": [
+    {
+      "Number": 0,
+      "palletNumber": "000000000000000017",
+      "palletAggregate": true,
+      "palletTime": "2026-07-29T08:30:00Z",
+      "readyBox": [
+        {
+          "Number": 0,
+          "boxNumber": "000000000000000024",
+          "boxAgregate": true,
+          "boxTime": "2026-07-29T08:10:00Z",
+          "productNumbers": [
+            "010460000000000121EXAMPLE01",
+            "010460000000000121EXAMPLE02"
+          ],
+          "productNumbersFull": [
+            "010460000000000121EXAMPLE01\u001d93ABCD",
+            "010460000000000121EXAMPLE02\u001d93EFGH"
+          ]
+        },
+        {
+          "Number": 1,
+          "boxNumber": "000000000000000031",
+          "boxAgregate": true,
+          "boxTime": "2026-07-29T08:20:00Z",
+          "productNumbers": [
+            "010460000000000121EXAMPLE03",
+            "010460000000000121EXAMPLE04"
+          ],
+          "productNumbersFull": [
+            "010460000000000121EXAMPLE03\u001d93IJKL",
+            "010460000000000121EXAMPLE04\u001d93MNOP"
+          ]
+        }
+      ]
+    }
+  ],
+  "sampleNumbers": [],
+  "sampleNumbersFull": null,
+  "defectiveCodes": null,
+  "defectiveCodesFull": null,
+  "emptyNumbers": null
+}

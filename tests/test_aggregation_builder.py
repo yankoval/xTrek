@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from xtrek.aggregation_builder import (
@@ -197,3 +200,22 @@ def test_rejects_short_codes_that_do_not_match_full_codes():
 
     with pytest.raises(AggregationBuildError, match="does not match"):
         normalize_equipment_report(report)
+
+
+@pytest.mark.parametrize(
+    "example_name",
+    [
+        "equipment-report-v2-unit.example.json",
+        "equipment-report-v2-set.example.json",
+    ],
+)
+def test_documented_v2_examples_match_builder_contract(example_name):
+    example_path = (
+        Path(__file__).parents[1] / "docs" / "examples" / example_name
+    )
+    report = json.loads(example_path.read_text(encoding="utf-8"))
+
+    normalized = normalize_equipment_report(report)
+
+    assert normalized.source_schema_version == 2
+    assert normalized.pallets

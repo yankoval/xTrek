@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xtrek.local/schemas/equipment-report-v2.schema.json",
+  "title": "xTrek equipment aggregation report v2",
+  "description": "Closed pallet -> box -> product hierarchy produced by equipment.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "readyPallet"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 2
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "startTime": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "endTime": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "operator": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "operators": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "build": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "readyPallet": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/pallet"
+      }
+    },
+    "sampleNumbers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sampleNumbersFull": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "defectiveCodes": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "defectiveCodesFull": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "emptyNumbers": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "properties": {
+        "convertedFromSchemaVersion": {
+          "const": 1
+        },
+        "strategy": {
+          "const": "single-pallet"
+        },
+        "sourceReportId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "convertedFromSchemaVersion",
+        "strategy",
+        "sourceReportId"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "sscc": {
+      "type": "string",
+      "pattern": "^[0-9]{18}$"
+    },
+    "fullMarkingCode": {
+      "type": "string",
+      "minLength": 1
+    },
+    "box": {
+      "type": "object",
+      "required": [
+        "boxNumber",
+        "boxAgregate",
+        "productNumbersFull"
+      ],
+      "properties": {
+        "Number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "boxNumber": {
+          "$ref": "#/$defs/sscc"
+        },
+        "boxAgregate": {
+          "const": true
+        },
+        "boxTime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "productNumbers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "productNumbersFull": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/fullMarkingCode"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "pallet": {
+      "type": "object",
+      "required": [
+        "palletNumber",
+        "palletAggregate",
+        "readyBox"
+      ],
+      "properties": {
+        "Number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "palletNumber": {
+          "$ref": "#/$defs/sscc"
+        },
+        "palletAggregate": {
+          "const": true
+        },
+        "palletTime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "readyBox": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/box"
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
