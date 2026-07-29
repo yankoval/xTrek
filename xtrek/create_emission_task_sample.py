@@ -26,6 +26,7 @@ from .crpt_auth import get_new_token
 from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
+from .aggregation_builder import AggregationBuildError, build_aggregation_report
 
 # ---------------------------------------------------------------------------
 # Изменения 2026-07-09: поддержка linked GTIN и работы через субаккаунты.
@@ -2062,25 +2063,12 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
             return None
 
         report_data = json.loads(storage_reports.read_text(report_path))
-        if not report_data.get('readyBox'):
-            logger.info(f"[*] Отчет {report_uuid} содержит пустой readyBox. Завершение без ошибки.")
+        if not report_data.get('readyBox') and not report_data.get('readyPallet'):
+            logger.info(
+                f"[*] Отчет {report_uuid} не содержит readyBox/readyPallet. "
+                "Завершение без ошибки."
+            )
             return None
-
-        # Фильтрация полей для отчета
-        sig_report = inspect.signature(EquipmentAggTaskReport.__init__)
-        valid_fields_report = {k for k, v in sig_report.parameters.items() if k != 'self'}
-
-        boxes_raw = report_data.get('readyBox', [])
-        boxes_objs = []
-        sig_box = inspect.signature(EquipmentAggBox.__init__)
-        valid_fields_box = {k for k, v in sig_box.parameters.items() if k != 'self'}
-        for b_dict in boxes_raw:
-            filtered_box_data = {k: v for k, v in b_dict.items() if k in valid_fields_box}
-            boxes_objs.append(EquipmentAggBox(**filtered_box_data))
-
-        filtered_report_data = {k: v for k, v in report_data.items() if k in valid_fields_report}
-        filtered_report_data['readyBox'] = boxes_objs
-        report_obj = EquipmentAggTaskReport(**filtered_report_data)
 
         # 3. Определяем ИНН по GTIN задания или используем переопределение
         inn = inn_override
@@ -2094,35 +2082,24 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
 
         logger.info(f"[*] Используется ИНН участника: {inn}")
 
-        # 4. Формируем целевой отчет AggregationReport
-        aggregation_units = []
-        for box in report_obj.readyBox:
-            box_number = str(box.boxNumber)
-            # Нормализация SSCC: должен быть 20 цифр, начинаться на 00
-            if len(box_number) == 18:
-                box_number = "00" + box_number
-            elif len(box_number) == 20 and not box_number.startswith("00"):
-                logger.warning(f"[*] Странный формат boxNumber (20 знаков, не 00...): {box_number}")
-
-            # Очистка кодов от криптохвоста (до первого \u001d)
-            clean_sntins = []
-            for code in box.productNumbersFull:
-                clean_code = code.split('\u001d')[0]
-                clean_sntins.append(clean_code)
-
-            unit = AggregationUnit(
-                unitSerialNumber=box_number,
-                aggregationType="AGGREGATION",
-                sntins=clean_sntins,
-                unitSerialNumberList=None
-            )
-            aggregation_units.append(unit)
-
-        final_report = AggregationReport(
-            participantId=inn,
-            aggregationUnits=aggregation_units,
-            productionOrderId=task_uuid
+        # 4. Формируем универсальный отчет v1/v2.
+        # Для переходных v1 отчетов паллет добавляется, если его SSCC уже был
+        # идемпотентно выделен вызывающей системой и сохранен в задании/отчете.
+        legacy_pallet_sscc = (
+            report_data.get('palletNumber')
+            or task_data.get('palletNumber')
+            or task_data.get('palletSSCC')
+            or task_data.get('palletSscc')
         )
+        try:
+            final_report = build_aggregation_report(
+                report_data,
+                participant_id=inn,
+                legacy_pallet_sscc=legacy_pallet_sscc,
+            )
+        except AggregationBuildError as e:
+            logger.error(f"[!] Некорректный отчет оборудования {report_uuid}: {e}")
+            return None
 
         # 5. Сохраняем итоговый отчет
         storage_agg = get_storage(agg_tasks_path, s3_config)
@@ -2806,7 +2783,9 @@ def update_aggregation_status(task_uuid: str, group: str):
 
         report_data = json.loads(storage_agg.read_text(report_path))
         inn = report_data.get('participantId')
-        production_order_id = report_data.get('productionOrderId')
+        production_order_id = (
+            report_data.get('productionOrderId') or production_order_id
+        )
 
         if not inn:
             logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
