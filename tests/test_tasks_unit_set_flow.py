@@ -98,6 +98,115 @@ def test_unit_equipment_report_creates_utilisation_and_skips_virtual_tasks(monke
     create_virtual.assert_not_called()
 
 
+def test_equipment_report_raises_when_utilisation_send_returns_error(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(tasks, "check_aggregation_reports", MagicMock(return_value={"report": None}))
+    monkeypatch.setattr(tasks, "create_utilisation_task_from_report", MagicMock(return_value="T-UNIT"))
+    monkeypatch.setattr(tasks, "sign_and_send_utilisation", MagicMock(return_value={
+        "error": "no healthy upstream",
+        "status_code": 503,
+    }))
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports/T-UNIT.json",
+    }])
+
+    assert not result.successful()
+    assert "sign_and_send_utilisation failed for T-UNIT" in str(result.result)
+
+
+def test_equipment_report_retries_when_precheck_returns_api_error(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    create_util = MagicMock()
+    sign_util = MagicMock()
+    monkeypatch.setattr(
+        tasks,
+        "check_aggregation_reports",
+        MagicMock(return_value={
+            "report": {"api_error": ["401 Client Error: Unauthorized"]}
+        }),
+    )
+    monkeypatch.setattr(tasks, "create_utilisation_task_from_report", create_util)
+    monkeypatch.setattr(tasks, "sign_and_send_utilisation", sign_util)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports/T-UNIT.json",
+    }])
+
+    assert not result.successful()
+    error = str(result.result)
+    assert "equipment report precheck True API failure for T-UNIT" in error
+    assert "HTTP 401 Unauthorized" in error
+    assert (
+        "retryable HTTP codes: 401, 408, 429, 500, 502, 503, 504"
+        in error
+    )
+    create_util.assert_not_called()
+    sign_util.assert_not_called()
+
+
+def test_equipment_report_stops_without_retry_on_forbidden_precheck(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    create_util = MagicMock()
+    sign_util = MagicMock()
+    set_check_tag = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        tasks,
+        "check_aggregation_reports",
+        MagicMock(return_value={
+            "s3://internal-bucket/equipment-reports/T-UNIT.json": {
+                "api_error": ["403 Client Error: Forbidden"]
+            }
+        }),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_set_equipment_report_check_tag",
+        set_check_tag,
+    )
+    monkeypatch.setattr(tasks, "create_utilisation_task_from_report", create_util)
+    monkeypatch.setattr(tasks, "sign_and_send_utilisation", sign_util)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports/T-UNIT.json",
+    }])
+
+    assert result.successful()
+    set_check_tag.assert_called_once_with(
+        "s3://internal-bucket/equipment-reports/T-UNIT.json",
+        "true-api-403-forbidden",
+    )
+    create_util.assert_not_called()
+    sign_util.assert_not_called()
+
+
+def test_equipment_report_skips_business_validation_errors_without_retry(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    create_util = MagicMock()
+    sign_util = MagicMock()
+    monkeypatch.setattr(
+        tasks,
+        "check_aggregation_reports",
+        MagicMock(return_value={
+            "report": {"wrongunitstatus": ["010... (Статус: INTRODUCED)"]}
+        }),
+    )
+    monkeypatch.setattr(tasks, "create_utilisation_task_from_report", create_util)
+    monkeypatch.setattr(tasks, "sign_and_send_utilisation", sign_util)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports/T-UNIT.json",
+    }])
+
+    assert result.successful()
+    create_util.assert_not_called()
+    sign_util.assert_not_called()
+
+
 def test_unit_utilisation_success_starts_introduce_from_report(monkeypatch):
     tasks = import_tasks(monkeypatch)
     status = tasks.UtilisationReportStatus(
@@ -121,6 +230,30 @@ def test_unit_utilisation_success_starts_introduce_from_report(monkeypatch):
     tasks.trigger_set_aggregation_if_ready.assert_not_called()
 
 
+def test_unit_utilisation_raises_when_introduce_send_returns_error(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    status = tasks.UtilisationReportStatus(
+        omsId="oms",
+        reportId="report",
+        reportStatus="SUCCESS",
+    )
+    monkeypatch.setattr(tasks, "update_utilisation_report_status", MagicMock(return_value=status))
+    monkeypatch.setattr(tasks, "get_production_order_data", MagicMock(return_value={"GtinType": "UNIT"}))
+    monkeypatch.setattr(tasks, "create_introduce_task_from_report", MagicMock(return_value="T-UNIT"))
+    monkeypatch.setattr(tasks, "sign_and_send_introduce", MagicMock(return_value={
+        "error": "no healthy upstream",
+        "status_code": 503,
+    }))
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "utilisationReceipts/T-UNIT.json",
+    }])
+
+    assert not result.successful()
+    assert "sign_and_send_introduce failed for T-UNIT" in str(result.result)
+
+
 def test_unit_checked_ok_introduce_starts_standard_aggregation(monkeypatch):
     tasks = import_tasks(monkeypatch)
     create_agg = MagicMock(return_value="T-UNIT")
@@ -138,6 +271,26 @@ def test_unit_checked_ok_introduce_starts_standard_aggregation(monkeypatch):
     create_agg.assert_called_once_with("T-UNIT")
     sign_agg.assert_called_once_with("T-UNIT", "chemistry", "/tmp/sign", 120)
     tasks.trigger_set_aggregation_if_ready.assert_not_called()
+
+
+def test_unit_introduce_raises_when_aggregation_send_returns_error(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(tasks, "update_introduce_status", MagicMock(return_value=[{"status": "CHECKED_OK"}]))
+    monkeypatch.setattr(tasks, "_find_production_order_id_by_suz_order_id", MagicMock(return_value="T-UNIT"))
+    monkeypatch.setattr(tasks, "get_production_order_data", MagicMock(return_value={"GtinType": "UNIT"}))
+    monkeypatch.setattr(tasks, "create_aggregation_report", MagicMock(return_value="T-UNIT"))
+    monkeypatch.setattr(tasks, "sign_and_send_aggregation", MagicMock(return_value={
+        "error": "no healthy upstream",
+        "status_code": 503,
+    }))
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "introduceReceipts/T-UNIT.json",
+    }])
+
+    assert not result.successful()
+    assert "sign_and_send_aggregation failed for T-UNIT" in str(result.result)
 
 
 def test_unit_checked_ok_introduce_uses_status_production_order_id(monkeypatch):

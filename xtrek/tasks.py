@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from celery import Celery
 from urllib.parse import quote
 
@@ -85,6 +86,91 @@ app.conf.update(
 )
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+_EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS = {
+    401: "Unauthorized",
+    408: "Request Timeout",
+    429: "Too Many Requests",
+    500: "Internal Server Error",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+}
+_EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS = {
+    403: "Forbidden",
+}
+
+
+def _equipment_report_api_error_details(error):
+    if isinstance(error, str):
+        error_text = error
+    else:
+        error_text = json.dumps(error, ensure_ascii=False, default=str)
+
+    status_codes = {
+        int(match)
+        for match in re.findall(r"\b([45]\d{2})\b", error_text)
+    }
+    return error_text, status_codes
+
+
+def _describe_equipment_report_api_error(error):
+    error_text, status_codes = _equipment_report_api_error_details(error)
+    known_errors = {
+        **_EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS,
+        **_EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS,
+    }
+    detected = [
+        "HTTP "
+        f"{status_code}"
+        f"{f' {known_errors[status_code]}' if status_code in known_errors else ''}"
+        for status_code in sorted(status_codes)
+    ]
+    if detected:
+        failure = ", ".join(detected)
+    else:
+        failure = "network/transport error or unclassified True API response"
+
+    retryable_codes = ", ".join(
+        str(status_code)
+        for status_code in _EQUIPMENT_REPORT_RETRYABLE_TRUE_API_HTTP_ERRORS
+    )
+    return (
+        f"{failure}; retryable HTTP codes: {retryable_codes}; "
+        f"details: {error_text}"
+    )
+
+
+def _set_equipment_report_check_tag(report_path, tag_value):
+    try:
+        from xtrek.storage import get_storage
+
+        storage = get_storage(report_path, config.get("s3_config"))
+        storage.set_tags(report_path, {"check": tag_value})
+        return True
+    except Exception as exc:
+        print(
+            f"[WARN] Не удалось установить check={tag_value} "
+            f"для {report_path}: {exc}"
+        )
+        return False
+
+
+def _is_failed_send_result(result):
+    if not result:
+        return True
+    if isinstance(result, dict):
+        if result.get("error"):
+            return True
+        status_code = result.get("status_code") or result.get("code")
+        if isinstance(status_code, int) and status_code >= 400:
+            return True
+        if isinstance(status_code, str) and status_code.isdigit() and int(status_code) >= 400:
+            return True
+    if isinstance(result, str) and "error" in result.lower():
+        return True
+    return False
+
+
 def get_production_order_data(production_order_id):
     """
     Загружает данные производственного задания из S3/Локально.
@@ -319,7 +405,7 @@ def logic_utilisationReceipt(full_key):
             if not res1:
                 raise RuntimeError(f"create_introduce_task_from_report failed for {utilisationReceipt_id}")
             res2 = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
-            if not res2:
+            if _is_failed_send_result(res2):
                 raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
             return f"Introduction task for UNIT {utilisationReceipt_id} started successfully"
         else:
@@ -334,7 +420,7 @@ def logic_utilisationReceipt(full_key):
     if type(result) is ProductionOrder:
         if result.virtual:
             result = sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120)
-            if not result:
+            if _is_failed_send_result(result):
                 raise RuntimeError(f"sign_and_send_introduce failed for {utilisationReceipt_id}")
 
             return f"Introduce task for virtual {utilisationReceipt_id} has been send successfully:{result}"
@@ -382,7 +468,7 @@ def logic_update_introduce(full_key):
                 if not res1:
                     raise RuntimeError(f"create_aggregation_report failed for {prod_id}")
                 res2 = sign_and_send_aggregation(prod_id, PRODUCT_GROUP, signing_dir, 120)
-                if not res2:
+                if _is_failed_send_result(res2):
                     raise RuntimeError(f"sign_and_send_aggregation failed for {prod_id}")
                 return f"Standard aggregation for UNIT {prod_id} started successfully"
 
@@ -402,24 +488,56 @@ def logic_start_equipment_reports(full_key):
     # Проверяем отчет перед обработкой
     result = check_aggregation_reports([production_order_id])
     
-    # Если есть ошибки не обрабатывам
-    if result:
-        error = list(result.values())[0] 
-        if error:
-            return f"Отчет оборудования об агрегации {production_order_id} пропускаем. Нацдены ошибки: {error}."
-    else:
-        return f"Отчет оборудования об агрегации {production_order_id} пропускаем. Нацдены ошибки: {error}."
+    # Ошибки авторизации (401), таймауты и rate limit (408, 429), ошибки
+    # True API/upstream (500, 502, 503, 504), а также сетевые ошибки без
+    # HTTP-кода означают, что отчет фактически не проверен.
+    # Поднимаем исключение, чтобы Celery повторил проверку после восстановления,
+    # не переходя к созданию документов.
+    if not result:
+        raise RuntimeError(
+            f"check_aggregation_reports returned no result for {production_order_id}"
+        )
+
+    error = next(iter(result.values()))
+    if error:
+        if isinstance(error, dict) and error.get("api_error"):
+            _, status_codes = _equipment_report_api_error_details(
+                error["api_error"]
+            )
+            api_error = _describe_equipment_report_api_error(
+                error["api_error"]
+            )
+            if status_codes & set(
+                _EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS
+            ):
+                report_path = next(iter(result))
+                _set_equipment_report_check_tag(
+                    report_path,
+                    "true-api-403-forbidden",
+                )
+                return (
+                    f"Обработка отчета оборудования {production_order_id} "
+                    f"остановлена без retry: {api_error}"
+                )
+            raise RuntimeError(
+                f"equipment report precheck True API failure for "
+                f"{production_order_id}: {api_error}"
+            )
+        return (
+            f"Отчет оборудования об агрегации {production_order_id} "
+            f"пропускаем. Найдены ошибки: {error}."
+        )
     
     # Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство
     print(f"Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство")
     utResult = create_utilisation_task_from_report(report_id, group)
     if not utResult:
-        print(f"Ошибка при попытке создания отчёта о нанесении по отчету оборудования f{report_id}. Продолжаем обработку. {utResult}")
+        raise RuntimeError(f"create_utilisation_task_from_report failed for {report_id}")
     else:
         print("Подписываем/отправляем")
         sutResult = sign_and_send_utilisation(report_id, signing_dir, 120)
-        if not sutResult:
-            print(f"sign_and_send_utilisation failed for {report_id}")
+        if _is_failed_send_result(sutResult):
+            raise RuntimeError(f"sign_and_send_utilisation failed for {report_id}")
     
     
     # Проверяем тип задания
@@ -483,7 +601,7 @@ def logic_update_agg_set(full_key):
 
         # 2. Подписываем и отправляем
         res2 = sign_and_send_aggregation(production_order_id, group, signing_dir, 120)
-        if not res2:
+        if _is_failed_send_result(res2):
             raise RuntimeError(f"sign_and_send_aggregation failed for {production_order_id}")
 
         return f"Standard aggregation for {production_order_id} started successfully"

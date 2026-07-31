@@ -88,6 +88,24 @@ def test_set_ready_check_fail_not_set(mock_resources):
                     result = set_ready_check(path)
                     assert result is None
 
+
+def test_set_ready_check_preserves_finished_tag(mock_resources):
+    api, nk, config = mock_resources
+    path = "reports/PROD123.json"
+    storage_rep = MagicMock()
+    storage_rep.get_tags.return_value = {"check": "finished"}
+
+    with patch(
+        "xtrek.utils._ensure_resources",
+        return_value=(path, api, nk, config),
+    ), patch("xtrek.utils.get_storage", return_value=storage_rep):
+        result = set_ready_check(path)
+
+    assert result == "finished"
+    storage_rep.set_tags.assert_not_called()
+    nk.get_set_by_gtin.assert_not_called()
+
+
 def test_set_ready_check_fail_util_not_success(mock_resources):
     api, nk, config = mock_resources
     path = "reports/PROD123.json"
