@@ -12,6 +12,11 @@ from .nkapi import NK
 from .tokens import TokenProcessor
 from .gs1_processor import get_inn_by_gtin
 from .config_loader import load_config
+from .aggregation_builder import (
+    AggregationBuildError,
+    iter_equipment_report_boxes,
+    iter_equipment_report_pallets,
+)
 
 # Setup logging
 logger = logging.getLogger("xtrek.utils")
@@ -110,25 +115,38 @@ class AggregationAnalyzer:
             logger.error(f"Ошибка чтения файла {path}: {e}")
             return {'filereaderror': [str(e)]}
 
-        ready_boxes = data.get('readyBox', [])
+        try:
+            ready_boxes = iter_equipment_report_boxes(data)
+            ready_pallets = iter_equipment_report_pallets(data)
+        except AggregationBuildError as e:
+            errors['invalidreport'].append(str(e))
+            ready_boxes = ()
+            ready_pallets = ()
 
         # 1. Проверка на минимальное количество коробок
         if len(ready_boxes) < self.min_sscc:
             errors['minssccinaggrep'].append(f"Количество коробок {len(ready_boxes)} меньше {self.min_sscc}")
 
         # 2. Сбор кодов и проверка уникальности внутри файла
-        box_codes = []
+        aggregate_codes = []
         child_codes = []
 
-        box_counter = Counter()
+        aggregate_counter = Counter()
         child_counter = Counter()
+
+        for pallet in ready_pallets:
+            pallet_code = pallet.get('palletNumber')
+            if pallet_code:
+                clean_pallet = normalize_sscc(cut_crypto_tail(pallet_code))
+                aggregate_codes.append(clean_pallet)
+                aggregate_counter[clean_pallet] += 1
 
         for box in ready_boxes:
             box_code = box.get('boxNumber')
             if box_code:
                 clean_box = normalize_sscc(cut_crypto_tail(box_code))
-                box_codes.append(clean_box)
-                box_counter[clean_box] += 1
+                aggregate_codes.append(clean_box)
+                aggregate_counter[clean_box] += 1
 
             children = box.get('productNumbersFull') or []
             for child in children:
@@ -136,13 +154,13 @@ class AggregationAnalyzer:
                 child_codes.append(clean_child)
                 child_counter[clean_child] += 1
 
-        for code, count in box_counter.items():
+        for code, count in aggregate_counter.items():
             if count > 1: errors['duplicateaggregation'].append(code)
         for code, count in child_counter.items():
             if count > 1: errors['duplicateattachment'].append(code)
 
         # 3. Запрос статусов в ГИС МТ
-        all_codes = list(set(box_codes + child_codes))
+        all_codes = list(set(aggregate_codes + child_codes))
         status_map = {}
 
         if all_codes:
@@ -174,11 +192,13 @@ class AggregationAnalyzer:
             # 5. Проверка начального состояния (эквивалентно готовности к агрегации)
 
             # Проверка кодов агрегации (SSCC должны отсутствовать в системе)
-            for box in set(box_codes):
-                info = status_map.get(box)
+            for aggregate_code in set(aggregate_codes):
+                info = status_map.get(aggregate_code)
                 # Если info пустой или в нем нет статуса - это значит "не найден" (ОК)
                 if info and info.get('status') and info.get('status') != 'NOT_FOUND':
-                    errors['alreadyregistered'].append(f"{box} (Статус: {info.get('status')})")
+                    errors['alreadyregistered'].append(
+                        f"{aggregate_code} (Статус: {info.get('status')})"
+                    )
 
             # Проверка кодов товаров (должны быть в статусе EMITTED)
             for child in set(child_codes):
@@ -258,10 +278,10 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
             else:
                 content = storage.read_text(resolved_path)
                 data = json.loads(content)
-                ready_boxes = data.get('readyBox', [])
+                ready_boxes = iter_equipment_report_boxes(data)
                 detected_inn = None
                 for box in ready_boxes:
-                    codes_to_check = [box.get('boxNumber')] + (box.get('productNumbersFull') or [])
+                    codes_to_check = box.get('productNumbersFull') or []
                     for code in codes_to_check:
                         if code:
                             gtin = get_gtin_from_code(cut_crypto_tail(code))

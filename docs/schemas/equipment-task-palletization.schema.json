@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xtrek.local/schemas/equipment-task-palletization.schema.json",
+  "title": "xTrek equipment task pallet assignment",
+  "description": "Pallet SSCCs allocated before an equipment task is published.",
+  "type": "object",
+  "required": [
+    "id",
+    "reportSchemaVersion",
+    "plannedPalletCount",
+    "palletSsccReserve",
+    "palletNumbers"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reportSchemaVersion": {
+      "enum": [
+        1,
+        2
+      ]
+    },
+    "numBoxesInPallet": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "plannedPalletCount": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "palletSsccReserve": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "palletNumbers": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9]{18}$"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "reportSchemaVersion": {
+            "const": 1
+          }
+        },
+        "required": [
+          "reportSchemaVersion"
+        ]
+      },
+      "then": {
+        "properties": {
+          "plannedPalletCount": {
+            "const": 1
+          },
+          "palletSsccReserve": {
+            "const": 0
+          },
+          "palletNumbers": {
+            "minItems": 1,
+            "maxItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reportSchemaVersion": {
+            "const": 2
+          }
+        },
+        "required": [
+          "reportSchemaVersion"
+        ]
+      },
+      "then": {
+        "required": [
+          "numBoxesInPallet"
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true
+}

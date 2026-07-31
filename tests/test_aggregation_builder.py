@@ -6,6 +6,9 @@ import pytest
 from xtrek.aggregation_builder import (
     AggregationBuildError,
     build_aggregation_report,
+    extract_full_product_codes,
+    iter_equipment_report_boxes,
+    iter_equipment_report_pallets,
     normalize_equipment_report,
 )
 
@@ -73,6 +76,87 @@ def test_v2_builds_boxes_before_pallet_in_one_document():
             },
         ],
     }
+
+
+def test_v2_builds_multiple_pallets_in_one_document():
+    report = {
+        "schemaVersion": 2,
+        "id": "report-v2-multiple-pallets",
+        "readyPallet": [
+            {
+                "palletNumber": "046070517921585754",
+                "palletAggregate": True,
+                "readyBox": [
+                    box("046070517921585730", PRODUCTS[:2]),
+                ],
+            },
+            {
+                "palletNumber": "046070517921585761",
+                "palletAggregate": True,
+                "readyBox": [
+                    box("046070517921585747", PRODUCTS[2:]),
+                ],
+            },
+        ],
+    }
+
+    result = build_aggregation_report(report, "7733154124").to_dict()
+
+    assert [
+        unit["unitSerialNumber"]
+        for unit in result["aggregationUnits"]
+    ] == [
+        "00046070517921585730",
+        "00046070517921585747",
+        "00046070517921585754",
+        "00046070517921585761",
+    ]
+    assert result["aggregationUnits"][2]["sntins"] == [
+        "00046070517921585730",
+    ]
+    assert result["aggregationUnits"][3]["sntins"] == [
+        "00046070517921585747",
+    ]
+
+
+def test_v2_common_consumers_can_flatten_boxes_and_full_codes():
+    report = {
+        "schemaVersion": 2,
+        "readyPallet": [
+            {
+                "palletNumber": "046070517921585754",
+                "palletAggregate": True,
+                "readyBox": [
+                    box("046070517921585730", PRODUCTS[:2]),
+                    box("046070517921585747", PRODUCTS[2:]),
+                ],
+            }
+        ],
+    }
+
+    assert len(iter_equipment_report_pallets(report)) == 1
+    assert [
+        raw_box["boxNumber"]
+        for raw_box in iter_equipment_report_boxes(report)
+    ] == [
+        "046070517921585730",
+        "046070517921585747",
+    ]
+    assert extract_full_product_codes(report) == PRODUCTS
+
+
+def test_ready_pallet_requires_explicit_schema_version_2():
+    report = {
+        "readyPallet": [
+            {
+                "palletNumber": "046070517921585754",
+                "readyBox": [],
+            }
+        ]
+    }
+
+    with pytest.raises(AggregationBuildError, match="schemaVersion=2"):
+        iter_equipment_report_boxes(report)
 
 
 def test_v1_preserves_boxes_only_without_allocated_pallet():

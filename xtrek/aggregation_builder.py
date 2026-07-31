@@ -16,6 +16,7 @@ class AggregationBuildError(ValueError):
 class CanonicalBox:
     sscc: str
     product_codes: tuple[str, ...]
+    full_product_codes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,106 @@ class CanonicalPallet:
 class CanonicalEquipmentReport:
     source_schema_version: int
     pallets: tuple[CanonicalPallet, ...]
+
+
+def get_equipment_report_version(report: Mapping[str, Any]) -> int:
+    """Return the declared equipment-report version and reject ambiguity."""
+    if not isinstance(report, Mapping):
+        raise AggregationBuildError("Equipment report must be an object")
+
+    schema_version = report.get("schemaVersion")
+    if schema_version == 2 or "readyPallet" in report:
+        if schema_version != 2:
+            raise AggregationBuildError(
+                "Reports with readyPallet must declare schemaVersion=2"
+            )
+        if "readyPallet" not in report:
+            raise AggregationBuildError(
+                "Reports with schemaVersion=2 must contain readyPallet"
+            )
+        return 2
+
+    if schema_version not in (None, 1):
+        raise AggregationBuildError(
+            f"Unsupported equipment report schemaVersion: {schema_version!r}"
+        )
+    return 1
+
+
+def iter_equipment_report_pallets(
+    report: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    """Return raw v2 pallets; v1 reports have no explicit pallet objects."""
+    if get_equipment_report_version(report) == 1:
+        return ()
+
+    raw_pallets = report.get("readyPallet")
+    if not isinstance(raw_pallets, Sequence) or isinstance(
+        raw_pallets, (str, bytes)
+    ):
+        raise AggregationBuildError("readyPallet must be an array")
+
+    pallets = []
+    for pallet_index, raw_pallet in enumerate(raw_pallets):
+        if not isinstance(raw_pallet, Mapping):
+            raise AggregationBuildError(
+                f"readyPallet[{pallet_index}] must be an object"
+            )
+        pallets.append(raw_pallet)
+    return tuple(pallets)
+
+
+def iter_equipment_report_boxes(
+    report: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    """Return physical boxes from either root readyBox (v1) or pallets (v2)."""
+    if get_equipment_report_version(report) == 1:
+        raw_boxes = report.get("readyBox", [])
+        if not isinstance(raw_boxes, Sequence) or isinstance(
+            raw_boxes, (str, bytes)
+        ):
+            raise AggregationBuildError("readyBox must be an array")
+        locations_and_boxes = [
+            (f"readyBox[{box_index}]", raw_box)
+            for box_index, raw_box in enumerate(raw_boxes)
+        ]
+    else:
+        locations_and_boxes = []
+        for pallet_index, raw_pallet in enumerate(
+            iter_equipment_report_pallets(report)
+        ):
+            raw_boxes = raw_pallet.get("readyBox")
+            if not isinstance(raw_boxes, Sequence) or isinstance(
+                raw_boxes, (str, bytes)
+            ):
+                raise AggregationBuildError(
+                    f"readyPallet[{pallet_index}].readyBox must be an array"
+                )
+            locations_and_boxes.extend(
+                (
+                    f"readyPallet[{pallet_index}].readyBox[{box_index}]",
+                    raw_box,
+                )
+                for box_index, raw_box in enumerate(raw_boxes)
+            )
+
+    boxes = []
+    for location, raw_box in locations_and_boxes:
+        if not isinstance(raw_box, Mapping):
+            raise AggregationBuildError(f"{location} must be an object")
+        boxes.append(raw_box)
+    return tuple(boxes)
+
+
+def extract_full_product_codes(report: Mapping[str, Any]) -> list[str]:
+    """Validate a v1/v2 report and flatten its full marking codes."""
+    canonical = normalize_equipment_report(report)
+    return [
+        code
+        for pallet in canonical.pallets
+        for box in pallet.boxes
+        for code in box.full_product_codes
+    ]
 
 
 def cut_crypto_tail(code: str) -> str:
@@ -71,7 +172,8 @@ def _parse_box(
     if not raw_codes:
         raise AggregationBuildError(f"{location}.productNumbersFull must not be empty")
 
-    product_codes = tuple(cut_crypto_tail(code) for code in raw_codes)
+    full_product_codes = tuple(raw_codes)
+    product_codes = tuple(cut_crypto_tail(code) for code in full_product_codes)
 
     short_codes = raw_box.get("productNumbers")
     if short_codes is not None:
@@ -83,7 +185,11 @@ def _parse_box(
             raise AggregationBuildError(
                 f"{location}.productNumbers does not match productNumbersFull"
             )
-    return CanonicalBox(sscc=sscc, product_codes=product_codes)
+    return CanonicalBox(
+        sscc=sscc,
+        product_codes=product_codes,
+        full_product_codes=full_product_codes,
+    )
 
 
 def normalize_equipment_report(
@@ -101,12 +207,8 @@ def normalize_equipment_report(
     if not isinstance(report, Mapping):
         raise AggregationBuildError("Equipment report must be an object")
 
-    schema_version = report.get("schemaVersion")
-    if schema_version == 2 or "readyPallet" in report:
-        if schema_version != 2:
-            raise AggregationBuildError(
-                "Reports with readyPallet must declare schemaVersion=2"
-            )
+    schema_version = get_equipment_report_version(report)
+    if schema_version == 2:
         raw_pallets = report.get("readyPallet")
         if not isinstance(raw_pallets, Sequence) or isinstance(
             raw_pallets, (str, bytes)
@@ -150,10 +252,6 @@ def normalize_equipment_report(
             pallets=tuple(pallets),
         )
     else:
-        if schema_version not in (None, 1):
-            raise AggregationBuildError(
-                f"Unsupported equipment report schemaVersion: {schema_version!r}"
-            )
         raw_boxes = report.get("readyBox")
         if not isinstance(raw_boxes, Sequence) or isinstance(
             raw_boxes, (str, bytes)
