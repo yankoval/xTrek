@@ -26,6 +26,15 @@ from .crpt_auth import get_new_token
 from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
+from .aggregation_builder import (
+    AggregationBuildError,
+    build_aggregation_report,
+    extract_full_product_codes,
+    get_equipment_report_version,
+    iter_equipment_report_pallets,
+    normalize_sscc,
+)
+from .SSCC_Utils import get_sscc_from_service
 
 # ---------------------------------------------------------------------------
 # Изменения 2026-07-09: поддержка linked GTIN и работы через субаккаунты.
@@ -1365,7 +1374,7 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
         report_data = json.loads(report_content)
 
         # Извлекаем коды
-        codes = extract_and_flatten(report_data)
+        codes = extract_full_product_codes(report_data)
         if not codes:
             logger.warning(f"[*] Отчет {report_filename} не содержит кодов.")
             return None
@@ -1473,7 +1482,7 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
         report_data = json.loads(report_content)
 
         # Извлекаем коды
-        codes = extract_and_flatten(report_data)
+        codes = extract_full_product_codes(report_data)
         if not codes:
             logger.warning(f"[*] Отчет {report_filename} не содержит кодов.")
             return None
@@ -2020,6 +2029,95 @@ def update_emission_order_status(production_order_id: str):
         logger.error(f"[!] Ошибка в update_emission_order_status: {e}")
         return str(e)
 
+def _validate_pallet_assignments(
+    *,
+    report_data,
+    task_data,
+):
+    """Validate assigned pallet SSCCs and return the one used for legacy v1."""
+    report_version = get_equipment_report_version(report_data)
+    task_report_version = task_data.get('reportSchemaVersion')
+    if task_report_version is not None:
+        try:
+            task_report_version = int(task_report_version)
+        except (TypeError, ValueError) as e:
+            raise AggregationBuildError(
+                "task.reportSchemaVersion must be 1 or 2"
+            ) from e
+        if task_report_version not in (1, 2):
+            raise AggregationBuildError(
+                "task.reportSchemaVersion must be 1 or 2"
+            )
+        if task_report_version != report_version:
+            raise AggregationBuildError(
+                f"Equipment report schemaVersion {report_version} does not "
+                f"match task.reportSchemaVersion {task_report_version}"
+            )
+
+    raw_assigned = task_data.get('palletNumbers')
+    if raw_assigned is None:
+        legacy_value = (
+            task_data.get('palletNumber')
+            or task_data.get('palletSSCC')
+            or task_data.get('palletSscc')
+        )
+        raw_assigned = [legacy_value] if legacy_value else []
+
+    if not isinstance(raw_assigned, list):
+        raise AggregationBuildError("task.palletNumbers must be an array")
+
+    assigned = []
+    for pallet_index, value in enumerate(raw_assigned):
+        normalized = normalize_sscc(
+            value,
+            f"task.palletNumbers[{pallet_index}]",
+        )
+        if normalized in assigned:
+            raise AggregationBuildError(
+                f"Duplicate assigned pallet SSCC: {normalized}"
+            )
+        assigned.append(normalized)
+
+    if report_version == 2:
+        if not assigned:
+            raise AggregationBuildError(
+                "task.palletNumbers is required for schemaVersion=2"
+            )
+
+        for pallet_index, pallet in enumerate(
+            iter_equipment_report_pallets(report_data)
+        ):
+            reported = normalize_sscc(
+                pallet.get('palletNumber'),
+                f"readyPallet[{pallet_index}].palletNumber",
+            )
+            if reported not in assigned:
+                raise AggregationBuildError(
+                    f"readyPallet[{pallet_index}].palletNumber was not "
+                    "assigned in task.palletNumbers"
+                )
+        return None
+
+    if len(assigned) > 1:
+        raise AggregationBuildError(
+            "Legacy v1 report can use exactly one assigned pallet SSCC"
+        )
+
+    report_value = report_data.get('palletNumber')
+    if report_value:
+        reported = normalize_sscc(report_value, "palletNumber")
+        if assigned and reported != assigned[0]:
+            raise AggregationBuildError(
+                "Legacy report palletNumber does not match task.palletNumbers[0]"
+            )
+        if not assigned:
+            raise AggregationBuildError(
+                "Legacy report palletNumber was not assigned in the task"
+            )
+
+    return assigned[0][2:] if assigned else None
+
+
 def create_aggregation_report(task_uuid: str, inn_override: str = None):
     """
     Создает отчет об агрегации для ЛК на основе отчета оборудования.
@@ -2062,25 +2160,12 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
             return None
 
         report_data = json.loads(storage_reports.read_text(report_path))
-        if not report_data.get('readyBox'):
-            logger.info(f"[*] Отчет {report_uuid} содержит пустой readyBox. Завершение без ошибки.")
+        if not report_data.get('readyBox') and not report_data.get('readyPallet'):
+            logger.info(
+                f"[*] Отчет {report_uuid} не содержит readyBox/readyPallet. "
+                "Завершение без ошибки."
+            )
             return None
-
-        # Фильтрация полей для отчета
-        sig_report = inspect.signature(EquipmentAggTaskReport.__init__)
-        valid_fields_report = {k for k, v in sig_report.parameters.items() if k != 'self'}
-
-        boxes_raw = report_data.get('readyBox', [])
-        boxes_objs = []
-        sig_box = inspect.signature(EquipmentAggBox.__init__)
-        valid_fields_box = {k for k, v in sig_box.parameters.items() if k != 'self'}
-        for b_dict in boxes_raw:
-            filtered_box_data = {k: v for k, v in b_dict.items() if k in valid_fields_box}
-            boxes_objs.append(EquipmentAggBox(**filtered_box_data))
-
-        filtered_report_data = {k: v for k, v in report_data.items() if k in valid_fields_report}
-        filtered_report_data['readyBox'] = boxes_objs
-        report_obj = EquipmentAggTaskReport(**filtered_report_data)
 
         # 3. Определяем ИНН по GTIN задания или используем переопределение
         inn = inn_override
@@ -2094,35 +2179,22 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
 
         logger.info(f"[*] Используется ИНН участника: {inn}")
 
-        # 4. Формируем целевой отчет AggregationReport
-        aggregation_units = []
-        for box in report_obj.readyBox:
-            box_number = str(box.boxNumber)
-            # Нормализация SSCC: должен быть 20 цифр, начинаться на 00
-            if len(box_number) == 18:
-                box_number = "00" + box_number
-            elif len(box_number) == 20 and not box_number.startswith("00"):
-                logger.warning(f"[*] Странный формат boxNumber (20 знаков, не 00...): {box_number}")
-
-            # Очистка кодов от криптохвоста (до первого \u001d)
-            clean_sntins = []
-            for code in box.productNumbersFull:
-                clean_code = code.split('\u001d')[0]
-                clean_sntins.append(clean_code)
-
-            unit = AggregationUnit(
-                unitSerialNumber=box_number,
-                aggregationType="AGGREGATION",
-                sntins=clean_sntins,
-                unitSerialNumberList=None
+        # 4. Формируем универсальный отчет v1/v2. SSCC паллетов выделяются
+        # при создании задания оборудования. Здесь они только сверяются с
+        # отчетом и используются для формирования документа агрегации.
+        try:
+            legacy_pallet_sscc = _validate_pallet_assignments(
+                report_data=report_data,
+                task_data=task_data,
             )
-            aggregation_units.append(unit)
-
-        final_report = AggregationReport(
-            participantId=inn,
-            aggregationUnits=aggregation_units,
-            productionOrderId=task_uuid
-        )
+            final_report = build_aggregation_report(
+                report_data,
+                participant_id=inn,
+                legacy_pallet_sscc=legacy_pallet_sscc,
+            )
+        except AggregationBuildError as e:
+            logger.error(f"[!] Некорректный отчет оборудования {report_uuid}: {e}")
+            return None
 
         # 5. Сохраняем итоговый отчет
         storage_agg = get_storage(agg_tasks_path, s3_config)
@@ -2806,7 +2878,9 @@ def update_aggregation_status(task_uuid: str, group: str):
 
         report_data = json.loads(storage_agg.read_text(report_path))
         inn = report_data.get('participantId')
-        production_order_id = report_data.get('productionOrderId')
+        production_order_id = (
+            report_data.get('productionOrderId') or production_order_id
+        )
 
         if not inn:
             logger.error(f"[!] Не найден participantId в отчете {task_uuid}")
@@ -3534,6 +3608,106 @@ def create_equipment_set_report_from_report(production_order_id: str):
             try: tf.unlink()
             except: pass
 
+def _create_pallet_assignment(prod_data, config):
+    """Build the task pallet assignment and allocate all SSCCs once."""
+    raw_boxes_per_pallet = prod_data.get('numBoxesInPallet')
+    has_pallet_norm = raw_boxes_per_pallet not in (None, '')
+
+    if has_pallet_norm:
+        try:
+            boxes_per_pallet = int(raw_boxes_per_pallet)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "numBoxesInPallet must be a positive integer"
+            ) from e
+        if boxes_per_pallet <= 0:
+            raise ValueError("numBoxesInPallet must be a positive integer")
+
+        try:
+            boxes_quantity = int(prod_data.get('Quantity'))
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "Quantity must be a positive integer when "
+                "numBoxesInPallet is specified"
+            ) from e
+        if boxes_quantity <= 0:
+            raise ValueError(
+                "Quantity must be a positive integer when "
+                "numBoxesInPallet is specified"
+            )
+
+        try:
+            reserve = int(config.get('pallet_sscc_reserve', 1))
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "pallet_sscc_reserve must be a non-negative integer"
+            ) from e
+        if reserve < 0:
+            raise ValueError(
+                "pallet_sscc_reserve must be a non-negative integer"
+            )
+
+        planned_pallet_count = (
+            boxes_quantity + boxes_per_pallet - 1
+        ) // boxes_per_pallet
+        sscc_count = planned_pallet_count + reserve
+        report_schema_version = 2
+    else:
+        boxes_per_pallet = None
+        planned_pallet_count = 1
+        reserve = 0
+        sscc_count = 1
+        report_schema_version = 1
+
+    sscc_service_url = (
+        config.get('sscc_service_url')
+        or config.get('sscc_url')
+    )
+    sscc_prefix = config.get('sscc_prefix')
+    sscc_extension = config.get('sscc_extension')
+    if not sscc_service_url or not sscc_prefix:
+        raise ValueError(
+            "Pallet SSCC allocation requires sscc_service_url "
+            "and sscc_prefix"
+        )
+
+    raw_codes = get_sscc_from_service(
+        sscc_service_url,
+        sscc_prefix,
+        sscc_count,
+        sscc_extension,
+    )
+    if not isinstance(raw_codes, list) or len(raw_codes) != sscc_count:
+        actual_count = len(raw_codes) if isinstance(raw_codes, list) else 0
+        raise ValueError(
+            f"SSCC service returned {actual_count} pallet codes "
+            f"instead of {sscc_count}"
+        )
+
+    pallet_numbers = []
+    for code_index, raw_code in enumerate(raw_codes):
+        pallet_number = normalize_sscc(
+            raw_code,
+            f"allocated pallet SSCC[{code_index}]",
+        )[2:]
+        if pallet_number in pallet_numbers:
+            raise ValueError(
+                f"SSCC service returned duplicate pallet code: "
+                f"{pallet_number}"
+            )
+        pallet_numbers.append(pallet_number)
+
+    assignment = {
+        "reportSchemaVersion": report_schema_version,
+        "plannedPalletCount": planned_pallet_count,
+        "palletSsccReserve": reserve,
+        "palletNumbers": pallet_numbers,
+    }
+    if boxes_per_pallet is not None:
+        assignment["numBoxesInPallet"] = boxes_per_pallet
+    return assignment
+
+
 def create_equipment_aggregation_task(production_order_id: str):
     """
     Создает задание для оборудования на агрегацию по заданию на производство.
@@ -3566,6 +3740,7 @@ def create_equipment_aggregation_task(production_order_id: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         pasport = prod_data.get('PasportData', {})
+        pallet_assignment = _create_pallet_assignment(prod_data, config)
 
         # Поле id теперь совпадает с production_order_id (без расширения .json)
         task_uuid = production_order_id
@@ -3657,11 +3832,14 @@ def create_equipment_aggregation_task(production_order_id: str):
             "productNumbers": [],
             "task-export-signed-link": presigned_url,
             "urlLabelBoxTemplate": "1",
-            "urlLabelProductTemplate": "1"
+            "urlLabelProductTemplate": "1",
+            **pallet_assignment,
         }
 
         # Сохранение в S3 (equipment-tasks)
-        temp_local = Path(f"temp_eq_task_{task_uuid}.json")
+        temp_local = Path(
+            f"temp_eq_task_{task_uuid}_{uuid.uuid4().hex}.json"
+        )
         with open(temp_local, 'w', encoding='utf-8') as f:
             json.dump(task_data, f, indent=3, ensure_ascii=False)
 

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 2,
+  "id": "T-EXAMPLE-SET-20260729-0001",
+  "startTime": "2026-07-29T09:00:00Z",
+  "endTime": "2026-07-29T09:25:00Z",
+  "operator": "operator-2",
+  "operators": [
+    "operator-2"
+  ],
+  "model": "equipment-model",
+  "build": "2.0.0",
+  "readyPallet": [
+    {
+      "Number": 0,
+      "palletNumber": "000000000000000048",
+      "palletAggregate": true,
+      "palletTime": "2026-07-29T09:25:00Z",
+      "readyBox": [
+        {
+          "Number": 0,
+          "boxNumber": "000000000000000055",
+          "boxAgregate": true,
+          "boxTime": "2026-07-29T09:15:00Z",
+          "productNumbers": [
+            "010460000000000220SET00001",
+            "010460000000000220SET00002"
+          ],
+          "productNumbersFull": [
+            "010460000000000220SET00001\u001d93QRST",
+            "010460000000000220SET00002\u001d93UVWX"
+          ]
+        }
+      ]
+    }
+  ],
+  "sampleNumbers": [],
+  "sampleNumbersFull": null,
+  "defectiveCodes": null,
+  "defectiveCodesFull": null,
+  "emptyNumbers": null
+}

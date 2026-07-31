@@ -164,6 +164,11 @@ class EquipmentAggTaskReport(SUZBase):
 class EquipmentAggTask(SUZBase):
     id: str
     gtin: str
+    reportSchemaVersion: Optional[int] = None
+    numBoxesInPallet: Optional[int] = None
+    plannedPalletCount: Optional[int] = None
+    palletSsccReserve: Optional[int] = None
+    palletNumbers: List[str] = field(default_factory=list)
     date: Optional[str] = None
     lineNum: Optional[str] = None
     isGroup: Optional[bool] = None

@@ -81,6 +81,59 @@ def test_sscc_normalization(analyzer, tmp_path):
     assert "alreadyregistered" in errors
     assert any(f"00{sscc_18}" in e for e in errors["alreadyregistered"])
 
+
+def test_v2_checks_pallet_and_nested_box_aggregates(analyzer, tmp_path):
+    file1 = tmp_path / "file-v2.json"
+    pallet_sscc = "123456789012345678"
+    box_sscc = "223456789012345678"
+    data = {
+        "schemaVersion": 2,
+        "readyPallet": [
+            {
+                "palletNumber": pallet_sscc,
+                "palletAggregate": True,
+                "readyBox": [
+                    {
+                        "boxNumber": box_sscc,
+                        "boxAgregate": True,
+                        "productNumbersFull": ["CHILD\u001d93tail"],
+                    }
+                ],
+            }
+        ],
+    }
+    file1.write_text(json.dumps(data))
+
+    normalized_pallet = "00" + pallet_sscc
+    normalized_box = "00" + box_sscc
+
+    def mock_check(codes):
+        assert set(codes) == {
+            normalized_pallet,
+            normalized_box,
+            "CHILD",
+        }
+        return [
+            {
+                "cisInfo": {
+                    "cis": normalized_pallet,
+                    "status": "EMITTED",
+                }
+            }
+        ]
+
+    analyzer.check_statuses = MagicMock(side_effect=mock_check)
+    analyzer.min_sscc = 0
+
+    errors = analyzer.check_report(str(file1))
+
+    assert "alreadyregistered" in errors
+    assert any(
+        normalized_pallet in error
+        for error in errors["alreadyregistered"]
+    )
+
+
 @patch('xtrek.utils.get_inn_by_gtin')
 @patch('xtrek.utils.TokenProcessor')
 @patch('xtrek.utils.get_storage')
