@@ -24,6 +24,13 @@ class TestGS1Processor(unittest.TestCase):
         """Тест извлечения ИНН из имени"""
         self.assertEqual(gs1_processor.extract_inn_from_filename("owned_gtins_7733154124.xlsx"), "7733154124")
 
+    def test_production_prefix_4680328(self):
+        """Production GTIN prefix 4680328 resolves to its owner INN."""
+        self.assertEqual(
+            gs1_processor.get_inn_by_gtin("04680328040887"),
+            "7733154124",
+        )
+
     @patch("xtrek.gs1_processor.os.path.exists", return_value=True)
     def test_get_inn_by_gtin(self, mock_exists):
         """Тест функции поиска ИНН в базе"""
