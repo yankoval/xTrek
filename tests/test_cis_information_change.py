@@ -25,7 +25,11 @@ def _config(tmp_path):
 
 
 def _code(serial):
-    return f"010460000000000021{serial}FULLCRYPTO"
+    return f"{_short_code(serial)}\u001d93FULLCRYPTO"
+
+
+def _short_code(serial):
+    return f"010460000000000021{serial}"
 
 
 def test_create_from_local_txt_builds_production_date_only(tmp_path, monkeypatch):
@@ -46,7 +50,7 @@ def test_create_from_local_txt_builds_production_date_only(tmp_path, monkeypatch
     assert task == {
         "participantInn": "7701234567",
         "codes": [{
-            "code": [_code("AAA"), _code("BBB")],
+            "code": [_short_code("AAA"), _short_code("BBB")],
             "productionDate": "2026-08-01",
         }],
     }
@@ -81,7 +85,7 @@ def test_create_from_equipment_report_uses_storage_source(tmp_path, monkeypatch)
     assert result == "REPORT-1-expiration-date"
     task = json.loads((tmp_path / "tasks" / f"{result}.json").read_text())
     assert task["codes"][0]["expirationDate"] == "2099-12-31"
-    assert task["codes"][0]["code"] == [_code("AAA"), _code("BBB")]
+    assert task["codes"][0]["code"] == [_short_code("AAA"), _short_code("BBB")]
 
 
 def test_create_from_equipment_report_supports_pallet_v2(tmp_path, monkeypatch):
@@ -98,7 +102,7 @@ def test_create_from_equipment_report_supports_pallet_v2(tmp_path, monkeypatch):
                 "boxNumber": "000000000000000024",
                 "boxAgregate": True,
                 "productNumbersFull": [_code("AAA"), _code("BBB")],
-                "productNumbers": [_code("AAA"), _code("BBB")],
+                "productNumbers": [_short_code("AAA"), _short_code("BBB")],
             }],
         }],
     }))
@@ -112,7 +116,7 @@ def test_create_from_equipment_report_supports_pallet_v2(tmp_path, monkeypatch):
 
     assert result == "REPORT-V2-production-date"
     task = json.loads((tmp_path / "tasks" / f"{result}.json").read_text())
-    assert task["codes"][0]["code"] == [_code("AAA"), _code("BBB")]
+    assert task["codes"][0]["code"] == [_short_code("AAA"), _short_code("BBB")]
 
 
 def test_universal_source_reads_s3_uri_through_storage(monkeypatch):
@@ -126,7 +130,7 @@ def test_universal_source_reads_s3_uri_through_storage(monkeypatch):
 
     codes = workflow._read_cis_information_change_codes_source(source)
 
-    assert codes == [_code("AAA")]
+    assert codes == [_short_code("AAA")]
     get_storage.assert_called_once_with(source, {})
 
 
@@ -154,7 +158,7 @@ def test_create_from_emission_resolves_receipt_codes_and_manufacturer(tmp_path, 
     assert result == "PROD-1-production-date"
     task = json.loads((tmp_path / "tasks" / f"{result}.json").read_text())
     assert task["participantInn"] == "7701234567"
-    assert task["codes"][0]["code"] == [_code("AAA")]
+    assert task["codes"][0]["code"] == [_short_code("AAA")]
 
 
 def test_payload_rejects_mixed_date_documents():
@@ -162,8 +166,8 @@ def test_payload_rejects_mixed_date_documents():
         workflow._validate_cis_information_change_payload({
             "participantInn": "7701234567",
             "codes": [
-                {"code": [_code("AAA")], "productionDate": "2026-08-01"},
-                {"code": [_code("BBB")], "expirationDate": "2027-08-01"},
+                {"code": [_short_code("AAA")], "productionDate": "2026-08-01"},
+                {"code": [_short_code("BBB")], "expirationDate": "2027-08-01"},
             ],
         })
 
@@ -173,7 +177,7 @@ def test_payload_rejects_both_dates_for_same_codes():
         workflow._validate_cis_information_change_payload({
             "participantInn": "7701234567",
             "codes": [{
-                "code": [_code("AAA")],
+                "code": [_short_code("AAA")],
                 "productionDate": "2026-08-01",
                 "expirationDate": "2027-08-01",
             }],
@@ -260,3 +264,34 @@ def test_update_status_uses_receipt_group_and_persists_result(tmp_path, monkeypa
     assert json.loads(status_path.read_text()) == {"status": "CHECKED_OK"}
     tags_path = tmp_path / "statuses" / "TASK-STATUS.json.tags"
     assert json.loads(tags_path.read_text()) == {"status": "CHECKED_OK"}
+
+
+def test_create_normalizes_full_marking_codes_to_identification_codes(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    monkeypatch.setattr(workflow, "load_config", lambda name: config)
+
+    task_id = workflow.create_cis_information_change_task(
+        "TASK-NORMALIZED",
+        "7701234567",
+        [_code("AAA")],
+        "productionDate",
+        "2026-08-01",
+    )
+
+    task = json.loads((tmp_path / "tasks" / f"{task_id}.json").read_text())
+    assert task["codes"][0]["code"] == [_short_code("AAA")]
+
+
+def test_create_rejects_duplicates_after_crypto_tail_normalization(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    monkeypatch.setattr(workflow, "load_config", lambda name: config)
+    short_code = _short_code("AAA")
+
+    with pytest.raises(ValueError, match="должны быть уникальны"):
+        workflow.create_cis_information_change_task(
+            "TASK-DUPLICATE",
+            "7701234567",
+            [f"{short_code}\u001d93FIRST", f"{short_code}\u001d93SECOND"],
+            "expirationDate",
+            "2029-06-01",
+        )
