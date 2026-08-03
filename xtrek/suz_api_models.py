@@ -133,6 +133,19 @@ class DocumentWrapper(SUZBase):
     type: str
     signature: str
 
+@dataclass
+class CisInformationChangeCodeGroup(SUZBase):
+    """Группа кодов с одним видом и значением корректировки."""
+    code: List[str] = field(default_factory=list)
+    productionDate: Optional[str] = None
+    expirationDate: Optional[str] = None
+
+@dataclass
+class CisInformationChangeMessage(SUZBase):
+    """Документ True API CIS_INFORMATION_CHANGE."""
+    participantInn: str
+    codes: List[CisInformationChangeCodeGroup] = field(default_factory=list)
+
 # --- Новые модели для работы со статусами и производственными заказами ---
 
 @dataclass
