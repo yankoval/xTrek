@@ -32,6 +32,7 @@ from .config_loader import load_config
 from .aggregation_builder import (
     AggregationBuildError,
     build_aggregation_report,
+    cut_crypto_tail,
     extract_full_product_codes,
     get_equipment_report_version,
     iter_equipment_report_pallets,
@@ -4331,7 +4332,7 @@ def _validate_cis_information_change_codes(codes):
     for index, code in enumerate(codes, start=1):
         if not isinstance(code, str) or not code.strip():
             raise ValueError(f"Пустой или некорректный код в позиции {index}")
-        clean_code = code.strip()
+        clean_code = cut_crypto_tail(code.strip())
         if any(char in clean_code for char in ("\r", "\n", "\t", " ")):
             raise ValueError(f"Код в позиции {index} содержит пробельные символы")
         if clean_code in seen:
@@ -4396,7 +4397,12 @@ def _validate_cis_information_change_payload(payload):
             raise ValueError(f"В codes[{index}].code отсутствуют коды")
         all_codes.extend(group_codes)
 
-    _validate_cis_information_change_codes(all_codes)
+    normalized_codes = _validate_cis_information_change_codes(all_codes)
+    if normalized_codes != all_codes:
+        raise ValueError(
+            "В теле CIS_INFORMATION_CHANGE должны быть КИ без "
+            "криптохвоста; создавайте задачу через библиотечную команду"
+        )
     return document_field
 
 
@@ -4481,7 +4487,14 @@ def _read_cis_information_change_codes_source(source_path: str):
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        codes = [line.strip() for line in content.splitlines() if line.strip()]
+        # str.splitlines() treats the GS character (ASCII 29) inside a full
+        # marking code as a line boundary. TXT sources are newline-delimited,
+        # so split only on LF and let code normalization remove the GS tail.
+        codes = [
+            line.rstrip("\r")
+            for line in content.split("\n")
+            if line.rstrip("\r")
+        ]
         return _validate_cis_information_change_codes(codes)
 
     if isinstance(data, list):
