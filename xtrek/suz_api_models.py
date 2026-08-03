@@ -127,6 +127,21 @@ class AggregationReport(SUZBase):
     productionOrderId: Optional[str] = None
 
 @dataclass
+class HierarchicalAggregationUnit(SUZBase):
+    unitSerialNumber: str
+    aggregationType: str
+    sntins: Optional[List[str]] = None
+    childer_sequences: Optional[List['HierarchicalAggregationUnit']] = None
+
+@dataclass
+class HierarchicalAggregationReport(SUZBase):
+    participantId: str
+    unit_sequences: List[HierarchicalAggregationUnit]
+    productGroup: Optional[str] = None
+    document_type: str = "AGGREGATION"
+    productionOrderId: Optional[str] = None
+
+@dataclass
 class DocumentWrapper(SUZBase):
     document_format: str
     product_document: str
