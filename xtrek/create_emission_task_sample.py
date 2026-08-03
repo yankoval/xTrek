@@ -6,6 +6,7 @@ import argparse
 import uuid
 import logging
 import inspect
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,7 +16,8 @@ from .suz_api_models import (
     EmissionOrderStatus, ProductionOrder, PasportData,
     UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
-    EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
+    EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument,
+    CisInformationChangeCodeGroup, CisInformationChangeMessage
 )
 from .kiz_from_rep import extract_and_flatten
 from .suz import SUZ
@@ -4248,6 +4250,603 @@ def update_introduce_status(order_id: str, group: str):
         return str(e)
 
 
+# --- Корректировка даты производства / срока годности (True API) ---
+
+CIS_INFORMATION_CHANGE_MAX_CODES = 35000
+CIS_INFORMATION_CHANGE_FIELDS = {
+    "production": "productionDate",
+    "production-date": "productionDate",
+    "production_date": "productionDate",
+    "productionDate": "productionDate",
+    "expiration": "expirationDate",
+    "expiration-date": "expirationDate",
+    "expiration_date": "expirationDate",
+    "expirationDate": "expirationDate",
+}
+
+
+def _cis_information_change_paths(config):
+    """Возвращает пути операции, поддерживая kebab_case и snake_case."""
+    return (
+        config.get("cis-information-change-tasks")
+        or config.get("cis_information_change_tasks"),
+        config.get("cis-information-change-receipts")
+        or config.get("cis_information_change_receipts"),
+        config.get("cis-information-changes")
+        or config.get("cis_information_changes"),
+    )
+
+
+def _normalise_cis_information_change_type(correction_type: str) -> str:
+    field_name = CIS_INFORMATION_CHANGE_FIELDS.get(correction_type)
+    if not field_name:
+        allowed = "productionDate или expirationDate"
+        raise ValueError(f"Неизвестный вид корректировки: {correction_type!r}; ожидается {allowed}")
+    return field_name
+
+
+def _normalise_cis_information_change_date(value: str, field_name: str) -> str:
+    if not value or not isinstance(value, str):
+        raise ValueError("Дата корректировки обязательна")
+
+    raw_value = value.strip()
+    parsed = None
+    for date_format in ("%Y-%m-%d", "%d.%m.%Y", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%d.%m.%Y %H:%M"):
+        try:
+            parsed = datetime.strptime(raw_value, date_format).date()
+            break
+        except ValueError:
+            continue
+
+    if parsed is None:
+        raise ValueError(
+            f"Некорректная дата {value!r}. Используйте yyyy-MM-dd или dd.MM.yyyy"
+        )
+
+    today = date.today()
+    if field_name == "productionDate":
+        try:
+            earliest = today.replace(year=today.year - 20)
+        except ValueError:  # 29 февраля
+            earliest = today.replace(year=today.year - 20, day=28)
+        latest = today + timedelta(days=1)
+    else:
+        earliest = date(1999, 1, 1)
+        latest = date(2099, 12, 31)
+
+    if not earliest <= parsed <= latest:
+        raise ValueError(
+            f"Дата {parsed.isoformat()} вне допустимого диапазона "
+            f"{earliest.isoformat()}..{latest.isoformat()} для {field_name}"
+        )
+    return parsed.isoformat()
+
+
+def _validate_cis_information_change_codes(codes):
+    if isinstance(codes, (str, bytes)) or not isinstance(codes, (list, tuple)):
+        raise ValueError("codes должен быть списком полных кодов маркировки")
+
+    clean_codes = []
+    seen = set()
+    for index, code in enumerate(codes, start=1):
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError(f"Пустой или некорректный код в позиции {index}")
+        clean_code = code.strip()
+        if any(char in clean_code for char in ("\r", "\n", "\t", " ")):
+            raise ValueError(f"Код в позиции {index} содержит пробельные символы")
+        if clean_code in seen:
+            raise ValueError(f"Коды в документе должны быть уникальны: {clean_code}")
+        seen.add(clean_code)
+        clean_codes.append(clean_code)
+
+    if not clean_codes:
+        raise ValueError("Не указан ни один код маркировки")
+    if len(clean_codes) > CIS_INFORMATION_CHANGE_MAX_CODES:
+        raise ValueError(
+            f"Количество кодов {len(clean_codes)} превышает лимит "
+            f"{CIS_INFORMATION_CHANGE_MAX_CODES}"
+        )
+    return clean_codes
+
+
+def _validate_cis_information_change_payload(payload):
+    """Не допускает смешивание двух видов дат в одном документе."""
+    if not isinstance(payload, dict):
+        raise ValueError("Тело CIS_INFORMATION_CHANGE должно быть JSON-объектом")
+
+    participant_inn = str(payload.get("participantInn") or "")
+    if not participant_inn.isdigit() or len(participant_inn) not in (10, 12):
+        raise ValueError("participantInn должен содержать 10 или 12 цифр")
+
+    groups = payload.get("codes")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("В документе отсутствует массив codes")
+
+    document_field = None
+    all_codes = []
+    for index, group in enumerate(groups, start=1):
+        if not isinstance(group, dict):
+            raise ValueError(f"Элемент codes[{index}] должен быть объектом")
+        present_fields = [
+            field for field in ("productionDate", "expirationDate")
+            if group.get(field) is not None
+        ]
+        if len(present_fields) != 1:
+            raise ValueError(
+                "Каждая группа кодов должна изменять ровно один вид даты: "
+                "productionDate или expirationDate"
+            )
+        field_name = present_fields[0]
+        if document_field and document_field != field_name:
+            raise ValueError(
+                "Один документ не может одновременно изменять дату производства "
+                "и дату окончания срока годности"
+            )
+        document_field = field_name
+
+        unexpected = set(group) - {"code", field_name}
+        if unexpected:
+            raise ValueError(
+                f"В codes[{index}] есть поля другого вида корректировки: "
+                f"{', '.join(sorted(unexpected))}"
+            )
+        _normalise_cis_information_change_date(group[field_name], field_name)
+        group_codes = group.get("code")
+        if not isinstance(group_codes, list) or not group_codes:
+            raise ValueError(f"В codes[{index}].code отсутствуют коды")
+        all_codes.extend(group_codes)
+
+    _validate_cis_information_change_codes(all_codes)
+    return document_field
+
+
+def _validate_cis_information_change_task_id(task_id: str) -> str:
+    task_id = str(task_id or "").strip()
+    if not task_id or task_id in {".", ".."} or "/" in task_id or "\\" in task_id:
+        raise ValueError("ID задачи не должен быть пустым или содержать разделители пути")
+    return task_id
+
+
+def _default_cis_information_change_task_id(source_id: str, correction_type: str) -> str:
+    source_stem = Path(str(source_id)).stem
+    suffix = "production-date" if correction_type == "productionDate" else "expiration-date"
+    return _validate_cis_information_change_task_id(f"{source_stem}-{suffix}")
+
+
+def create_cis_information_change_task(
+    task_id: str,
+    participant_inn: str,
+    codes,
+    correction_type: str,
+    correction_date: str,
+):
+    """Создаёт отдельный документ на изменение одного вида даты у списка кодов."""
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    tasks_path, _, _ = _cis_information_change_paths(config)
+    if not tasks_path:
+        raise RuntimeError(
+            "[!] В конфигурации отсутствует cis-information-change-tasks"
+        )
+
+    task_id = _validate_cis_information_change_task_id(task_id)
+    participant_inn = str(participant_inn or "").strip()
+    field_name = _normalise_cis_information_change_type(correction_type)
+    correction_date = _normalise_cis_information_change_date(correction_date, field_name)
+    clean_codes = _validate_cis_information_change_codes(codes)
+
+    group_args = {"code": clean_codes, field_name: correction_date}
+    message = CisInformationChangeMessage(
+        participantInn=participant_inn,
+        codes=[CisInformationChangeCodeGroup(**group_args)],
+    )
+    payload = message.to_dict()
+    _validate_cis_information_change_payload(payload)
+    body_json = message.to_json()
+
+    storage = get_storage(tasks_path, s3_config)
+    task_path = f"{tasks_path.rstrip('/')}/{task_id}.json"
+    if storage.exists(task_path):
+        existing = json.loads(storage.read_text(task_path))
+        if existing == payload:
+            logger.info("[IDEMPOTENCY] Задача корректировки %s уже существует", task_id)
+            return task_id
+        raise RuntimeError(
+            f"[!] Задача {task_id} уже существует с другим содержимым"
+        )
+
+    storage.write_text(task_path, body_json)
+    logger.info(
+        "[+] Создана задача %s: %s=%s, кодов=%s",
+        task_id,
+        field_name,
+        correction_date,
+        len(clean_codes),
+    )
+    return task_id
+
+
+def _read_cis_information_change_codes_source(source_path: str):
+    """Читает коды из S3/локального JSON или TXT через абстракцию storage."""
+    if not source_path:
+        raise ValueError("Путь к источнику кодов обязателен")
+
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    storage = get_storage(source_path, s3_config)
+    if not storage.exists(source_path):
+        raise FileNotFoundError(f"Источник кодов не найден: {source_path}")
+    content = storage.read_text(source_path)
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        codes = [line.strip() for line in content.splitlines() if line.strip()]
+        return _validate_cis_information_change_codes(codes)
+
+    if isinstance(data, list):
+        codes = data
+    elif isinstance(data, dict) and isinstance(data.get("codes"), list):
+        codes = data["codes"]
+    elif isinstance(data, dict) and isinstance(data.get("sntins"), list):
+        codes = data["sntins"]
+    elif isinstance(data, dict) and (
+        isinstance(data.get("readyBox"), list)
+        or isinstance(data.get("readyPallet"), list)
+    ):
+        codes = extract_full_product_codes(data)
+    else:
+        raise ValueError(
+            "Неподдерживаемый источник кодов. Ожидается JSON-массив, "
+            "объект с codes/sntins, отчёт оборудования readyBox или TXT"
+        )
+    return _validate_cis_information_change_codes(codes)
+
+
+def create_cis_information_change_from_source(
+    source_path: str,
+    participant_inn: str,
+    correction_type: str,
+    correction_date: str,
+    task_id: str = None,
+):
+    """Базовая команда: создаёт задачу по универсальному S3/локальному пути."""
+    field_name = _normalise_cis_information_change_type(correction_type)
+    task_id = task_id or _default_cis_information_change_task_id(
+        source_path,
+        field_name,
+    )
+    codes = _read_cis_information_change_codes_source(source_path)
+    return create_cis_information_change_task(
+        task_id,
+        participant_inn,
+        codes,
+        field_name,
+        correction_date,
+    )
+
+
+def _read_codes_from_equipment_report(report_id: str):
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    reports_path = config.get("equipment-reports")
+    if not reports_path:
+        raise RuntimeError("[!] В конфигурации отсутствует equipment-reports")
+
+    report_name = str(report_id)
+    if not report_name.lower().endswith(".json"):
+        report_name += ".json"
+    report_path = f"{reports_path.rstrip('/')}/{report_name}"
+    return _read_cis_information_change_codes_source(report_path)
+
+
+def create_cis_information_change_from_equipment_report(
+    report_id: str,
+    participant_inn: str,
+    correction_type: str,
+    correction_date: str,
+    task_id: str = None,
+):
+    """Создаёт задачу корректировки по полным кодам из отчёта оборудования."""
+    field_name = _normalise_cis_information_change_type(correction_type)
+    task_id = task_id or _default_cis_information_change_task_id(report_id, field_name)
+    codes = _read_codes_from_equipment_report(report_id)
+    return create_cis_information_change_task(
+        task_id,
+        participant_inn,
+        codes,
+        field_name,
+        correction_date,
+    )
+
+
+def _read_emission_codes_for_production_order(production_order_id: str):
+    order_id = _get_order_id_from_receipt(production_order_id)
+    if not order_id:
+        raise RuntimeError(
+            f"[!] Не найден orderId эмиссии для задания {production_order_id}"
+        )
+
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    kodes_path = config.get("kodes")
+    if not kodes_path:
+        raise RuntimeError("[!] В конфигурации отсутствует kodes")
+
+    storage = get_storage(kodes_path, s3_config)
+    codes_path = f"{kodes_path.rstrip('/')}/{order_id}.json"
+    codes_data = None
+    if storage.exists(codes_path):
+        codes_data = json.loads(storage.read_text(codes_path))
+    else:
+        codes_data = get_emission_kodes(order_id)
+
+    codes = codes_data.get("codes") if isinstance(codes_data, dict) else None
+    if not codes:
+        raise RuntimeError(
+            f"[!] Полные коды эмиссии для заказа {order_id} не найдены или уже исчерпаны"
+        )
+    return _validate_cis_information_change_codes(codes)
+
+
+def _get_participant_inn_from_production_order(production_order_id: str):
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    production_orders_path = config.get("production_orders_path")
+    if not production_orders_path:
+        return None
+
+    filename = str(production_order_id)
+    if not filename.lower().endswith(".json"):
+        filename += ".json"
+    order_path = f"{production_orders_path.rstrip('/')}/{filename}"
+    storage = get_storage(production_orders_path, s3_config)
+    if not storage.exists(order_path):
+        return None
+    order_data = json.loads(storage.read_text(order_path))
+    return (
+        order_data.get("Manufacturer_inn")
+        or order_data.get("PasportData", {}).get("Manufacturer_inn")
+    )
+
+
+def create_cis_information_change_from_emission(
+    production_order_id: str,
+    correction_type: str,
+    correction_date: str,
+    participant_inn: str = None,
+    task_id: str = None,
+):
+    """Создаёт задачу корректировки по кодам эмиссии производственного задания."""
+    field_name = _normalise_cis_information_change_type(correction_type)
+    task_id = task_id or _default_cis_information_change_task_id(
+        production_order_id,
+        field_name,
+    )
+    participant_inn = participant_inn or _get_participant_inn_from_production_order(
+        production_order_id
+    )
+    if not participant_inn:
+        raise RuntimeError(
+            "[!] Не удалось определить Manufacturer_inn; передайте participant_inn явно"
+        )
+    codes = _read_emission_codes_for_production_order(production_order_id)
+    return create_cis_information_change_task(
+        task_id,
+        participant_inn,
+        codes,
+        field_name,
+        correction_date,
+    )
+
+
+def sign_and_send_cis_information_change(
+    task_id: str,
+    group: str,
+    signing_dir: str,
+    timeout: int,
+    refresh_token: bool = False,
+):
+    """Подписывает и отправляет CIS_INFORMATION_CHANGE через True API."""
+    submission_storage = None
+    submission_lock_path = None
+    submission_ambiguous = False
+    accepted_not_persisted = False
+    try:
+        config = load_config("suz_worker_config")
+        s3_config = config.get("s3_config")
+        tasks_path, receipts_path, _ = _cis_information_change_paths(config)
+        signing_dir = config.get("sign") or signing_dir
+        timeout = config.get("SIGNING_TIMEOUT", timeout)
+        if not tasks_path or not receipts_path:
+            raise RuntimeError(
+                "[!] В конфигурации отсутствуют cis-information-change-tasks "
+                "или cis-information-change-receipts"
+            )
+
+        task_id = _validate_cis_information_change_task_id(task_id)
+        (
+            existing_receipt,
+            submission_storage,
+            receipt_path,
+            submission_lock_path,
+        ) = _claim_document_submission(
+            receipts_path,
+            s3_config,
+            "cis-information-change",
+            task_id,
+        )
+        if existing_receipt is not None:
+            return existing_receipt
+
+        task_storage = get_storage(tasks_path, s3_config)
+        task_path = f"{tasks_path.rstrip('/')}/{task_id}.json"
+        if not task_storage.exists(task_path):
+            raise RuntimeError(f"[!] Задача корректировки не найдена: {task_path}")
+        task_content = task_storage.read_text(task_path)
+        task_data = json.loads(task_content)
+        _validate_cis_information_change_payload(task_data)
+        participant_inn = str(task_data["participantInn"])
+
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        token = None
+        if not refresh_token:
+            token = token_processor.get_token_value_by_inn(
+                participant_inn,
+                token_type="JWT",
+            )
+        if not token:
+            token = get_new_token(inn=participant_inn, mode="jwt", timeout=timeout)
+            if token:
+                token_processor.save_token(token)
+        if not token:
+            raise RuntimeError(
+                f"[!] Не удалось получить JWT токен для ИНН {participant_inn}"
+            )
+
+        signing_storage = get_storage(signing_dir, s3_config)
+        unique_id = uuid.uuid4()
+        body_filename = f"{participant_inn}_{unique_id}_cis_information_change.json"
+        signature_filename = f"{body_filename}.sig"
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
+
+        try:
+            signing_storage.write_text(remote_body_path, task_content)
+            body_bytes = task_content.encode("utf-8")
+            with open(local_body_path, "wb") as body_file:
+                body_file.write(body_bytes)
+
+            logger.info("[*] Ожидание подписи для %s...", remote_body_path)
+            started_at = time.time()
+            while not signing_storage.exists(remote_signature_path):
+                if time.time() - started_at > timeout:
+                    raise RuntimeError("[!] Таймаут ожидания подписи")
+                time.sleep(2)
+
+            signing_storage.download(remote_signature_path, str(local_signature_path))
+            with open(local_signature_path, "r", encoding="utf-8") as signature_file:
+                signature_base64 = signature_file.read().strip()
+
+            wrapper = DocumentWrapper(
+                document_format="MANUAL",
+                product_document=base64.b64encode(body_bytes).decode("utf-8"),
+                type="CIS_INFORMATION_CHANGE",
+                signature=signature_base64,
+            )
+            api = HonestSignAPI(token=token)
+            submission_ambiguous = True
+            result = api.documents_create(wrapper.to_json(), pg=group)
+            submission_ambiguous = False
+            if not result or (isinstance(result, dict) and result.get("error")):
+                raise RuntimeError(f"[!] Ошибка отправки корректировки: {result}")
+
+            accepted_not_persisted = True
+            if isinstance(result, str):
+                result = {"document_id": result}
+            result["taskId"] = task_id
+            result["productGroup"] = group
+            receipt_json = json.dumps(result, ensure_ascii=False, indent=4)
+            submission_storage.write_text(receipt_path, receipt_json)
+            accepted_not_persisted = False
+            _release_document_submission_lock(submission_storage, submission_lock_path)
+            submission_lock_path = None
+            logger.info("[+] CIS_INFORMATION_CHANGE отправлен: %s", result)
+            return result
+        finally:
+            if local_body_path.exists():
+                local_body_path.unlink()
+            if local_signature_path.exists():
+                local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except Exception:
+                pass
+            try:
+                if signing_storage.exists(remote_body_path):
+                    signing_storage.delete(remote_body_path)
+                if signing_storage.exists(remote_signature_path):
+                    signing_storage.delete(remote_signature_path)
+            except Exception:
+                pass
+    except Exception:
+        if (
+            submission_lock_path
+            and not submission_ambiguous
+            and not accepted_not_persisted
+        ):
+            _release_document_submission_lock(
+                submission_storage,
+                submission_lock_path,
+            )
+        logger.exception("[!] Ошибка в sign_and_send_cis_information_change")
+        raise
+
+
+def update_cis_information_change_status(task_id: str, group: str = None):
+    """Получает и сохраняет статус CIS_INFORMATION_CHANGE."""
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    tasks_path, receipts_path, statuses_path = _cis_information_change_paths(config)
+    if not tasks_path or not receipts_path or not statuses_path:
+        raise RuntimeError(
+            "[!] В конфигурации отсутствуют пути задач, чеков или статусов "
+            "CIS_INFORMATION_CHANGE"
+        )
+
+    task_id = _validate_cis_information_change_task_id(task_id)
+    receipt_storage = get_storage(receipts_path, s3_config)
+    receipt_path = f"{receipts_path.rstrip('/')}/{task_id}.json"
+    if not receipt_storage.exists(receipt_path):
+        raise FileNotFoundError(f"Чек отправки не найден: {receipt_path}")
+    receipt = json.loads(receipt_storage.read_text(receipt_path))
+    document_id = receipt.get("document_id")
+    if not document_id:
+        raise RuntimeError(f"[!] В чеке {task_id} отсутствует document_id")
+    group = group or receipt.get("productGroup")
+    if not group:
+        raise ValueError("Товарная группа обязательна для запроса статуса")
+
+    task_storage = get_storage(tasks_path, s3_config)
+    task_path = f"{tasks_path.rstrip('/')}/{task_id}.json"
+    if not task_storage.exists(task_path):
+        raise FileNotFoundError(f"Задача корректировки не найдена: {task_path}")
+    task = json.loads(task_storage.read_text(task_path))
+    participant_inn = str(task.get("participantInn") or "")
+
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
+    token_processor = TokenProcessor(org_manager=org_manager)
+    token = token_processor.get_token_value_by_inn(participant_inn, token_type="JWT")
+    if not token:
+        raise RuntimeError(f"[!] JWT токен для ИНН {participant_inn} не найден")
+
+    status_result = HonestSignAPI(token=token).doc(document_id, pg=group)
+    if not status_result:
+        raise RuntimeError("[!] True API вернул пустой статус")
+    if isinstance(status_result, dict) and status_result.get("error"):
+        return status_result
+
+    status_storage = get_storage(statuses_path, s3_config)
+    status_path = f"{statuses_path.rstrip('/')}/{task_id}.json"
+    status_storage.write_text(
+        status_path,
+        json.dumps(status_result, ensure_ascii=False, indent=4),
+    )
+    target = status_result[0] if isinstance(status_result, list) and status_result else status_result
+    if isinstance(target, dict) and target.get("status"):
+        status_storage.set_tags(status_path, {"status": target["status"]})
+    logger.info("[+] Статус CIS_INFORMATION_CHANGE сохранён в %s", status_path)
+    return status_result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Создание, подпись и отправка заказа на эмиссию КМ в СУЗ")
     parser.add_argument("--process-task", help="Обработать входящее задание на производство (S3 key)")
@@ -4272,6 +4871,35 @@ def main():
     parser.add_argument("--create-introduce-from-report", help="Создать задачу на ввод в оборот на основании отчета оборудования по productionOrderId")
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
     parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
+    parser.add_argument(
+        "--create-cis-information-change",
+        metavar="SOURCE",
+        help="Создать корректировку даты по локальному или s3:// пути с кодами",
+    )
+    parser.add_argument(
+        "--create-cis-information-change-from-report",
+        metavar="REPORT_ID",
+        help="Создать корректировку даты по ID отчета оборудования",
+    )
+    parser.add_argument(
+        "--create-cis-information-change-from-emission",
+        metavar="PRODUCTION_ORDER_ID",
+        help="Создать корректировку даты по кодам эмиссии производственного задания",
+    )
+    parser.add_argument(
+        "--send-cis-information-change",
+        metavar="TASK_ID",
+        help="Подписать и отправить CIS_INFORMATION_CHANGE",
+    )
+    parser.add_argument(
+        "--cis-information-change-status",
+        metavar="TASK_ID",
+        help="Получить статус CIS_INFORMATION_CHANGE",
+    )
+    parser.add_argument(
+        "--cis-task-id",
+        help="Явный ID задачи корректировки (иначе формируется из источника и вида даты)",
+    )
 
     parser.add_argument("--qty", default=0, type=int, help="Количество для создания виртуальных заданий (переопределяет количество в исходном задании)")
     parser.add_argument("--group", default="chemistry", help="Товарная группа (например: chemistry, perfumes, clothes...)")
@@ -4327,6 +4955,75 @@ def main():
             print(f"Успешно получено кодов: {len(result.get('codes', []))}")
         else:
             print("Не удалось получить коды.")
+        return
+
+    cis_create_source = (
+        args.create_cis_information_change
+        or args.create_cis_information_change_from_report
+        or args.create_cis_information_change_from_emission
+    )
+    if cis_create_source:
+        selected_dates = [
+            ("productionDate", args.production_date),
+            ("expirationDate", args.expiration_date),
+        ]
+        selected_dates = [(kind, value) for kind, value in selected_dates if value]
+        if len(selected_dates) != 1:
+            parser.error(
+                "Для CIS_INFORMATION_CHANGE укажите ровно одну опцию: "
+                "--production-date или --expiration-date"
+            )
+        correction_type, correction_date = selected_dates[0]
+
+        if args.create_cis_information_change:
+            if not args.inn:
+                parser.error("Для универсального источника укажите --inn")
+            result = create_cis_information_change_from_source(
+                args.create_cis_information_change,
+                args.inn,
+                correction_type,
+                correction_date,
+                task_id=args.cis_task_id,
+            )
+        elif args.create_cis_information_change_from_report:
+            if not args.inn:
+                parser.error("Для отчета оборудования укажите --inn")
+            result = create_cis_information_change_from_equipment_report(
+                args.create_cis_information_change_from_report,
+                args.inn,
+                correction_type,
+                correction_date,
+                task_id=args.cis_task_id,
+            )
+        else:
+            result = create_cis_information_change_from_emission(
+                args.create_cis_information_change_from_emission,
+                correction_type,
+                correction_date,
+                participant_inn=args.inn,
+                task_id=args.cis_task_id,
+            )
+        logger.info("[+++] Задача корректировки сведений создана: %s", result)
+        print(result)
+        return
+
+    if args.send_cis_information_change:
+        result = sign_and_send_cis_information_change(
+            args.send_cis_information_change,
+            args.group,
+            args.signing_dir,
+            args.timeout,
+            refresh_token=args.refresh_token,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if args.cis_information_change_status:
+        result = update_cis_information_change_status(
+            args.cis_information_change_status,
+            args.group,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
         return
 
     if args.process_task:
