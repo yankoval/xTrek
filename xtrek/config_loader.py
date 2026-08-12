@@ -42,7 +42,7 @@ def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
                 with open(path, 'r', encoding='utf-8-sig') as f:
                     data = json.load(f)
                     merged_config.update(data)
-                    logger.info(f"Конфигурация дополнена из файла: {path}")
+                    logger.debug(f"Конфигурация дополнена из файла: {path}")
             except Exception as e:
                 logger.error(f"Ошибка при чтении {path}: {e}")
 
@@ -57,7 +57,7 @@ def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
                 with open(val, 'r', encoding='utf-8-sig') as f:
                     data = json.load(f)
                     merged_config.update(data)
-                    logger.info(f"Конфигурация дополнена из файла (env {env}): {val}")
+                    logger.debug(f"Конфигурация дополнена из файла (env {env}): {val}")
             except Exception as e:
                 logger.error(f"Ошибка при чтении {val}: {e}")
         else:
@@ -65,7 +65,7 @@ def load_config(env_name: str = 'TOKENS_CONFIG') -> Dict[str, Any]:
             try:
                 data = json.loads(val)
                 merged_config.update(data)
-                logger.info(f"Конфигурация дополнена из JSON (env {env})")
+                logger.debug(f"Конфигурация дополнена из JSON (env {env})")
             except:
                 # Если не JSON и не существующий файл - игнорируем
                 pass

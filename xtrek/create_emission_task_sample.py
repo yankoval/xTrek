@@ -1616,7 +1616,7 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
                 if storage_em_orders.exists(em_order_path):
                     em_data = json.loads(storage_em_orders.read_text(em_order_path))
                     found_group = em_data.get('productGroup') or found_group
-                    logger.info(f"[*] Определена товарная группа из заказа: {found_group}")
+                    logger.debug(f"[*] Определена товарная группа из заказа: {found_group}")
         else:
             logger.warning(f"[!] Файл производственного заказа {prod_path} не найден.")
 
@@ -2659,7 +2659,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             if storage_em_orders.exists(em_order_path):
                 em_data = json.loads(storage_em_orders.read_text(em_order_path))
                 found_group = em_data.get('productGroup') or found_group
-                logger.info(f"[*] Определена товарная группа из заказа: {found_group}")
+                logger.debug(f"[*] Определена товарная группа из заказа: {found_group}")
 
             storage_prod = get_storage(production_orders_path, s3_config)
             prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
