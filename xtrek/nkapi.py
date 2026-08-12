@@ -37,7 +37,8 @@ class NK:
     Версия API: v5.38
     """
 
-    def __init__(self, token: str = None, apikey: str = None, sandbox: bool = False, host: str = None):
+    def __init__(self, token: str = None, apikey: str = None, sandbox: bool = False, host: str = None,
+                 token_refresher=None):
         """
         Инициализация API клиента.
         :param token: Bearer-токен True API
@@ -48,6 +49,7 @@ class NK:
         self.token = token or os.getenv("TRUE_API_TOKEN")
         self.apikey = apikey or os.getenv("API_KEY")
         self.sandbox = sandbox
+        self.token_refresher = token_refresher
 
         if not self.token and not self.apikey:
             raise ValueError("Не найден ни token, ни apikey. "
@@ -60,6 +62,16 @@ class NK:
             self.base_url = "https://api.nk.sandbox.crptech.ru"
         else:
             self.base_url = os.getenv("NK_API_HOST", "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai")
+
+    def _request(self, method: str, url: str, **kwargs):
+        """Один безопасный повтор read-only запроса после обновления токена."""
+        requester = requests.get if method.upper() == "GET" else requests.post
+        response = requester(url, **kwargs)
+        if response.status_code in (401, 403) and self.token_refresher:
+            self.token = self.token_refresher()
+            kwargs["headers"] = self._true_api_headers()
+            response = requester(url, **kwargs)
+        return response
 
     def _true_api_base_url(self) -> str:
         if self.sandbox:
@@ -151,7 +163,7 @@ class NK:
             chunk = payload_docs[i:i + 25]
             logger.info(f"POST {url} (/rd/list docs: {len(chunk)})")
             try:
-                response = requests.post(
+                response = self._request("POST",
                     url,
                     headers=self._true_api_headers(),
                     json={"documents": chunk},
@@ -188,7 +200,7 @@ class NK:
 
         logger.info(f"POST {url} (GTIN: {gtin}, rdInfo={rd_info})")
         try:
-            response = requests.post(
+            response = self._request("POST",
                 url,
                 headers=self._true_api_headers(),
                 json=payload,
@@ -329,7 +341,7 @@ class NK:
             params["apikey"] = self.apikey
 
         logger.info(f"GET {url} (GTIN: {gtin})")
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response = self._request("GET", url, headers=headers, params=params, timeout=30)
         logger.info(f"Status: {response.status_code}")
 
         if response.status_code != 200:
@@ -356,7 +368,7 @@ class NK:
             params["apikey"] = self.apikey
 
         logger.info(f"GET {url} (GTIN: {gtin})")
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response = self._request("GET", url, headers=headers, params=params, timeout=30)
         logger.info(f"Status: {response.status_code}")
 
         if response.status_code != 200:
@@ -385,7 +397,7 @@ class NK:
             params["apikey"] = self.apikey
 
         logger.info(f"POST {url} (GTIN: {gtin})")
-        response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
+        response = self._request("POST", url, headers=headers, params=params, json=payload, timeout=30)
         logger.info(f"Status: {response.status_code}")
 
         if response.status_code != 200:
@@ -474,7 +486,7 @@ class NK:
         logger.info(f"GET {url} (INN: {inn}, GTIN: {gtin}, limit: {limit}, offset: {offset})")
         
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = self._request("GET", url, headers=headers, params=params, timeout=30)
             logger.info(f"Status: {response.status_code}")
 
             if response.status_code != 200:
@@ -556,7 +568,7 @@ class NK:
         logger.info(f"GET {url} (limit: {limit}, offset: {offset})")
         
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = self._request("GET", url, headers=headers, params=params, timeout=30)
             logger.info(f"Status: {response.status_code}")
 
             if response.status_code != 200:

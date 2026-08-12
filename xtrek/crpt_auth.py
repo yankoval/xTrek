@@ -140,7 +140,7 @@ def main():
 
         # Сохранение в общую базу tokens.json
         try:
-            processor = TokenProcessor()
+            processor = TokenProcessor(tokens_read_only=False)
             processor.save_token(token_value, conid=args.conid)
         except Exception as e:
             print(f"[!] Ошибка при сохранении токена в базу: {e}")

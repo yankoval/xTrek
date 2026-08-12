@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
-from xtrek.tokens import TokenProcessor, SYNC_INTERVAL
+from xtrek.tokens import TokenProcessor
 
 @pytest.fixture
 def temp_tokens_file(tmp_path):
@@ -18,30 +18,26 @@ def temp_orgs_dir(tmp_path):
     d.mkdir()
     return d
 
-def test_sync_interval_caching(temp_tokens_file, temp_orgs_dir):
+def test_read_only_uses_one_s3_snapshot_per_command(temp_tokens_file, temp_orgs_dir):
     with patch('xtrek.tokens.get_storage') as mock_get_storage, \
          patch('xtrek.tokens.load_config', return_value={'tokens_path': 's3://bucket/tokens.json'}):
 
         mock_storage = MagicMock()
         mock_get_storage.return_value = mock_storage
-        mock_storage.exists.return_value = True
+        mock_storage.download.side_effect = lambda remote, local: Path(local).write_text('[]')
 
-        tp = TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir))
+        TokenProcessor._command_snapshots.clear()
+        tp = TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir), tokens_read_only=True)
 
         # Initial sync happened in __init__ -> _sync_on_init
         assert mock_storage.download.call_count == 1
 
-        # Call get_token_value_by_inn
+        # Reads inside the same command do not contact S3 again.
         tp.get_token_value_by_inn("12345")
-        # Should not sync because last_sync_time is fresh
         assert mock_storage.download.call_count == 1
 
-        # Simulate time passage
-        tp.last_sync_time -= (SYNC_INTERVAL + 1)
-
-        tp.get_token_value_by_inn("12345")
-        # Should sync now
-        assert mock_storage.download.call_count == 2
+        TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir), tokens_read_only=True)
+        assert mock_storage.download.call_count == 1
 
 def test_save_token_removes_duplicates_jwt(temp_tokens_file, temp_orgs_dir):
     # Setup: one existing JWT token for INN 12345
@@ -55,7 +51,7 @@ def test_save_token_removes_duplicates_jwt(temp_tokens_file, temp_orgs_dir):
             "ДействуетДо": "2030-01-01T00:00:00"
         }], f)
 
-    tp = TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir))
+    tp = TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir), tokens_read_only=False)
     assert len(tp.tokens) == 1
 
     # New JWT for same INN but different PID (identifier)
@@ -82,7 +78,7 @@ def test_save_token_removes_duplicates_uuid(temp_tokens_file, temp_orgs_dir):
     mock_org = MagicMock()
     mock_org.inn = "12345"
 
-    tp = TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir))
+    tp = TokenProcessor(str(temp_tokens_file), str(temp_orgs_dir), tokens_read_only=False)
     tp.org_manager.find = MagicMock(return_value=mock_org)
 
     assert len(tp.tokens) == 1
