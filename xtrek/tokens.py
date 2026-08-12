@@ -28,6 +28,12 @@ class TokenProcessor:
     _command_snapshots = {}
     _snapshot_lock = threading.Lock()
 
+    @classmethod
+    def clear_command_snapshots(cls):
+        """Завершает текущий снимок токенов, например на границе Celery-задачи."""
+        with cls._snapshot_lock:
+            cls._command_snapshots.clear()
+
     def __init__(self, file_path: str = '', orgs_dir: str = 'my_orgs', org_manager: Optional[OrganizationManager] = None,
                  tokens_read_only: Optional[bool] = None):
         """

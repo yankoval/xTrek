@@ -62,6 +62,26 @@ def test_client_downloads_once_and_never_reads_stale_local_file(tmp_path, orgs_d
     assert stale_file.read_text(encoding="utf-8") == "not valid json"
 
 
+def test_clearing_command_snapshot_downloads_fresh_tokens_for_next_command(tmp_path, orgs_dir):
+    first_token = _jwt("123", datetime.now(timezone.utc).timestamp() + 3600)
+    second_token = _jwt("456", datetime.now(timezone.utc).timestamp() + 3600)
+    storage = _storage_with([{"Идентификатор": "pid-1", "Токен": first_token}])
+
+    with patch("xtrek.tokens.load_config", return_value={"tokens_path": "s3://bucket/tokens.json"}), \
+         patch("xtrek.tokens.get_storage", return_value=storage):
+        first = TokenProcessor(str(tmp_path / "tokens.json"), str(orgs_dir))
+        storage.download.side_effect = lambda remote, local: Path(local).write_text(
+            json.dumps([{"Идентификатор": "pid-2", "Токен": second_token}]),
+            encoding="utf-8",
+        )
+        TokenProcessor.clear_command_snapshots()
+        second = TokenProcessor(str(tmp_path / "tokens.json"), str(orgs_dir))
+
+    assert first.get_jwt_token_value_by_inn("123") == first_token
+    assert second.get_jwt_token_value_by_inn("456") == second_token
+    assert storage.download.call_count == 2
+
+
 def test_client_fails_closed_when_s3_is_unavailable(tmp_path, orgs_dir):
     stale_file = tmp_path / "tokens.json"
     stale_file.write_text("[]", encoding="utf-8")
