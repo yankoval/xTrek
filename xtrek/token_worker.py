@@ -29,17 +29,15 @@ class TokenRefreshWorker:
         # Путь к базе организаций
         org_storage = Path(__file__).parent / "my_orgs"
         self.org_manager = OrganizationManager(str(org_storage))
-        self.tp = TokenProcessor(org_manager=self.org_manager)
+        self.tp = TokenProcessor(org_manager=self.org_manager, tokens_read_only=False)
         self.interval = self.config.get('tokens_update_interval', 600)
+        self.refresh_before_expiry = self.config.get('tokens_refresh_before_expiry_seconds', 900)
 
     def check_and_refresh(self):
         logger.info("--- Запуск цикла проверки токенов (JWT + Auth/СУЗ) ---")
         
         # Синхронизация данных
-        if hasattr(self.tp, '_sync_from_s3'):
-            self.tp._sync_from_s3()
-        self.tp.read_tokens_file()
-        self.tp.process_tokens()
+        self.tp._sync_from_s3(required=True)
 
         if hasattr(self.org_manager, '_sync_from_s3'):
             self.org_manager._sync_from_s3()
@@ -64,7 +62,8 @@ class TokenRefreshWorker:
             # Передаем conid=None, чтобы TokenProcessor искал именно "чистый" JWT для ИНН
             jwt_token = self.tp.get_token_value_by_inn(inn, conid=None)
             
-            if jwt_token:
+            jwt_remaining = self.tp.get_token_remaining_seconds(inn, token_type='JWT')
+            if jwt_token and (jwt_remaining is None or jwt_remaining > self.refresh_before_expiry):
                 logger.info(f"[{name}] JWT: Актуален")
             else:
                 logger.warning(f"[{name}] JWT: Требуется обновление (mode='jwt')...")
@@ -84,7 +83,8 @@ class TokenRefreshWorker:
                 # Ищем токен именно для этой связки ИНН + ConnectionID
                 auth_token = self.tp.get_token_value_by_inn(inn, token_type='auth', conid=conid)
                 
-                if auth_token:
+                auth_remaining = self.tp.get_token_remaining_seconds(inn, token_type='auth', conid=conid)
+                if auth_token and (auth_remaining is None or auth_remaining > self.refresh_before_expiry):
                     logger.info(f"[{name}] Auth (СУЗ): Актуален")
                 else:
                     logger.warning(f"[{name}] Auth (СУЗ): Требуется обновление (mode='auth')...")

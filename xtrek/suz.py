@@ -35,7 +35,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class SUZ:
-    def __init__(self, token: str = None, omsId: str = None, clientToken: str = None):
+    def __init__(self, token: str = None, omsId: str = None, clientToken: str = None, token_refresher=None):
         self.token = token or os.getenv('HONEST_SIGN_TOKEN')
         if not self.token:
             raise ValueError("Токен не найден")
@@ -45,6 +45,7 @@ class SUZ:
         self.clientToken = clientToken or os.getenv('CLIENT_TOKEN')
         if not self.clientToken:
             raise ValueError("clientToken не найден")
+        self.token_refresher = token_refresher
 
         self.base_url = "https://suzgrid.crpt.ru"
         # В СУЗ API v3 для аутентификации используется заголовок clientToken.
@@ -59,6 +60,10 @@ class SUZ:
     def _get(self, url, params=None):
         try:
             response = requests.get(url, params=params, headers=self.headers, verify=False)
+            if response.status_code in (401, 403) and self.token_refresher:
+                self.token = self.token_refresher()
+                self.headers["clientToken"] = self.token
+                response = requests.get(url, params=params, headers=self.headers, verify=False)
             if response.status_code != 200:
                 logger.debug(f"GET {url} failed with {response.status_code}: {response.text}")
             response.raise_for_status()

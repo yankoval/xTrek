@@ -25,6 +25,8 @@ from .trueapi import HonestSignAPI
 from .nkapi import NK
 from .gs1_processor import get_inn_by_gtin
 from .tokens import TokenProcessor
+# Импорт сохранён для обратной совместимости внешних monkeypatch-тестов.
+# Клиентские рабочие потоки get_new_token не вызывают.
 from .crpt_auth import get_new_token
 from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
@@ -323,13 +325,9 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
         token_processor = TokenProcessor(org_manager=org_manager)
         token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
         if not token:
-            token = get_new_token(inn=inn, mode='jwt')
-            if token:
-                token_processor.save_token(token)
-        if not token:
             raise ValueError(f"JWT token for INN {inn} not found")
 
-        nk = NK(token=token)
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
 
         # 1. Получаем информацию о gtin из исходного задания на производство с помощью NK.feedproduct
         feed = get_product_info_robust(nk, source_gtin)
@@ -566,14 +564,9 @@ def process_incoming_task(s3_full_key: str):
             token = participant_token
 
         if not token:
-            token = get_new_token(inn=inn, mode='jwt')
-            if token:
-                token_processor.save_token(token)
-
-        if not token:
             raise ValueError(f"JWT токен для ИНН {inn} не найден")
 
-        nk = NK(token=token)
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
         feed = get_product_info_robust(nk, normalized_gtin)
 
         if feed is None:
@@ -731,15 +724,9 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
                 token = participant_token
 
             if not token:
-                # Попробуем получить новый если нет
-                token = get_new_token(inn=inn, mode='jwt')
-                if token:
-                    token_processor.save_token(token)
+                raise ValueError(f"JWT токен для ИНН {inn} отсутствует в актуальном снимке S3")
 
-            if not token:
-                raise ValueError(f"JWT токен для ИНН {inn} не найден, не удалось получить данные из НК")
-
-            nk = NK(token=token)
+            nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
             feed = get_product_info_robust(nk, gtin)
             if not feed:
                 raise ValueError(f"Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
@@ -1074,7 +1061,12 @@ def get_emission_kodes(order_id: str):
             logger.error(f"[!] Активный UUID токен для ИНН {found_org.inn} не найден.")
             return None
 
-        suz_api = SUZ(token=token, omsId=oms_id, clientToken=found_org.connection_id)
+        suz_api = SUZ(
+            token=token, omsId=oms_id, clientToken=found_org.connection_id,
+            token_refresher=lambda: token_processor.refresh_token_value(
+                found_org.inn, 'UUID', found_org.connection_id
+            ),
+        )
 
         # Проверяем статус в СУЗ
         logger.info(f"[*] Запрос актуального статуса из СУЗ для orderId: {order_id}, gtin: {gtin}")
@@ -1624,7 +1616,7 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
                 if storage_em_orders.exists(em_order_path):
                     em_data = json.loads(storage_em_orders.read_text(em_order_path))
                     found_group = em_data.get('productGroup') or found_group
-                    logger.info(f"[*] Определена товарная группа из заказа: {found_group}")
+                    logger.debug(f"[*] Определена товарная группа из заказа: {found_group}")
         else:
             logger.warning(f"[!] Файл производственного заказа {prod_path} не найден.")
 
@@ -1657,14 +1649,10 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
         token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
 
         if not token:
-            token = get_new_token(inn=inn, mode='jwt')
-            if token: token_processor.save_token(token)
-
-        if not token:
             logger.error(f"[!] JWT токен для ИНН {inn} не найден")
             return None
 
-        nk = NK(token=token)
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
         feed = get_product_info_robust(nk, gtin, rd_info=True)
         if not feed:
             logger.error(f"[!] Не удалось получить информацию из НК для GTIN {gtin}")
@@ -2084,7 +2072,12 @@ def update_emission_order_status(production_order_id: str):
             logger.error(f"[!] Активный токен для ИНН {found_org.inn} не найден.")
             return None
 
-        suz_api = SUZ(token=token, omsId=oms_id, clientToken=found_org.connection_id)
+        suz_api = SUZ(
+            token=token, omsId=oms_id, clientToken=found_org.connection_id,
+            token_refresher=lambda: token_processor.refresh_token_value(
+                found_org.inn, 'UUID', found_org.connection_id
+            ),
+        )
         logger.info(f"[*] Запрос статуса для orderId: {order_id}, gtin: {gtin}")
 
         try:
@@ -2380,18 +2373,9 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
 
-        token = None
-        if not refresh_token:
-            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
-
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
         if not token:
-            logger.info(f"[*] Получение нового JWT токена для ИНН {inn}...")
-            token = get_new_token(inn=inn, mode='jwt', timeout=timeout)
-            if token:
-                token_processor.save_token(token)
-                logger.info(f"[+] Новый токен успешно получен и сохранен.")
-            else:
-                raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}.")
+            raise RuntimeError(f"[!] JWT токен для ИНН {inn} отсутствует в актуальном снимке S3")
 
         # Декодируем JWT для логов, чтобы проверить PID/INN
         try:
@@ -2570,7 +2554,12 @@ def update_utilisation_report_status(order_id: str):
             logger.error(f"[!] Токен не найден.")
             return None
 
-        suz_api = SUZ(token=token, omsId=oms_id, clientToken=found_org.connection_id)
+        suz_api = SUZ(
+            token=token, omsId=oms_id, clientToken=found_org.connection_id,
+            token_refresher=lambda: token_processor.refresh_token_value(
+                found_org.inn, 'UUID', found_org.connection_id
+            ),
+        )
 
         # 3. Запрос статуса
         logger.info(f"[*] Запрос статуса отчета {report_id} для заказа {order_id}...")
@@ -2670,7 +2659,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             if storage_em_orders.exists(em_order_path):
                 em_data = json.loads(storage_em_orders.read_text(em_order_path))
                 found_group = em_data.get('productGroup') or found_group
-                logger.info(f"[*] Определена товарная группа из заказа: {found_group}")
+                logger.debug(f"[*] Определена товарная группа из заказа: {found_group}")
 
             storage_prod = get_storage(production_orders_path, s3_config)
             prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
@@ -2725,15 +2714,10 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             token = participant_token
 
         if not token:
-             # Попробуем получить новый если нет
-             token = get_new_token(inn=inn, mode='jwt')
-             if token: token_processor.save_token(token)
-
-        if not token:
             logger.error(f"[!] JWT токен для ИНН {inn} не найден, не удалось получить данные из НК")
             return None
 
-        nk = NK(token=token)
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
         feed = get_product_info_robust(nk, gtin, rd_info=True)
         if not feed:
             logger.error(f"[!] Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
@@ -2884,13 +2868,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
 
-        token = None
-        if not refresh_token:
-            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
-
-        if not token:
-            token = get_new_token(inn=inn, mode='jwt', timeout=timeout)
-            if token: token_processor.save_token(token)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
 
         if not token:
             raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}")
@@ -3178,7 +3156,7 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
                     if token: break
 
                 if token:
-                    nk = NK(token=token)
+                    nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(org.inn, 'JWT'))
                     feed = get_product_info_robust(nk, gtin)
                     if feed:
                         # В feedProduct обычно ИНН владельца лежит в owner_inn или в result[0].owner_inn
@@ -3302,13 +3280,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
 
-        token = None
-        if not refresh_token:
-            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
-
-        if not token:
-            token = get_new_token(inn=inn, mode='jwt', timeout=timeout)
-            if token: token_processor.save_token(token)
+        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
 
         if not token:
             raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}")
@@ -3458,12 +3430,9 @@ def create_equipment_set_report(production_order_id: str):
         token_processor = TokenProcessor(org_manager=org_manager)
         token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
         if not token:
-            token = get_new_token(inn=inn, mode='jwt')
-            if token: token_processor.save_token(token)
-        if not token:
             raise ValueError(f"JWT token for INN {inn} not found")
 
-        nk = NK(token=token)
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
         set_feed = nk.get_set_by_gtin(main_gtin)
         if not set_feed or not set_feed.get('result'):
              raise ValueError(f"Failed to get set composition for {main_gtin}")
@@ -3672,12 +3641,9 @@ def create_equipment_set_report_from_report(production_order_id: str):
         token_processor = TokenProcessor(org_manager=org_manager)
         token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
         if not token:
-            token = get_new_token(inn=inn, mode='jwt')
-            if token: token_processor.save_token(token)
-        if not token:
             raise ValueError(f"JWT token for INN {inn} not found")
 
-        nk = NK(token=token)
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
         set_feed = nk.get_set_by_gtin(main_gtin)
         if not set_feed or not set_feed.get('result'):
              raise ValueError(f"Failed to get set composition for {main_gtin}")
@@ -4704,16 +4670,10 @@ def sign_and_send_cis_information_change(
         base_path = os.path.dirname(os.path.abspath(__file__))
         org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = None
-        if not refresh_token:
-            token = token_processor.get_token_value_by_inn(
-                participant_inn,
-                token_type="JWT",
-            )
-        if not token:
-            token = get_new_token(inn=participant_inn, mode="jwt", timeout=timeout)
-            if token:
-                token_processor.save_token(token)
+        token = token_processor.get_token_value_by_inn(
+            participant_inn,
+            token_type="JWT",
+        )
         if not token:
             raise RuntimeError(
                 f"[!] Не удалось получить JWT токен для ИНН {participant_inn}"

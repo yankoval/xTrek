@@ -41,6 +41,11 @@ class _FakeCelery:
         return decorator
 
 
+class _FakeSignal:
+    def connect(self, func):
+        return func
+
+
 def import_tasks(monkeypatch, module_name="tasks"):
     monkeypatch.setenv("YMQ_ACCESS_KEY", "test-access")
     monkeypatch.setenv("YMQ_SECRET_KEY", "test-secret")
@@ -48,6 +53,11 @@ def import_tasks(monkeypatch, module_name="tasks"):
     sys.modules.pop("tasks", None)
     sys.modules.pop("xtrek.tasks", None)
     monkeypatch.setitem(sys.modules, "celery", types.SimpleNamespace(Celery=_FakeCelery))
+    monkeypatch.setitem(
+        sys.modules,
+        "celery.signals",
+        types.SimpleNamespace(task_prerun=_FakeSignal(), task_postrun=_FakeSignal()),
+    )
     config = {
         "input_bucket": "input-bucket",
         "internal_bucket": "internal-bucket",
@@ -64,6 +74,17 @@ def test_tasks_module_is_available_from_package_and_legacy_entrypoint(monkeypatc
     package_tasks = importlib.import_module("xtrek.tasks")
 
     assert legacy_tasks is package_tasks
+
+
+def test_celery_task_boundaries_clear_token_snapshot(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    clear = MagicMock()
+    monkeypatch.setattr(tasks.TokenProcessor, "clear_command_snapshots", clear)
+
+    tasks._start_token_snapshot()
+    tasks._finish_token_snapshot()
+
+    assert clear.call_count == 2
 
 
 def test_process_s3_event_routes_equipment_report_through_celery(monkeypatch):

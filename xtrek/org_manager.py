@@ -70,11 +70,11 @@ class OrganizationManager:
 
         if self.orgs_path and self.orgs_path.startswith('s3://'):
             self.storage = get_storage(self.orgs_path, self.s3_config)
-            logger.info(f"Инициализирован S3 storage для организаций: {self.orgs_path}")
+            logger.debug(f"Инициализирован S3 storage для организаций: {self.orgs_path}")
             self._sync_on_init()
         else:
             self.storage = None
-            logger.info(f"Используется локальное хранилище для организаций: {self.storage_dir}")
+            logger.debug(f"Используется локальное хранилище для организаций: {self.storage_dir}")
 
         self.sync_from_disk()
 
@@ -86,7 +86,7 @@ class OrganizationManager:
 
         try:
             # 1. Загружаем то, что есть в S3
-            logger.info(f"Синхронизация организаций из {self.orgs_path}...")
+            logger.debug(f"Синхронизация организаций из {self.orgs_path}...")
             remote_files = self.storage.list_files(self.orgs_path, "*.json")
             remote_filenames = set()
             for remote_file in remote_files:
@@ -105,20 +105,25 @@ class OrganizationManager:
                     self.storage.upload(local_path, remote_path)
                     upload_count += 1
 
-            logger.info(f"Синхронизация завершена. Загружено: {len(remote_files)}, Выгружено: {upload_count}")
+            summary = f"Синхронизация завершена. Загружено: {len(remote_files)}, Выгружено: {upload_count}"
+            if upload_count:
+                # Публикация в S3 — внешнее изменение, которое должно быть видно в INFO.
+                logger.info(summary)
+            else:
+                logger.debug(summary)
         except Exception as e:
             logger.error(f"Ошибка при начальной синхронизации организаций: {e}")
 
     def _sync_from_s3(self):
         if self.storage and self.orgs_path:
             try:
-                logger.info(f"Синхронизация организаций из {self.orgs_path}...")
+                logger.debug(f"Синхронизация организаций из {self.orgs_path}...")
                 remote_files = self.storage.list_files(self.orgs_path, "*.json")
                 for remote_file in remote_files:
                     filename = os.path.basename(remote_file)
                     local_path = os.path.join(self.storage_dir, filename)
                     self.storage.download(remote_file, local_path)
-                logger.info(f"Загружено {len(remote_files)} файлов организаций.")
+                logger.debug(f"Загружено {len(remote_files)} файлов организаций.")
                 # Обновляем в памяти
                 self.sync_from_disk()
             except Exception as e:

@@ -2,10 +2,12 @@ import os
 import json
 import re
 from celery import Celery
+from celery.signals import task_postrun, task_prerun
 from urllib.parse import quote
 
 # 1. Импорт вашей бизнес-логики
 from xtrek.config_loader import load_config
+from xtrek.tokens import TokenProcessor
 from xtrek.create_emission_task_sample import (
     process_incoming_task, 
     create_equipment_aggregation_task, 
@@ -54,6 +56,18 @@ safe_secret = quote(SECRET_KEY, safe='')
 BROKER_URL = f'sqs://{ACCESS_KEY}:{safe_secret}@'
 
 app = Celery('tasks', broker=BROKER_URL)
+
+
+@task_prerun.connect
+def _start_token_snapshot(**kwargs):
+    """Каждая Celery-задача должна получить актуальный снимок tokens.json из S3."""
+    TokenProcessor.clear_command_snapshots()
+
+
+@task_postrun.connect
+def _finish_token_snapshot(**kwargs):
+    """Не переносим снимок токенов в следующую задачу долгоживущего worker."""
+    TokenProcessor.clear_command_snapshots()
 
 # Загрузка конфигурации
 config = load_config('suz_worker_config')

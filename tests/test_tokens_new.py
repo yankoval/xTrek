@@ -63,7 +63,7 @@ def test_env(tmp_path):
 
 def test_get_token_value_by_inn_default_jwt(test_env):
     tokens_file, orgs_dir = test_env
-    tp = TokenProcessor(str(tokens_file), str(orgs_dir))
+    tp = TokenProcessor(str(tokens_file), str(orgs_dir), tokens_read_only=False)
 
     # Should return the newest JWT
     token = tp.get_token_value_by_inn("1234567890")
@@ -76,7 +76,7 @@ def test_get_token_value_by_inn_default_jwt(test_env):
 
 def test_get_jwt_token_wrapper(test_env):
     tokens_file, orgs_dir = test_env
-    tp = TokenProcessor(str(tokens_file), str(orgs_dir))
+    tp = TokenProcessor(str(tokens_file), str(orgs_dir), tokens_read_only=False)
 
     token = tp.get_jwt_token_value_by_inn("1234567890")
     assert token is not None
@@ -87,14 +87,14 @@ def test_get_jwt_token_wrapper(test_env):
 
 def test_get_uuid_token_wrapper(test_env):
     tokens_file, orgs_dir = test_env
-    tp = TokenProcessor(str(tokens_file), str(orgs_dir))
+    tp = TokenProcessor(str(tokens_file), str(orgs_dir), tokens_read_only=False)
 
     token = tp.get_uuid_token_value_by_inn("1234567890")
     assert token == "12345678-1234-1234-1234-1234567890ab"
 
 def test_uuid_synonyms(test_env):
     tokens_file, orgs_dir = test_env
-    tp = TokenProcessor(str(tokens_file), str(orgs_dir))
+    tp = TokenProcessor(str(tokens_file), str(orgs_dir), tokens_read_only=False)
 
     token_auth = tp.get_token_value_by_inn("1234567890", token_type='auth')
     token_uuid = tp.get_token_value_by_inn("1234567890", token_type='uuid')
@@ -104,7 +104,7 @@ def test_uuid_synonyms(test_env):
 
 def test_token_not_found(test_env):
     tokens_file, orgs_dir = test_env
-    tp = TokenProcessor(str(tokens_file), str(orgs_dir))
+    tp = TokenProcessor(str(tokens_file), str(orgs_dir), tokens_read_only=False)
 
     assert tp.get_token_value_by_inn("nonexistent") is None
     assert tp.get_token_value_by_inn("1234567890", token_type='UNKNOWN') is None
