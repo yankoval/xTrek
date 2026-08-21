@@ -191,10 +191,13 @@ def main():
     p.add_argument('--boxes', '-b', type=int, default=1)
     p.add_argument('--output', '-o')
     p.add_argument('--sscc-url',
-        default='https://functions.yandexcloud.net/d4et2pvmtgp0oo5pk0bh')
+        default=os.environ.get('SSCC_CI_URL') or os.environ.get('SSCC_URL'))
     p.add_argument('--sscc-prefix', default='460705179')
     p.add_argument('--sscc-extension', default='0')
     args = p.parse_args()
+
+    if not args.sscc_url:
+        p.error('задайте --sscc-url, SSCC_CI_URL или SSCC_URL')
 
     pid = args.production_order_id.replace('.json', '').strip()
     num_boxes = max(args.boxes, 1)

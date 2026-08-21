@@ -1,6 +1,7 @@
 import json
 import csv
 import logging
+import os
 import re
 import requests
 import time
@@ -155,7 +156,7 @@ if __name__ == "__main__":
         output_path='result_datamatrix.csv',
         sscc_path=None,
         column_name='C1',
-        sscc_url="https://functions.yandexcloud.net/YOUR_ID",
+        sscc_url=os.environ.get("SSCC_URL"),
         sscc_prefix="460705179",
         sscc_extension="0"
     )
