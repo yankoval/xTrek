@@ -6,6 +6,17 @@ import re
 import requests
 import time
 from datetime import datetime
+from urllib.parse import urlparse
+
+
+YC_METADATA_TOKEN_URL = (
+    "http://169.254.169.254/computeMetadata/v1/instance/"
+    "service-accounts/default/token"
+)
+YC_FUNCTION_HOST = "functions.yandexcloud.net"
+YC_IAM_AUTH_MODE = "yandex_iam"
+_IAM_TOKEN_REFRESH_MARGIN_SECONDS = 60
+_iam_token_cache = {"access_token": None, "expires_at": 0.0}
 
 # Настройка логирования
 logging.basicConfig(
@@ -13,6 +24,64 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _clear_iam_token_cache():
+    _iam_token_cache["access_token"] = None
+    _iam_token_cache["expires_at"] = 0.0
+
+
+def _get_yandex_iam_token(force_refresh=False):
+    """Return a short-lived IAM token from the VM metadata service."""
+    now = time.monotonic()
+    cached_token = _iam_token_cache["access_token"]
+    if (
+        not force_refresh
+        and cached_token
+        and now < _iam_token_cache["expires_at"]
+    ):
+        return cached_token
+
+    response = requests.get(
+        YC_METADATA_TOKEN_URL,
+        headers={"Metadata-Flavor": "Google"},
+        timeout=(1, 3),
+    )
+    response.raise_for_status()
+    data = response.json()
+    access_token = data.get("access_token")
+    if not access_token:
+        raise ValueError("VM metadata response does not contain access_token")
+
+    try:
+        expires_in = max(0, int(data.get("expires_in", 0)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("VM metadata response contains invalid expires_in") from exc
+
+    cache_lifetime = max(
+        0,
+        expires_in - _IAM_TOKEN_REFRESH_MARGIN_SECONDS,
+    )
+    _iam_token_cache["access_token"] = access_token
+    _iam_token_cache["expires_at"] = now + cache_lifetime
+    return access_token
+
+
+def _get_sscc_request_headers(function_url, auth_mode, force_refresh=False):
+    if auth_mode in (None, "", "none"):
+        return None
+    if auth_mode != YC_IAM_AUTH_MODE:
+        raise ValueError(f"Unsupported SSCC auth mode: {auth_mode}")
+
+    hostname = (urlparse(function_url).hostname or "").lower()
+    if hostname != YC_FUNCTION_HOST:
+        raise ValueError(
+            "Refusing to send Yandex IAM token to non-Yandex Functions host: "
+            f"{hostname or '<missing>'}"
+        )
+
+    token = _get_yandex_iam_token(force_refresh=force_refresh)
+    return {"Authorization": f"Bearer {token}"}
 
 def format_gs1_date(date_str):
     """Преобразует дату из формата YYYY-MM-DD в YYMMDD."""
@@ -22,7 +91,13 @@ def format_gs1_date(date_str):
         logger.error(f"Ошибка преобразования даты {date_str}: {e}")
         raise
 
-def get_sscc_from_service(function_url, prefix, count, extension=None):
+def get_sscc_from_service(
+    function_url,
+    prefix,
+    count,
+    extension=None,
+    auth_mode=None,
+):
     """Запрашивает SSCC коды у внешнего сервиса с замером времени отклика."""
     count = int(count)
     logger.info(f"Запрос {count} кодов SSCC (Prefix: {prefix}, Ext: {extension})")
@@ -32,7 +107,26 @@ def get_sscc_from_service(function_url, prefix, count, extension=None):
 
     start_time = time.perf_counter()
     try:
-        response = requests.post(function_url, json=payload, timeout=15)
+        headers = _get_sscc_request_headers(function_url, auth_mode)
+        response = requests.post(
+            function_url,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if auth_mode == YC_IAM_AUTH_MODE and response.status_code == 401:
+            _clear_iam_token_cache()
+            headers = _get_sscc_request_headers(
+                function_url,
+                auth_mode,
+                force_refresh=True,
+            )
+            response = requests.post(
+                function_url,
+                json=payload,
+                headers=headers,
+                timeout=15,
+            )
         response.raise_for_status()
 
         latency = (time.perf_counter() - start_time) * 1000
@@ -54,6 +148,7 @@ def get_sscc_from_service(function_url, prefix, count, extension=None):
 def generate_gs1_csv(json_path, output_path, sscc_path=None,
                      column_name='C1', sscc_url=None,
                      sscc_prefix=None, sscc_extension=None,
+                     sscc_auth_mode=None,
                      gs1_template="00{sscc}"):
     """
     Генерация CSV для DataMatrix.
@@ -119,7 +214,13 @@ def generate_gs1_csv(json_path, output_path, sscc_path=None,
             logger.error("Параметры API не заданы.")
             return
         try:
-            sscc_list = get_sscc_from_service(sscc_url, sscc_prefix, target_quantity, sscc_extension)
+            sscc_list = get_sscc_from_service(
+                sscc_url,
+                sscc_prefix,
+                target_quantity,
+                sscc_extension,
+                auth_mode=sscc_auth_mode,
+            )
         except ValueError:
             return
 

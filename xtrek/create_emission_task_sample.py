@@ -3836,11 +3836,15 @@ def _create_pallet_assignment(prod_data, config):
             "and sscc_prefix"
         )
 
+    sscc_request_kwargs = {}
+    if config.get('sscc_auth_mode'):
+        sscc_request_kwargs['auth_mode'] = config['sscc_auth_mode']
     raw_codes = get_sscc_from_service(
         sscc_service_url,
         sscc_prefix,
         sscc_count,
         sscc_extension,
+        **sscc_request_kwargs,
     )
     if not isinstance(raw_codes, list) or len(raw_codes) != sscc_count:
         actual_count = len(raw_codes) if isinstance(raw_codes, list) else 0
