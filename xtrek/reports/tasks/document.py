@@ -64,7 +64,7 @@ def build(data: TasksReportData) -> Report:
                             cell_padding=8,
                             repeat_header=True,
                             striped_rows=True,
-                            messenger_layout="table",
+                            messenger_layout="vertical_table",
                         ),
                     ),
                 ),

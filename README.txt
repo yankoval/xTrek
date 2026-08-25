@@ -120,8 +120,9 @@ WeasyPrint также требует системные библиотеки, п
 
 Профиль `messenger` использует шрифт 11 px и не добавляет рамки. Таблица может
 сохраняться в компактном табличном виде через
-`TableStyle(messenger_layout="table")`; режимы `cards` и `key_value` остаются
-доступны для клиентов, которые не поддерживают HTML-таблицы.
+`TableStyle(messenger_layout="table")` или выводиться вертикально двумя
+колонками через `messenger_layout="vertical_table"`. Режимы `cards` и
+`key_value` остаются доступны для клиентов без поддержки HTML-таблиц.
 
 По умолчанию команда читает Yandex Object Storage. Параметры `--bucket`,
 `--prefix`, `--endpoint-url`, `--region` и `--timezone` можно переопределить.
