@@ -37,7 +37,8 @@ def test_cli_prints_messenger_html_to_stdout(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert code == 0
     assert captured.out.startswith("<b>Отчёт о полученных заданиях</b>")
-    assert "<b>Кодов:</b> 24<br>" in captured.out
+    assert "<b>Кодов:</b> 24\n" in captured.out
+    assert "<br" not in captured.out
     assert captured.err == ""
 
 
