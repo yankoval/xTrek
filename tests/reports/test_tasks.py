@@ -110,10 +110,11 @@ def test_build_and_render_approved_tasks_report():
     assert message.startswith("<b>Отчёт о полученных заданиях</b>")
     assert "<table" not in message
     assert "style=" not in message
-    assert "<b>Дата:</b> 25.08.2026<br>" in message
-    assert "<b>Заданий:</b> 2<br>" in message
-    assert "<b>Паспортов (ярлыков):</b> 1 640<br>" in message
-    assert "<b>Кодов:</b> 9 840<br>" in message
+    assert "<b>Дата:</b> 25.08.2026\n" in message
+    assert "<b>Заданий:</b> 2\n" in message
+    assert "<b>Паспортов (ярлыков):</b> 1 640\n" in message
+    assert "<b>Кодов:</b> 9 840\n" in message
+    assert "<br" not in message
     assert "border:" not in message
     assert "Quantity" not in message
     assert "<table" not in markdown_message
