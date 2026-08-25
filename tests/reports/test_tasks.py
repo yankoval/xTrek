@@ -107,24 +107,15 @@ def test_build_and_render_approved_tasks_report():
         "right",
         "right",
     ]
-    assert '<div style="font-family: Arial, Helvetica, sans-serif; font-size: 11px' in message
-    assert '<table role="presentation"' in message
-    assert "<thead>" not in message
-    assert "<th" not in message
-    assert "<b>Дата</b></td><td" in message
-    assert "<b>Заданий</b></td><td" in message
-    assert "<b>Паспортов (ярлыков)</b></td><td" in message
-    assert "<b>Кодов</b></td><td" in message
-    assert message.count("<tr>") == 4
-    assert "text-align: left" in message
-    assert "text-align: right" in message
-    assert ">25.08.2026</td>" in message
-    assert ">2</td>" in message
-    assert ">1 640</td>" in message
-    assert ">9 840</td>" in message
+    assert message.startswith("<b>Отчёт о полученных заданиях</b>")
+    assert "<table" not in message
+    assert "style=" not in message
+    assert "<b>Дата:</b> 25.08.2026<br>" in message
+    assert "<b>Заданий:</b> 2<br>" in message
+    assert "<b>Паспортов (ярлыков):</b> 1 640<br>" in message
+    assert "<b>Кодов:</b> 9 840<br>" in message
     assert "border:" not in message
     assert "Quantity" not in message
-    assert "<thead>" not in markdown_message
-    assert markdown_message.count("<tr>") == 4
-    assert "<b>Дата</b>" in markdown_message
-    assert "text-align: right\">9 840</td>" in markdown_message
+    assert "<table" not in markdown_message
+    assert "**Дата:** 25\\.08\\.2026" in markdown_message
+    assert "**Кодов:** 9 840" in markdown_message

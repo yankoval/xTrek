@@ -104,8 +104,7 @@ def test_printer_html_contains_paged_css(sample_report):
 def test_messenger_html_is_a_compact_fragment(sample_report):
     result = render(sample_report, output_format="html", profile="messenger")
 
-    assert result.startswith('<div style="font-family: Arial')
-    assert "<b>Тестовый отчёт</b>" in result
+    assert result.startswith("<b>Тестовый отчёт</b>")
     assert "<b>Дата:</b> 25.08.2026" in result
     assert "<!doctype" not in result
     assert "<style>" not in result
