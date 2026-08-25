@@ -1,16 +1,17 @@
 {% if profile == "messenger" %}**{{ report.title | md }}**{% else %}# {{ report.title | md }}{% endif %}
 
+{% macro value(item, column=none) %}{% if item.kind|default("") == "link" %}[{{ item | display(column) | md }}]({{ item.url | md_url }}){% else %}{{ item | display(column) | md }}{% endif %}{% endmacro %}
 {% macro blocks(items) %}{% for block in items %}{% if block.kind == "heading" %}{{ "#" * block.level }} {{ block.text | md }}
 
-{% elif block.kind == "paragraph" %}{{ block.text | md }}
+{% elif block.kind == "paragraph" %}{{ value(block.text) }}
 
-{% elif block.kind == "key_value" %}**{{ block.label | md }}:** {{ block.value | md }}
+{% elif block.kind == "key_value" %}**{{ block.label | md }}:** {{ value(block.value) }}
 
 {% elif block.kind == "table" %}{% if block.caption %}**{{ block.caption | md }}**
 
-{% endif %}| {% for header in block.headers %}{{ header | md }} | {% endfor %}
-| {% for header in block.headers %}--- | {% endfor %}
-{% for row in block.rows %}| {% for cell in row %}{{ cell | md }} | {% endfor %}
+{% endif %}| {% for column in block.columns %}{{ column.title | md }} | {% endfor %}
+| {% for column in block.columns %}{{ column | md_align }} | {% endfor %}
+{% for row in block.rows %}| {% for cell in row %}{% set column = block.columns[loop.index0] %}{{ value(cell, column) }} | {% endfor %}
 {% endfor %}
 {% endif %}{% endfor %}{% endmacro %}
 {{ blocks(report.header) }}{% for page in report.pages %}{{ blocks(page.header) }}{{ blocks(page.blocks) }}{{ blocks(page.footer) }}{% if not loop.last %}

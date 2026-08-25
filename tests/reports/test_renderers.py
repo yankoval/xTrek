@@ -1,8 +1,20 @@
 import sys
+from decimal import Decimal
 
 import pytest
 
-from xtrek.reports import KeyValue, Page, Report, Table, render
+from xtrek.reports import (
+    Border,
+    KeyValue,
+    Link,
+    NumberFormat,
+    Page,
+    Report,
+    Table,
+    TableColumn,
+    TableStyle,
+    render,
+)
 from xtrek.reports.errors import OptionalDependencyError
 
 
@@ -20,6 +32,52 @@ def sample_report():
                     ),
                 ),
                 break_after=False,
+            ),
+        ),
+    )
+
+
+@pytest.fixture
+def styled_table_report():
+    return Report(
+        title="Таблица",
+        pages=(
+            Page(
+                blocks=(
+                    Table(
+                        columns=(
+                            TableColumn("Документ", align="left"),
+                            TableColumn(
+                                "Сумма",
+                                align="right",
+                                number_format=NumberFormat(
+                                    decimal_places=2,
+                                    thousands_separator=" ",
+                                    decimal_separator=",",
+                                    suffix=" ₽",
+                                ),
+                            ),
+                        ),
+                        rows=(
+                            (
+                                Link(
+                                    "Открыть",
+                                    "https://example.com/task?id=1&source=report",
+                                    title="Карточка задания",
+                                ),
+                                Decimal("1234.5"),
+                            ),
+                        ),
+                        style=TableStyle(
+                            outer_border=Border(
+                                width=2,
+                                style="dashed",
+                                color="#123456",
+                            ),
+                            striped_rows=True,
+                        ),
+                    ),
+                ),
             ),
         ),
     )
@@ -86,3 +144,22 @@ def test_pdf_renderer_returns_weasyprint_bytes(sample_report, monkeypatch):
 def test_unknown_theme_is_rejected(sample_report):
     with pytest.raises(ValueError, match="Unknown report profile or theme"):
         render(sample_report, output_format="html", theme="missing")
+
+
+def test_html_table_applies_borders_alignment_numbers_and_links(styled_table_report):
+    result = render(styled_table_report, output_format="html", profile="browser")
+
+    assert "--outer-border: 2pt dashed #123456" in result
+    assert "text-align: right" in result
+    assert "1 234,50 ₽" in result
+    assert "https://example.com/task?id=1&amp;source=report" in result
+    assert 'title="Карточка задания"' in result
+    assert 'class="striped repeat-header"' in result
+
+
+def test_markdown_table_applies_alignment_numbers_and_links(styled_table_report):
+    result = render(styled_table_report, output_format="md", profile="browser")
+
+    assert "| :--- | ---: |" in result
+    assert "1 234,50 ₽" in result
+    assert "[Открыть](https://example.com/task?id=1&source=report)" in result

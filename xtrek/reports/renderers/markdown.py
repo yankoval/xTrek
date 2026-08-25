@@ -8,6 +8,7 @@ from jinja2 import Environment, PackageLoader
 
 from ..model import Report
 from ..options import RenderOptions
+from .values import format_value, markdown_alignment, markdown_url
 
 
 def _escape_markdown(value: object) -> str:
@@ -21,6 +22,9 @@ def render_markdown(report: Report, options: RenderOptions) -> str:
         keep_trailing_newline=True,
     )
     environment.filters["md"] = _escape_markdown
+    environment.filters["display"] = format_value
+    environment.filters["md_align"] = markdown_alignment
+    environment.filters["md_url"] = markdown_url
     template = environment.get_template("report.md.jinja")
     rendered = template.render(report=report, profile=options.profile.value)
     lines = [line.rstrip() for line in rendered.splitlines()]

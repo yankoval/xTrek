@@ -121,3 +121,23 @@ WeasyPrint также требует системные библиотеки, п
 По умолчанию команда читает Yandex Object Storage. Параметры `--bucket`,
 `--prefix`, `--endpoint-url`, `--region` и `--timezone` можно переопределить.
 Учётные данные AWS/S3 получает `boto3` стандартным способом.
+
+Таблицы поддерживают декларативные колонки, выравнивание, числовые форматы,
+ширину и рамки. Ссылки можно передавать как значения ячеек:
+
+    Table(
+        columns=(
+            TableColumn("Документ", align="left"),
+            TableColumn(
+                "Количество",
+                align="right",
+                number_format=NumberFormat(decimal_places=0),
+            ),
+        ),
+        rows=((Link("Открыть", "https://example.com"), 1234),),
+        style=TableStyle(
+            outer_border=Border(width=1.5, style="solid"),
+            row_border=Border(width=0.5, style="dashed"),
+            column_border=Border(width=0.5, style="dashed"),
+        ),
+    )

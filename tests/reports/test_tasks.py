@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from xtrek.reports import render
+from xtrek.reports import Table, render
 from xtrek.reports.tasks import TaskObjectRef, TasksDataError, build, collect
 
 
@@ -98,6 +98,14 @@ def test_build_and_render_approved_tasks_report():
     message = render(document, output_format="html", profile="messenger")
 
     assert document.title == "Отчёт о полученных заданиях"
+    table = document.pages[0].blocks[0]
+    assert isinstance(table, Table)
+    assert [column.align for column in table.columns] == [
+        "left",
+        "right",
+        "right",
+        "right",
+    ]
     assert "<b>Дата:</b> 25.08.2026" in message
     assert "<b>Заданий:</b> 2" in message
     assert "<b>Паспортов (ярлыков):</b> 1 640" in message

@@ -3,5 +3,6 @@
 .report { width: 100%; padding: 0; }
 .page.break-after:not(:last-of-type) { break-after: page; }
 .key-value, tr { break-inside: avoid; }
-thead { display: table-header-group; }
+table.repeat-header thead { display: table-header-group; }
+table:not(.repeat-header) thead { display: table-row-group; }
 .table-wrap { overflow: visible; }
