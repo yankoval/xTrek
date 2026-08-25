@@ -32,7 +32,8 @@ def _table_css(table) -> str:
 def _column_css(column, value=None, *, header=False) -> str:
     if header:
         alignment = column.header_align or (
-            "right" if column.align in {"right", "decimal"} else "left"
+            column.align if column.align in {"center", "right"} else
+            "right" if column.align == "decimal" else "left"
         )
     else:
         alignment = effective_alignment(value, column)

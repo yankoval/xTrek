@@ -80,6 +80,7 @@ def styled_table_report():
                 ),
             ),
         ),
+        footer=(KeyValue("Поддержка", Link("Открыть", "https://example.com")),),
     )
 
 
@@ -155,6 +156,7 @@ def test_html_table_applies_borders_alignment_numbers_and_links(styled_table_rep
     assert "https://example.com/task?id=1&amp;source=report" in result
     assert 'title="Карточка задания"' in result
     assert 'class="striped repeat-header"' in result
+    assert '<th style="text-align: right; vertical-align: middle">Сумма</th>' in result
 
 
 def test_markdown_table_applies_alignment_numbers_and_links(styled_table_report):
@@ -163,3 +165,11 @@ def test_markdown_table_applies_alignment_numbers_and_links(styled_table_report)
     assert "| :--- | ---: |" in result
     assert "1 234,50 ₽" in result
     assert "[Открыть](https://example.com/task?id=1&source=report)" in result
+
+
+def test_messenger_table_ends_with_break_before_footer(styled_table_report):
+    result = render(styled_table_report, output_format="html", profile="messenger")
+
+    assert "1 234,50 ₽<br>\n<b>Поддержка:</b>" in result
+    assert "<table" not in result
+    assert "<style" not in result

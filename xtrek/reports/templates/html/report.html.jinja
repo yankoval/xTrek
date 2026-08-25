@@ -15,7 +15,7 @@
 {% if block.kind == "heading" %}<b>{{ block.text }}</b><br>
 {% elif block.kind == "paragraph" %}{{ value(block.text) }}<br>
 {% elif block.kind == "key_value" %}<b>{{ block.label }}:</b> {{ value(block.value) }}<br>
-{% elif block.kind == "table" %}{% if block.caption %}<b>{{ block.caption }}</b><br>{% endif %}{% for row in block.rows %}{% for cell in row %}{% set column = block.columns[loop.index0] %}<b>{{ column.title }}:</b> {{ value(cell, column) }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% if not loop.last %}{% if block.style.messenger_layout == "cards" %}<br><br>{% else %}<br>{% endif %}{% endif %}{% endfor %}
+{% elif block.kind == "table" %}{% if block.caption %}<b>{{ block.caption }}</b><br>{% endif %}{% for row in block.rows %}{% for cell in row %}{% set column = block.columns[loop.index0] %}<b>{{ column.title }}:</b> {{ value(cell, column) }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% if not loop.last %}{% if block.style.messenger_layout == "cards" %}<br><br>{% else %}<br>{% endif %}{% endif %}{% endfor %}<br>
 {% endif %}
 {% endfor %}
 {%- endmacro %}

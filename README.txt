@@ -141,3 +141,7 @@ WeasyPrint также требует системные библиотеки, п
             column_border=Border(width=0.5, style="dashed"),
         ),
     )
+
+Полный набор демонстрационных HTML/Markdown можно пересобрать командой:
+
+    python examples/reports_showcase.py
