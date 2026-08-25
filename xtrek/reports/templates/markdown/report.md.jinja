@@ -1,0 +1,19 @@
+{% if profile == "messenger" %}**{{ report.title | md }}**{% else %}# {{ report.title | md }}{% endif %}
+
+{% macro blocks(items) %}{% for block in items %}{% if block.kind == "heading" %}{{ "#" * block.level }} {{ block.text | md }}
+
+{% elif block.kind == "paragraph" %}{{ block.text | md }}
+
+{% elif block.kind == "key_value" %}**{{ block.label | md }}:** {{ block.value | md }}
+
+{% elif block.kind == "table" %}{% if block.caption %}**{{ block.caption | md }}**
+
+{% endif %}| {% for header in block.headers %}{{ header | md }} | {% endfor %}
+| {% for header in block.headers %}--- | {% endfor %}
+{% for row in block.rows %}| {% for cell in row %}{{ cell | md }} | {% endfor %}
+{% endfor %}
+{% endif %}{% endfor %}{% endmacro %}
+{{ blocks(report.header) }}{% for page in report.pages %}{{ blocks(page.header) }}{{ blocks(page.blocks) }}{{ blocks(page.footer) }}{% if not loop.last %}
+---
+
+{% endif %}{% endfor %}{{ blocks(report.footer) }}

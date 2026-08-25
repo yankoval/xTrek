@@ -1,0 +1,45 @@
+{% macro web_blocks(blocks) -%}
+{% for block in blocks %}
+{% if block.kind == "heading" %}<h{{ block.level }}>{{ block.text }}</h{{ block.level }}>
+{% elif block.kind == "paragraph" %}<p>{{ block.text }}</p>
+{% elif block.kind == "key_value" %}<div class="key-value"><span class="label">{{ block.label }}</span><span class="value">{{ block.value }}</span></div>
+{% elif block.kind == "table" %}<div class="table-wrap">{% if block.caption %}<div class="table-caption">{{ block.caption }}</div>{% endif %}<table><thead><tr>{% for header in block.headers %}<th>{{ header }}</th>{% endfor %}</tr></thead><tbody>{% for row in block.rows %}<tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div>
+{% endif %}
+{% endfor %}
+{%- endmacro %}
+{% macro message_blocks(blocks) -%}
+{% for block in blocks %}
+{% if block.kind == "heading" %}<b>{{ block.text }}</b><br>
+{% elif block.kind == "paragraph" %}{{ block.text }}<br>
+{% elif block.kind == "key_value" %}<b>{{ block.label }}:</b> {{ block.value }}<br>
+{% elif block.kind == "table" %}{% if block.caption %}<b>{{ block.caption }}</b><br>{% endif %}{% for row in block.rows %}{% for cell in row %}<b>{{ block.headers[loop.index0] }}:</b> {{ cell }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% if not loop.last %}<br><br>{% endif %}{% endfor %}
+{% endif %}
+{% endfor %}
+{%- endmacro %}
+{% if profile == "messenger" -%}
+<b>{{ report.title }}</b><br><br>
+{{ message_blocks(report.header) }}{% for page in report.pages %}{{ message_blocks(page.header) }}{{ message_blocks(page.blocks) }}{{ message_blocks(page.footer) }}{% if not loop.last %}<br>{% endif %}{% endfor %}{{ message_blocks(report.footer) }}
+{%- else -%}
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ report.title }}</title>
+  <style>{{ css | safe }}</style>
+</head>
+<body class="profile-{{ profile }}">
+  <main class="report">
+    <header class="report-header"><h1>{{ report.title }}</h1>{{ web_blocks(report.header) }}</header>
+    {% for page in report.pages %}
+    <section class="page{% if page.break_after %} break-after{% endif %}">
+      {% if page.header %}<header class="page-header">{{ web_blocks(page.header) }}</header>{% endif %}
+      <div class="page-content">{{ web_blocks(page.blocks) }}</div>
+      {% if page.footer %}<footer class="page-footer">{{ web_blocks(page.footer) }}</footer>{% endif %}
+    </section>
+    {% endfor %}
+    {% if report.footer %}<footer class="report-footer">{{ web_blocks(report.footer) }}</footer>{% endif %}
+  </main>
+</body>
+</html>
+{%- endif %}

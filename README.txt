@@ -77,7 +77,7 @@ text
 login successful
 operation completed
 🛠 Требования
-Python 3.6+
+Python 3.9+
 
 Опционально: chardet для автоопределения кодировок
 
@@ -86,3 +86,38 @@ MIT License
 
 🤝 Поддержка
 Сообщения об ошибках и предложения приветствуются через Issues.
+
+## Отчёты
+
+Пакет `xtrek.reports` отделяет получение данных от структуры документа и
+оформления. Первый отчёт показывает задания, полученные за календарный день.
+
+Установка поддержки HTML и Markdown:
+
+    pip install "xtrek[reports]"
+
+Установка опционального PDF-рендерера:
+
+    pip install "xtrek[reports-pdf]"
+
+WeasyPrint также требует системные библиотеки, перечисленные в его инструкции
+по установке для конкретной операционной системы.
+
+Создание HTML-отчёта для браузера:
+
+    python -m xtrek.reports.tasks \
+        --date 2026-08-25 \
+        --format html \
+        --profile browser \
+        --output report.html
+
+Вывод компактного HTML для MAX в stdout:
+
+    python -m xtrek.reports.tasks \
+        --date 2026-08-25 \
+        --format html \
+        --profile messenger
+
+По умолчанию команда читает Yandex Object Storage. Параметры `--bucket`,
+`--prefix`, `--endpoint-url`, `--region` и `--timezone` можно переопределить.
+Учётные данные AWS/S3 получает `boto3` стандартным способом.
