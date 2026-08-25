@@ -1,0 +1,12 @@
+.report {
+  width: min(100% - 32px, 720px);
+  margin-top: 24px;
+  margin-bottom: 24px;
+  padding: 24px;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+}
+@media (max-width: 520px) {
+  .report { width: 100%; margin: 0; padding: 16px; border-radius: 0; box-shadow: none; }
+  .report-header h1 { font-size: 20px; }
+}

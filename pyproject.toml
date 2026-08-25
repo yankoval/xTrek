@@ -10,7 +10,7 @@ authors = [
 ]
 description = "Utilities for xTrek"
 readme = "README.txt"
-requires-python = ">=3.6"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -23,6 +23,15 @@ dependencies = [
     "requests",
     "pyperclip",
     "boto3",
+]
+
+[project.optional-dependencies]
+reports = [
+    "Jinja2>=3.1",
+]
+reports-pdf = [
+    "Jinja2>=3.1",
+    "WeasyPrint>=62",
 ]
 
 [project.urls]
@@ -45,4 +54,12 @@ where = ["."]
 include = ["xtrek*", "amica*"]
 
 [tool.setuptools.package-data]
-xtrek = ["*.json", "my_orgs/*.json"]
+xtrek = [
+    "*.json",
+    "my_orgs/*.json",
+    "reports/templates/html/*.jinja",
+    "reports/templates/markdown/*.jinja",
+    "reports/styles/*.css",
+    "reports/styles/profiles/*.css",
+    "reports/styles/themes/*.css",
+]

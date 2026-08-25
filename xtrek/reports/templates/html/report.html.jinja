@@ -1,0 +1,48 @@
+{% macro value(item, column=none) -%}
+{% if item.kind|default("") == "link" %}<a href="{{ item.url }}"{% if item.title %} title="{{ item.title }}"{% endif %}>{{ item | display(column) }}</a>{% else %}{{ item | display(column) }}{% endif %}
+{%- endmacro %}
+{% macro web_blocks(blocks) -%}
+{% for block in blocks %}
+{% if block.kind == "heading" %}<h{{ block.level }}>{{ block.text }}</h{{ block.level }}>
+{% elif block.kind == "paragraph" %}<p>{{ value(block.text) }}</p>
+{% elif block.kind == "key_value" %}<div class="key-value"><span class="label">{{ block.label }}</span><span class="value">{{ value(block.value) }}</span></div>
+{% elif block.kind == "table" %}<div class="table-wrap">{% if block.caption %}<div class="table-caption">{{ block.caption }}</div>{% endif %}<table class="{% if block.style.striped_rows %}striped {% endif %}{% if block.style.repeat_header %}repeat-header{% endif %}" style="{{ block | table_css }}"><thead><tr>{% for column in block.columns %}<th style="{{ header_css(column) }}">{{ column.title }}</th>{% endfor %}</tr></thead><tbody>{% for row in block.rows %}<tr>{% for cell in row %}{% set column = block.columns[loop.index0] %}<td style="{{ cell | cell_css(column) }}">{{ value(cell, column) }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div>
+{% endif %}
+{% endfor %}
+{%- endmacro %}
+{% macro message_blocks(blocks) -%}
+{% for block in blocks %}
+{% if block.kind == "heading" %}<b>{{ block.text }}</b><br>
+{% elif block.kind == "paragraph" %}{{ value(block.text) }}<br>
+{% elif block.kind == "key_value" %}<b>{{ block.label }}:</b> {{ value(block.value) }}<br>
+{% elif block.kind == "table" %}{% if block.caption %}<b>{{ block.caption }}</b><br>{% endif %}{% if block.style.messenger_layout == "table" %}<table role="presentation" style="border-collapse: collapse; font-size: inherit; line-height: inherit"><thead><tr>{% for column in block.columns %}<th style="padding: 1px 5px; {{ header_css(column) }}">{{ column.title }}</th>{% endfor %}</tr></thead><tbody>{% for row in block.rows %}<tr>{% for cell in row %}{% set column = block.columns[loop.index0] %}<td style="padding: 1px 5px; {{ cell | cell_css(column) }}">{{ value(cell, column) }}</td>{% endfor %}</tr>{% endfor %}</tbody></table><br>{% elif block.style.messenger_layout == "vertical_table" %}{% for row in block.rows %}<table role="presentation" style="border-collapse: collapse; font-size: inherit; line-height: inherit"><tbody>{% for cell in row %}{% set column = block.columns[loop.index0] %}<tr><td style="padding: 1px 8px 1px 0; text-align: left; vertical-align: middle"><b>{{ column.title }}</b></td><td style="padding: 1px 0; {{ cell | cell_css(column) }}">{{ value(cell, column) }}</td></tr>{% endfor %}</tbody></table>{% if not loop.last %}<br>{% endif %}{% endfor %}<br>{% else %}{% for row in block.rows %}{% for cell in row %}{% set column = block.columns[loop.index0] %}<b>{{ column.title }}:</b> {{ value(cell, column) }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% if not loop.last %}{% if block.style.messenger_layout == "cards" %}<br><br>{% else %}<br>{% endif %}{% endif %}{% endfor %}<br>{% endif %}
+{% endif %}
+{% endfor %}
+{%- endmacro %}
+{% if profile == "messenger" -%}
+<div style="font-family: Arial, Helvetica, sans-serif; font-size: 11px; line-height: 1.2"><b>{{ report.title }}</b><br><br>
+{{ message_blocks(report.header) }}{% for page in report.pages %}{{ message_blocks(page.header) }}{{ message_blocks(page.blocks) }}{{ message_blocks(page.footer) }}{% if not loop.last %}<br>{% endif %}{% endfor %}{{ message_blocks(report.footer) }}</div>
+{%- else -%}
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ report.title }}</title>
+  <style>{{ css | safe }}</style>
+</head>
+<body class="profile-{{ profile }}">
+  <main class="report">
+    <header class="report-header"><h1>{{ report.title }}</h1>{{ web_blocks(report.header) }}</header>
+    {% for page in report.pages %}
+    <section class="page{% if page.break_after %} break-after{% endif %}">
+      {% if page.header %}<header class="page-header">{{ web_blocks(page.header) }}</header>{% endif %}
+      <div class="page-content">{{ web_blocks(page.blocks) }}</div>
+      {% if page.footer %}<footer class="page-footer">{{ web_blocks(page.footer) }}</footer>{% endif %}
+    </section>
+    {% endfor %}
+    {% if report.footer %}<footer class="report-footer">{{ web_blocks(report.footer) }}</footer>{% endif %}
+  </main>
+</body>
+</html>
+{%- endif %}

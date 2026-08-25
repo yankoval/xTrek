@@ -9,8 +9,13 @@ setup(
     author='Ivan Kiselev',
     author_email='yankoval@gmail.com',
     description='utilities for xTrek',
+    python_requires='>=3.9',
     packages=find_packages(include=['xtrek', 'xtrek.*', 'amica', 'amica.*']),
     install_requires=requirements,
+    extras_require={
+        'reports': ['Jinja2>=3.1'],
+        'reports-pdf': ['Jinja2>=3.1', 'WeasyPrint>=62'],
+    },
     entry_points={
         'console_scripts': [
             'nk=xtrek.nk:main',
@@ -26,6 +31,14 @@ setup(
         ],
     },
     package_data={
-        'xtrek': ['*.json', 'my_orgs/*.json'],
+        'xtrek': [
+            '*.json',
+            'my_orgs/*.json',
+            'reports/templates/html/*.jinja',
+            'reports/templates/markdown/*.jinja',
+            'reports/styles/*.css',
+            'reports/styles/profiles/*.css',
+            'reports/styles/themes/*.css',
+        ],
     },
 )

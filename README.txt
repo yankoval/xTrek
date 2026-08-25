@@ -77,7 +77,7 @@ text
 login successful
 operation completed
 🛠 Требования
-Python 3.6+
+Python 3.9+
 
 Опционально: chardet для автоопределения кодировок
 
@@ -86,3 +86,68 @@ MIT License
 
 🤝 Поддержка
 Сообщения об ошибках и предложения приветствуются через Issues.
+
+## Отчёты
+
+Пакет `xtrek.reports` отделяет получение данных от структуры документа и
+оформления. Первый отчёт показывает задания, полученные за календарный день.
+
+Установка поддержки HTML и Markdown:
+
+    pip install "xtrek[reports]"
+
+Установка опционального PDF-рендерера:
+
+    pip install "xtrek[reports-pdf]"
+
+WeasyPrint также требует системные библиотеки, перечисленные в его инструкции
+по установке для конкретной операционной системы.
+
+Создание HTML-отчёта для браузера:
+
+    python -m xtrek.reports.tasks \
+        --date 2026-08-25 \
+        --format html \
+        --profile browser \
+        --output report.html
+
+Вывод компактного HTML для MAX в stdout:
+
+    python -m xtrek.reports.tasks \
+        --date 2026-08-25 \
+        --format html \
+        --profile messenger
+
+Профиль `messenger` использует шрифт 11 px и не добавляет рамки. Таблица может
+сохраняться в компактном табличном виде через
+`TableStyle(messenger_layout="table")` или выводиться вертикально двумя
+колонками через `messenger_layout="vertical_table"`. Режимы `cards` и
+`key_value` остаются доступны для клиентов без поддержки HTML-таблиц.
+
+По умолчанию команда читает Yandex Object Storage. Параметры `--bucket`,
+`--prefix`, `--endpoint-url`, `--region` и `--timezone` можно переопределить.
+Учётные данные AWS/S3 получает `boto3` стандартным способом.
+
+Таблицы поддерживают декларативные колонки, выравнивание, числовые форматы,
+ширину и рамки. Ссылки можно передавать как значения ячеек:
+
+    Table(
+        columns=(
+            TableColumn("Документ", align="left"),
+            TableColumn(
+                "Количество",
+                align="right",
+                number_format=NumberFormat(decimal_places=0),
+            ),
+        ),
+        rows=((Link("Открыть", "https://example.com"), 1234),),
+        style=TableStyle(
+            outer_border=Border(width=1.5, style="solid"),
+            row_border=Border(width=0.5, style="dashed"),
+            column_border=Border(width=0.5, style="dashed"),
+        ),
+    )
+
+Полный набор демонстрационных HTML/Markdown можно пересобрать командой:
+
+    python examples/reports_showcase.py

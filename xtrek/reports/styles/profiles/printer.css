@@ -1,0 +1,8 @@
+@page { size: A4 portrait; margin: 18mm 16mm; }
+:root { --page-background: #ffffff; }
+.report { width: 100%; padding: 0; }
+.page.break-after:not(:last-of-type) { break-after: page; }
+.key-value, tr { break-inside: avoid; }
+table.repeat-header thead { display: table-header-group; }
+table:not(.repeat-header) thead { display: table-row-group; }
+.table-wrap { overflow: visible; }
