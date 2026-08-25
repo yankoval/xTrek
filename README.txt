@@ -118,6 +118,11 @@ WeasyPrint также требует системные библиотеки, п
         --format html \
         --profile messenger
 
+Профиль `messenger` использует шрифт 11 px и не добавляет рамки. Таблица может
+сохраняться в компактном табличном виде через
+`TableStyle(messenger_layout="table")`; режимы `cards` и `key_value` остаются
+доступны для клиентов, которые не поддерживают HTML-таблицы.
+
 По умолчанию команда читает Yandex Object Storage. Параметры `--bucket`,
 `--prefix`, `--endpoint-url`, `--region` и `--timezone` можно переопределить.
 Учётные данные AWS/S3 получает `boto3` стандартным способом.

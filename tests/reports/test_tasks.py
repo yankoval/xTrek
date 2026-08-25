@@ -106,8 +106,13 @@ def test_build_and_render_approved_tasks_report():
         "right",
         "right",
     ]
-    assert "<b>Дата:</b> 25.08.2026" in message
-    assert "<b>Заданий:</b> 2" in message
-    assert "<b>Паспортов (ярлыков):</b> 1 640" in message
-    assert "<b>Кодов:</b> 9 840" in message
+    assert '<div style="font-family: Arial, Helvetica, sans-serif; font-size: 11px' in message
+    assert '<table role="presentation"' in message
+    assert '<th style="padding: 1px 5px; text-align: left' in message
+    assert '<th style="padding: 1px 5px; text-align: right' in message
+    assert ">25.08.2026</td>" in message
+    assert ">2</td>" in message
+    assert ">1 640</td>" in message
+    assert ">9 840</td>" in message
+    assert "border:" not in message
     assert "Quantity" not in message

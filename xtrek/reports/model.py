@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 ALIGNMENTS = {"auto", "left", "center", "right", "decimal"}
 BORDER_STYLES = {"none", "solid", "dashed", "dotted", "double"}
 VERTICAL_ALIGNMENTS = {"top", "middle", "bottom"}
-MESSENGER_TABLE_LAYOUTS = {"cards", "key_value"}
+MESSENGER_TABLE_LAYOUTS = {"cards", "key_value", "table"}
 _COLUMN_WIDTH = re.compile(r"^(?:auto|\d+(?:\.\d+)?(?:%|px|pt|em|rem|ch|cm|mm|in)?)$")
 _BORDER_COLOR = re.compile(r"^(?:#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$")
 

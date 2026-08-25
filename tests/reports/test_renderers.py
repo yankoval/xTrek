@@ -104,7 +104,8 @@ def test_printer_html_contains_paged_css(sample_report):
 def test_messenger_html_is_a_compact_fragment(sample_report):
     result = render(sample_report, output_format="html", profile="messenger")
 
-    assert result.startswith("<b>Тестовый отчёт</b>")
+    assert result.startswith('<div style="font-family: Arial')
+    assert "<b>Тестовый отчёт</b>" in result
     assert "<b>Дата:</b> 25.08.2026" in result
     assert "<!doctype" not in result
     assert "<style>" not in result
@@ -170,6 +171,8 @@ def test_markdown_table_applies_alignment_numbers_and_links(styled_table_report)
 def test_messenger_table_ends_with_break_before_footer(styled_table_report):
     result = render(styled_table_report, output_format="html", profile="messenger")
 
-    assert "1 234,50 ₽<br>\n<b>Поддержка:</b>" in result
+    assert "1 234,50 ₽<br>" in result
+    assert "<b>Поддержка:</b>" in result
     assert "<table" not in result
+    assert "border:" not in result
     assert "<style" not in result
