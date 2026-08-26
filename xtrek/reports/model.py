@@ -122,6 +122,7 @@ class Paragraph:
 class KeyValue:
     label: str
     value: "Value"
+    small: bool = False
     kind: ClassVar[str] = "key_value"
 
 

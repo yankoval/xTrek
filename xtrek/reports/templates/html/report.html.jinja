@@ -5,7 +5,7 @@
 {% for block in blocks %}
 {% if block.kind == "heading" %}<h{{ block.level }}>{{ block.text }}</h{{ block.level }}>
 {% elif block.kind == "paragraph" %}<p>{{ value(block.text) }}</p>
-{% elif block.kind == "key_value" %}<div class="key-value"><span class="label">{{ block.label }}</span><span class="value">{{ value(block.value) }}</span></div>
+{% elif block.kind == "key_value" %}<div class="key-value{% if block.small %} small{% endif %}"><span class="label">{{ block.label }}</span><span class="value">{{ value(block.value) }}</span></div>
 {% elif block.kind == "table" %}<div class="table-wrap">{% if block.caption %}<div class="table-caption">{{ block.caption }}</div>{% endif %}<table class="{% if block.style.striped_rows %}striped {% endif %}{% if block.style.repeat_header %}repeat-header{% endif %}" style="{{ block | table_css }}"><thead><tr>{% for column in block.columns %}<th style="{{ header_css(column) }}">{{ column.title }}</th>{% endfor %}</tr></thead><tbody>{% for row in block.rows %}<tr>{% for cell in row %}{% set column = block.columns[loop.index0] %}<td style="{{ cell | cell_css(column) }}">{{ value(cell, column) }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div>
 {% endif %}
 {% endfor %}

@@ -1,4 +1,4 @@
-"""Command-line interface for the received-tasks report."""
+"""CLI for the daily tasks report grouped by article."""
 
 from __future__ import annotations
 
@@ -11,13 +11,21 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from .. import render
 from ..errors import ReportsError
-from .data import TasksDataError, collect, collect_range
+from ..tasks.data import TasksDataError
+from ..tasks.source import (
+    DEFAULT_BUCKET,
+    DEFAULT_ENDPOINT_URL,
+    DEFAULT_PREFIX,
+    S3TaskSource,
+)
+from .data import collect, collect_range
 from .document import build
-from .source import DEFAULT_BUCKET, DEFAULT_ENDPOINT_URL, DEFAULT_PREFIX, S3TaskSource
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Отчёт о полученных заданиях")
+    result = argparse.ArgumentParser(
+        description="Отчет о заданиях с группировкой по артикулам"
+    )
     period = result.add_mutually_exclusive_group(required=True)
     period.add_argument("--date", help="Дата отчёта в формате YYYY-MM-DD")
     period.add_argument(
@@ -37,6 +45,12 @@ def parser() -> argparse.ArgumentParser:
         default=None,
     )
     result.add_argument("--theme", default="default")
+    result.add_argument(
+        "--details",
+        choices=("auto", "full", "none"),
+        default="auto",
+        help="Расшифровка по файлам: автоматически, полностью или без неё",
+    )
     result.add_argument("--output", help="Файл результата; HTML/MD без него идут в stdout")
     result.add_argument("--bucket", default=DEFAULT_BUCKET)
     result.add_argument("--prefix", default=DEFAULT_PREFIX)
@@ -78,7 +92,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 date_to=arguments.date_to,
                 timezone_name=arguments.timezone,
             )
-        document = build(data)
+        include_details = arguments.details == "full" or (
+            arguments.details == "auto" and profile != "messenger"
+        )
+        document = build(data, include_details=include_details)
         content = render(
             document,
             output_format=arguments.format,
@@ -106,7 +123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(output)
     elif isinstance(content, str):
         print(content, end="")
-    else:  # guarded above, kept for alternative binary renderers
+    else:
         print("Для бинарного формата необходимо указать --output", file=sys.stderr)
         return 2
     return 0

@@ -60,3 +60,25 @@ def test_cli_writes_markdown_file(monkeypatch, tmp_path, capsys):
     assert code == 0
     assert output.read_text(encoding="utf-8").startswith("# Отчёт о полученных заданиях")
     assert capsys.readouterr().out.strip() == str(output)
+
+
+def test_cli_supports_inclusive_minute_range(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "S3TaskSource", FakeSource)
+
+    code = cli.main(
+        [
+            "--from",
+            "2026-08-25T12:59",
+            "--to",
+            "2026-08-25T13:00",
+            "--format",
+            "html",
+            "--profile",
+            "messenger",
+        ]
+    )
+
+    content = capsys.readouterr().out
+    assert code == 0
+    assert "<b>Период:</b> 25.08.2026 12:59 — 25.08.2026 13:00\n" in content
+    assert "<b>Заданий:</b> 1\n" in content

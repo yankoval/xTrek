@@ -20,6 +20,12 @@ body {
 }
 .label { color: var(--muted-color); }
 .value { font-weight: 700; text-align: right; }
+.key-value.small {
+  padding: 4px 0;
+  color: var(--muted-color);
+  font-size: 12px;
+}
+.key-value.small .value { font-weight: 400; }
 .table-wrap { max-width: 100%; overflow-x: auto; }
 .table-caption { margin: 16px 0 8px; font-weight: 700; }
 table { width: 100%; border-collapse: collapse; border: var(--outer-border); }

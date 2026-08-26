@@ -23,15 +23,33 @@ def build(data: TasksReportData) -> Report:
         thousands_separator=" ",
         decimal_separator=",",
     )
+    if data.period is not None:
+        first_column = TableColumn("Период", align="left", width="38%")
+        period_value = (
+            f"{data.period.start.strftime('%d.%m.%Y %H:%M')} — "
+            f"{data.period.end.strftime('%d.%m.%Y %H:%M')}"
+        )
+        metadata = {
+            "report": "tasks",
+            "date_from": data.period.start.isoformat(timespec="minutes"),
+            "date_to": data.period.end.isoformat(timespec="minutes"),
+        }
+    else:
+        if data.day is None:
+            raise ValueError("Tasks report must contain a day or a period")
+        first_column = TableColumn("Дата", align="left", width="22%")
+        period_value = data.day.strftime("%d.%m.%Y")
+        metadata = {"report": "tasks", "date": data.day.isoformat()}
+
     return Report(
         title=REPORT_TITLE,
-        metadata={"report": "tasks", "date": data.day.isoformat()},
+        metadata=metadata,
         pages=(
             Page(
                 blocks=(
                     Table(
                         columns=(
-                            TableColumn("Дата", align="left", width="22%"),
+                            first_column,
                             TableColumn(
                                 "Заданий",
                                 align="right",
@@ -50,7 +68,7 @@ def build(data: TasksReportData) -> Report:
                         ),
                         rows=(
                             (
-                                data.day.strftime("%d.%m.%Y"),
+                                period_value,
                                 data.tasks,
                                 data.labels,
                                 data.codes,
