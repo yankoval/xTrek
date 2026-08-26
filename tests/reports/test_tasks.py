@@ -4,7 +4,13 @@ from decimal import Decimal
 import pytest
 
 from xtrek.reports import Table, render
-from xtrek.reports.tasks import TaskObjectRef, TasksDataError, build, collect
+from xtrek.reports.tasks import (
+    TaskObjectRef,
+    TasksDataError,
+    build,
+    collect,
+    collect_range,
+)
 
 
 class FakeSource:
@@ -120,3 +126,58 @@ def test_build_and_render_approved_tasks_report():
     assert "<table" not in markdown_message
     assert "**Дата:** 25\\.08\\.2026" in markdown_message
     assert "**Кодов:** 9 840" in markdown_message
+
+
+def test_collects_inclusive_minute_range_and_renders_period():
+    source = FakeSource(
+        [
+            (
+                ref("Задания/before.json", "2026-08-25T08:59:59+03:00"),
+                {"Quantity": 100, "PasportData": {"Product_PackQty": 1}},
+            ),
+            (
+                ref("Задания/start.json", "2026-08-25T09:00:59+03:00"),
+                {"Quantity": 2, "PasportData": {"Product_PackQty": 3}},
+            ),
+            (
+                ref("Задания/end.json", "2026-08-25T10:15:59+03:00"),
+                {"Quantity": 4, "PasportData": {"Product_PackQty": 5}},
+            ),
+            (
+                ref("Задания/after.json", "2026-08-25T10:16:00+03:00"),
+                {"Quantity": 100, "PasportData": {"Product_PackQty": 1}},
+            ),
+        ]
+    )
+
+    data = collect_range(
+        source,
+        date_from="2026-08-25T09:00",
+        date_to="2026-08-25T10:15",
+    )
+    document = build(data)
+    message = render(document, output_format="html", profile="messenger")
+
+    assert data.day is None
+    assert data.tasks == 2
+    assert data.labels == Decimal(6)
+    assert data.codes == Decimal(26)
+    assert document.pages[0].blocks[0].columns[0].title == "Период"
+    assert "<b>Период:</b> 25.08.2026 09:00 — 25.08.2026 10:15\n" in message
+
+
+def test_range_rejects_seconds_and_reverse_boundaries():
+    source = FakeSource([])
+
+    with pytest.raises(TasksDataError, match="expected YYYY-MM-DDTHH:MM"):
+        collect_range(
+            source,
+            date_from="2026-08-25T09:00:01",
+            date_to="2026-08-25T10:00",
+        )
+    with pytest.raises(TasksDataError, match="must not be earlier"):
+        collect_range(
+            source,
+            date_from="2026-08-25T10:00",
+            date_to="2026-08-25T09:59",
+        )

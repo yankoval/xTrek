@@ -111,12 +111,52 @@ WeasyPrint также требует системные библиотеки, п
         --profile browser \
         --output report.html
 
+Оба отчёта поддерживают диапазон с точностью до минуты вместо `--date`.
+Начальная и конечная минуты включаются полностью; время интерпретируется в
+часовом поясе `--timezone`:
+
+    python -m xtrek.reports.tasks \
+        --from 2026-08-25T09:30 \
+        --to 2026-08-26T12:15 \
+        --format html \
+        --profile browser \
+        --output tasks-range.html
+
+    python -m xtrek.reports.tasks-goupped \
+        --from 2026-08-25T09:30 \
+        --to 2026-08-26T12:15 \
+        --format html \
+        --profile browser \
+        --output tasks-goupped-range.html
+
 Вывод компактного HTML для MAX в stdout:
 
     python -m xtrek.reports.tasks \
         --date 2026-08-25 \
         --format html \
         --profile messenger
+
+Отчёт за день с группировкой по артикулам (идентификатор отчёта
+`tasks-goupped`):
+
+    python -m xtrek.reports.tasks-goupped \
+        --date 2026-08-25 \
+        --format html \
+        --profile browser \
+        --output tasks-goupped.html
+
+Для импорта из Python используется имя пакета `xtrek.reports.tasks_goupped`.
+
+Для каждого значения `Article` выводятся количество заданий, сумма паспортов
+(ярлыков) из `Quantity` и количество кодов. В конце таблицы добавляется общий
+итог за выбранный день. В заголовке фиксируются дата отчёта и дата со временем
+его создания в часовом поясе `--timezone`. Ниже выводится расшифровка по файлам: локальное время,
+ярлыки, коды и полное имя JSON-файла. В профиле `messenger` расшифровка по
+умолчанию скрыта, чтобы не превышать лимит сообщения MAX. Управление разделом:
+
+    --details auto   # подробно для browser/printer, кратко для messenger
+    --details full   # всегда включать расшифровку
+    --details none   # всегда выводить только сводку
 
 Профиль `messenger` не добавляет CSS и рамки. Таблица может сохраняться в
 табличном виде через `TableStyle(messenger_layout="table")`. Для MAX и других
