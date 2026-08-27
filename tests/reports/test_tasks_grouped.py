@@ -3,7 +3,13 @@ from decimal import Decimal
 
 from xtrek.reports import Table, render
 from xtrek.reports.tasks import TaskObjectRef
-from xtrek.reports.tasks_goupped import build, collect, collect_range
+from xtrek.reports.tasks_grouped import (
+    TasksGroupedReportData,
+    build,
+    collect,
+    collect_range,
+)
+from xtrek.reports.tasks_goupped import TasksGouppedReportData
 
 
 class FakeSource:
@@ -19,6 +25,10 @@ class FakeSource:
 
 def ref(key, timestamp):
     return TaskObjectRef(key, datetime.fromisoformat(timestamp))
+
+
+def test_misspelled_data_class_name_remains_a_compatibility_alias():
+    assert TasksGouppedReportData is TasksGroupedReportData
 
 
 def test_collects_requested_day_and_groups_by_article():
@@ -98,7 +108,7 @@ def test_builds_aligned_table_with_totals_and_messenger_cards():
     browser = render(document, output_format="html", profile="browser")
 
     assert document.title == "Отчет о заданиях с группировкой по артикулам"
-    assert document.metadata["report"] == "tasks-goupped"
+    assert document.metadata["report"] == "tasks-grouped"
     assert document.header[0].label == "Дата и время создания отчёта"
     assert document.header[0].small is True
     assert document.header[1].label == "Дата"

@@ -1,29 +1,23 @@
-"""Backward-compatible alias for :mod:`xtrek.reports.tasks_grouped`."""
+"""Daily xTrek tasks report grouped by article."""
 
-from ..tasks_grouped import (
+from ..tasks.source import S3TaskSource, TaskObjectRef, TaskSource
+from .data import (
     ArticleTasksData,
-    REPORT_TITLE,
-    S3TaskSource,
     TaskFileData,
-    TaskObjectRef,
-    TaskSource,
     TasksGroupedReportData,
-    build,
     collect,
     collect_range,
 )
-
-TasksGouppedReportData = TasksGroupedReportData
+from .document import REPORT_TITLE, build
 
 __all__ = [
     "ArticleTasksData",
     "REPORT_TITLE",
     "S3TaskSource",
-    "TaskFileData",
     "TaskObjectRef",
+    "TaskFileData",
     "TaskSource",
     "TasksGroupedReportData",
-    "TasksGouppedReportData",
     "build",
     "collect",
     "collect_range",

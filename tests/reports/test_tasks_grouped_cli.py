@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from xtrek.reports.tasks import TaskObjectRef
-from xtrek.reports.tasks_goupped import cli
+from xtrek.reports.tasks_grouped import cli
 
 
 class FakeSource:
@@ -26,7 +26,7 @@ class FakeSource:
 
 def test_cli_writes_grouped_markdown(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "S3TaskSource", FakeSource)
-    output = tmp_path / "tasks-goupped.md"
+    output = tmp_path / "tasks-grouped.md"
 
     code = cli.main(
         [

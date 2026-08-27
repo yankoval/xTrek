@@ -122,12 +122,12 @@ WeasyPrint также требует системные библиотеки, п
         --profile browser \
         --output tasks-range.html
 
-    python -m xtrek.reports.tasks-goupped \
+    python -m xtrek.reports.tasks-grouped \
         --from 2026-08-25T09:30 \
         --to 2026-08-26T12:15 \
         --format html \
         --profile browser \
-        --output tasks-goupped-range.html
+        --output tasks-grouped-range.html
 
 Вывод компактного HTML для MAX в stdout:
 
@@ -137,15 +137,16 @@ WeasyPrint также требует системные библиотеки, п
         --profile messenger
 
 Отчёт за день с группировкой по артикулам (идентификатор отчёта
-`tasks-goupped`):
+`tasks-grouped`):
 
-    python -m xtrek.reports.tasks-goupped \
+    python -m xtrek.reports.tasks-grouped \
         --date 2026-08-25 \
         --format html \
         --profile browser \
-        --output tasks-goupped.html
+        --output tasks-grouped.html
 
-Для импорта из Python используется имя пакета `xtrek.reports.tasks_goupped`.
+Для импорта из Python используется имя пакета `xtrek.reports.tasks_grouped`.
+Ошибочное прежнее имя `tasks-goupped` оставлено только как совместимый alias.
 
 Для каждого значения `Article` выводятся количество заданий, сумма паспортов
 (ярлыков) из `Quantity` и количество кодов. В конце таблицы добавляется общий
