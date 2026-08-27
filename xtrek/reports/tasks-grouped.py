@@ -1,4 +1,4 @@
-"""Backward-compatible CLI entry point for the misspelled report name."""
+"""CLI entry point for the ``tasks-grouped`` report."""
 
 from .tasks_grouped.cli import main
 
