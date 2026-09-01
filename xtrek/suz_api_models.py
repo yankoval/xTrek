@@ -134,6 +134,31 @@ class DocumentWrapper(SUZBase):
     signature: str
 
 @dataclass
+class DisaggregationProduct(SUZBase):
+    """Aggregate referenced by a True API disaggregation document."""
+    uitu: str
+
+@dataclass
+class DisaggregationMessage(SUZBase):
+    """True API DISAGGREGATION_DOCUMENT body."""
+    participant_inn: str
+    products_list: List[DisaggregationProduct] = field(default_factory=list)
+
+@dataclass
+class ReaggregationItem(SUZBase):
+    """One child removed from or added to an aggregate."""
+    uit_uitu: Optional[str] = None
+    kitu: Optional[str] = None
+
+@dataclass
+class ReaggregationMessage(SUZBase):
+    """True API REAGGREGATION_DOCUMENT body."""
+    participant_inn: str
+    reaggregation_type: str
+    uitu: str
+    uit_uitu_list: List[ReaggregationItem] = field(default_factory=list)
+
+@dataclass
 class CisInformationChangeCodeGroup(SUZBase):
     """Группа кодов с одним видом и значением корректировки."""
     code: List[str] = field(default_factory=list)
