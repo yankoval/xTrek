@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from xtrek import utils
+from xtrek.trueapi import HonestSignAPI
 
 
 AGGREGATE = "00000123456789012345"
@@ -168,6 +170,55 @@ def test_reaggregation_removing_final_check_sets_finished(tmp_path):
 
     assert result == {"finished": ["All requested codes are removed"]}
     assert _tags(path) == {"check": "finished"}
+
+
+def test_reaggregation_removing_missing_aggregate_is_not_finished(tmp_path):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    not_found = MagicMock(status_code=404)
+
+    with patch(
+        "xtrek.trueapi.requests.post",
+        side_effect=[not_found, not_found],
+    ):
+        result = utils.check_reaggregation_removing_report(
+            path,
+            api=HonestSignAPI(token="test-token"),
+            config={},
+        )
+
+    assert result == {"aggregatenotfound": [AGGREGATE]}
+    assert _tags(path) == {"check": "aggregatenotfound"}
+
+
+def test_reaggregation_retryable_api_error_preserves_check_tag(tmp_path):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    Path(f"{path}.tags").write_text(
+        json.dumps({"check": ""}),
+        encoding="utf-8",
+    )
+    api = FailingTrueAPI(
+        {
+            AGGREGATE: {
+                "cis": AGGREGATE,
+                "status": "INTRODUCED",
+                "packageType": "BOX",
+                "ownerInn": "7701234567",
+            },
+            CHILD: {
+                "cis": CHILD,
+                "status": "INTRODUCED",
+                "packageType": "UNIT",
+                "ownerInn": "7701234567",
+                "parent": AGGREGATE,
+            },
+        },
+        {},
+    )
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert result == {"api_error": ["503 Service Unavailable"]}
+    assert _tags(path) == {"check": ""}
 
 
 def test_reaggregation_owner_error_uses_existing_error_tag_style(tmp_path):
