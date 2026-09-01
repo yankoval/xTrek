@@ -58,6 +58,23 @@ class TestHonestSignAPI(unittest.TestCase):
         self.assertEqual(len(balances), 1)
         self.assertEqual(balances[0]['balance'], 5000)
 
+    @patch('requests.post')
+    def test_get_aggregated_cis_list(self, mock_post):
+        mock_res = MagicMock()
+        mock_res.status_code = 200
+        mock_res.json.return_value = {"00AGGREGATE": {"01CHILD": []}}
+        mock_post.return_value = mock_res
+
+        result = self.api.get_aggregated_cis_list(["00AGGREGATE"])
+
+        self.assertEqual(result, {"00AGGREGATE": {"01CHILD": []}})
+        mock_post.assert_called_once_with(
+            "https://markirovka.crpt.ru/api/v3/true-api/cises/aggregated/list",
+            json=["00AGGREGATE"],
+            headers=self.api.headers,
+            verify=False,
+        )
+
     @patch('pyperclip.paste')
     def test_get_codes_from_clipboard(self, mock_paste):
         """Тест получения кодов из буфера"""

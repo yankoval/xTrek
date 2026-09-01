@@ -59,6 +59,30 @@ def test_create_disaggregation_from_txt(tmp_path, monkeypatch):
     }
 
 
+def test_create_disaggregation_from_equipment_report_uses_filename_as_task_id(
+    tmp_path,
+    monkeypatch,
+):
+    config = _config(tmp_path)
+    monkeypatch.setattr(workflow, "load_config", lambda name: config)
+    report = tmp_path / "T-000123456789012345-11111111-1111-1111-1111-111111111111.json"
+    report.write_text(json.dumps({
+        "participant_inn": "7701234567",
+        "products_list": [{"uitu": "000123456789012345"}],
+    }))
+
+    task_id = workflow.create_disaggregation_task_from_report(str(report))
+
+    assert task_id == report.stem
+    payload = json.loads(
+        (tmp_path / "disaggregation-tasks" / f"{report.stem}.json").read_text()
+    )
+    assert payload == {
+        "participant_inn": "7701234567",
+        "products_list": [{"uitu": "00000123456789012345"}],
+    }
+
+
 def test_create_reaggregation_removing_normalizes_product_codes(tmp_path, monkeypatch):
     config = _config(tmp_path)
     monkeypatch.setattr(workflow, "load_config", lambda name: config)
@@ -105,6 +129,33 @@ def test_create_reaggregation_removing_nested_kitu(tmp_path, monkeypatch):
         (tmp_path / "reaggregation-tasks" / "REMOVE-BOX.json").read_text()
     )
     assert payload["uit_uitu_list"] == [{"kitu": "00000987654321098765"}]
+
+
+def test_create_reaggregation_removing_from_equipment_report(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    monkeypatch.setattr(workflow, "load_config", lambda name: config)
+    report = tmp_path / "T-KIZ-22222222-2222-2222-2222-222222222222.json"
+    report.write_text(json.dumps({
+        "participant_inn": "7701234567",
+        "reaggregation_type": "REMOVING",
+        "uitu": "000123456789012345",
+        "uit_uitu_list": [
+            {"uit_uitu": "010460000000000021ABC\u001d93CRYPTO"},
+        ],
+    }))
+
+    task_id = workflow.create_reaggregation_removing_task_from_report(str(report))
+
+    assert task_id == report.stem
+    payload = json.loads(
+        (tmp_path / "reaggregation-tasks" / f"{report.stem}.json").read_text()
+    )
+    assert payload == {
+        "participant_inn": "7701234567",
+        "reaggregation_type": "REMOVING",
+        "uitu": "00000123456789012345",
+        "uit_uitu_list": [{"uit_uitu": "010460000000000021ABC"}],
+    }
 
 
 def test_reaggregation_rejects_mixed_fields():
