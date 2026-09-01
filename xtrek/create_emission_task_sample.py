@@ -43,6 +43,12 @@ from .aggregation_builder import (
     normalize_sscc,
 )
 from .SSCC_Utils import get_sscc_from_service
+from .aggregate_operation_reports import (
+    normalize_disaggregation_report,
+    normalize_reaggregation_removing_report,
+    validate_disaggregation_payload,
+    validate_reaggregation_removing_payload,
+)
 
 # ---------------------------------------------------------------------------
 # Изменения 2026-07-09: поддержка linked GTIN и работы через субаккаунты.
@@ -4390,64 +4396,24 @@ def _read_aggregate_codes_source(source_path):
 
 
 def _validate_disaggregation_payload(payload):
-    if not isinstance(payload, dict):
-        raise ValueError("Тело DISAGGREGATION_DOCUMENT должно быть JSON-объектом")
-    _validate_participant_inn(payload.get("participant_inn"))
-    products = payload.get("products_list")
-    if not isinstance(products, list) or not products:
-        raise ValueError("В документе отсутствует массив products_list")
-    codes = []
-    for index, product in enumerate(products, start=1):
-        if not isinstance(product, dict) or set(product) != {"uitu"}:
-            raise ValueError(f"products_list[{index}] должен содержать только поле uitu")
-        codes.append(product.get("uitu"))
-    clean_codes = _validate_aggregate_codes(codes, "products_list")
-    for index, code in enumerate(clean_codes, start=1):
-        if _normalize_kitu(code, f"products_list[{index}].uitu") != code:
-            raise ValueError(
-                f"products_list[{index}].uitu должен быть записан с префиксом AI 00"
-            )
-    return payload
+    return validate_disaggregation_payload(payload)
 
 
 def _validate_reaggregation_removing_payload(payload):
-    if not isinstance(payload, dict):
-        raise ValueError("Тело REAGGREGATION_DOCUMENT должно быть JSON-объектом")
-    _validate_participant_inn(payload.get("participant_inn"))
-    if payload.get("reaggregation_type") != "REMOVING":
-        raise ValueError("Поддерживается только reaggregation_type=REMOVING")
-    target = _validate_aggregate_codes([payload.get("uitu")], "uitu")[0]
-    if _normalize_kitu(target, "uitu") != target:
-        raise ValueError("uitu должен быть записан с префиксом AI 00")
-    items = payload.get("uit_uitu_list")
-    if not isinstance(items, list) or not items:
-        raise ValueError("В документе отсутствует массив uit_uitu_list")
+    return validate_reaggregation_removing_payload(payload)
 
-    fields = []
-    codes = []
-    for index, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"uit_uitu_list[{index}] должен быть объектом")
-        present = [field for field in ("uit_uitu", "kitu") if item.get(field)]
-        if len(present) != 1 or set(item) != {present[0]}:
-            raise ValueError(
-                f"uit_uitu_list[{index}] должен содержать ровно одно поле: "
-                "uit_uitu или kitu"
-            )
-        fields.append(present[0])
-        codes.append(item[present[0]])
-    if len(set(fields)) != 1:
-        raise ValueError("Нельзя смешивать uit_uitu и kitu в одном документе")
-    clean_codes = _validate_aggregate_codes(codes, "uit_uitu_list")
-    if fields[0] == "kitu":
-        for index, code in enumerate(clean_codes, start=1):
-            if _normalize_kitu(code, f"uit_uitu_list[{index}].kitu") != code:
-                raise ValueError(
-                    f"uit_uitu_list[{index}].kitu должен быть записан с префиксом AI 00"
-                )
-    if target in clean_codes:
-        raise ValueError("Код трансформируемого агрегата нельзя изъять из самого себя")
-    return fields[0]
+
+def _read_aggregate_operation_report(report_path):
+    if not report_path:
+        raise ValueError("Путь к отчету оборудования обязателен")
+    config = load_config("suz_worker_config")
+    storage = get_storage(report_path, config.get("s3_config"))
+    if not storage.exists(report_path):
+        raise FileNotFoundError(f"Отчет оборудования не найден: {report_path}")
+    try:
+        return json.loads(storage.read_text(report_path))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Отчет оборудования содержит некорректный JSON: {error}") from error
 
 
 def _write_aggregate_operation_task(operation, task_id, payload):
@@ -4494,6 +4460,22 @@ def create_disaggregation_task(source_path, participant_inn, task_id=None):
     return result
 
 
+def create_disaggregation_task_from_report(report_path, task_id=None):
+    """Create a disaggregation task from a local or S3 equipment report."""
+    payload = normalize_disaggregation_report(
+        _read_aggregate_operation_report(report_path)
+    )
+    task_id = task_id or Path(str(report_path)).stem
+    result = _write_aggregate_operation_task("disaggregation", task_id, payload)
+    logger.info(
+        "[+] Создано расформирование %s из отчета %s: агрегатов=%s",
+        result,
+        report_path,
+        len(payload["products_list"]),
+    )
+    return result
+
+
 def create_reaggregation_removing_task(
     aggregate_code,
     source_path,
@@ -4535,6 +4517,24 @@ def create_reaggregation_removing_task(
         result,
         aggregate_code,
         len(removed_codes),
+        code_field,
+    )
+    return result
+
+
+def create_reaggregation_removing_task_from_report(report_path, task_id=None):
+    """Create a REMOVING task from a local or S3 equipment report."""
+    payload, code_field = normalize_reaggregation_removing_report(
+        _read_aggregate_operation_report(report_path)
+    )
+    task_id = task_id or Path(str(report_path)).stem
+    result = _write_aggregate_operation_task("reaggregation", task_id, payload)
+    logger.info(
+        "[+] Создано изъятие %s из отчета %s: агрегат=%s, кодов=%s, поле=%s",
+        result,
+        report_path,
+        payload["uitu"],
+        len(payload["uit_uitu_list"]),
         code_field,
     )
     return result

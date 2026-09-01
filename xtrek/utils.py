@@ -17,6 +17,10 @@ from .aggregation_builder import (
     iter_equipment_report_boxes,
     iter_equipment_report_pallets,
 )
+from .aggregate_operation_reports import (
+    normalize_disaggregation_report,
+    normalize_reaggregation_removing_report,
+)
 
 # Setup logging
 logger = logging.getLogger("xtrek.utils")
@@ -233,6 +237,250 @@ class AggregationAnalyzer:
 
         return result
 
+
+DISAGGREGATION_FINAL_STATUSES = {"DISAGGREGATION", "DISAGGREGATED"}
+AGGREGATE_OPERATION_ACTIVE_STATUSES = {"APPLIED", "INTRODUCED"}
+
+
+class AggregateOperationAnalyzer:
+    """Validate disaggregation and REMOVING reports against current True API state."""
+
+    def __init__(self, api: HonestSignAPI, config: Optional[Dict] = None):
+        self.api = api
+        self.config = config or {}
+
+    def _check_statuses(self, codes: List[str]):
+        results = []
+        for index in range(0, len(codes), 1000):
+            batch = codes[index:index + 1000]
+            try:
+                batch_results = self.api.get_list_cis_info(batch)
+            except Exception as error:
+                return {"error": str(error)}
+            if not isinstance(batch_results, list):
+                return batch_results
+            results.extend(batch_results)
+        return results
+
+    def _check_composition(self, codes: List[str]):
+        result = {}
+        for index in range(0, len(codes), 1000):
+            batch = codes[index:index + 1000]
+            try:
+                batch_result = self.api.get_aggregated_cis_list(batch)
+            except Exception as error:
+                return {"error": str(error)}
+            if not isinstance(batch_result, dict) or "error" in batch_result:
+                return batch_result
+            result.update(batch_result)
+        return result
+
+    @staticmethod
+    def _status_map(status_results):
+        status_map = {}
+        for item in status_results:
+            if not isinstance(item, dict):
+                continue
+            info = item.get("cisInfo") or {}
+            requested_code = item.get("requestedCis")
+            code = info.get("cis") or requested_code
+            if code:
+                status_map[code] = info
+                if requested_code:
+                    status_map[requested_code] = info
+        return status_map
+
+    @staticmethod
+    def _direct_children(composition, aggregate_code):
+        value = composition.get(aggregate_code)
+        if isinstance(value, dict):
+            return set(value)
+        if isinstance(value, list):
+            return set(value)
+        return set()
+
+    @staticmethod
+    def _set_check(storage, path, result):
+        if result and "api_error" in result:
+            return
+        try:
+            current_check = storage.get_tags(path).get("check")
+            if current_check == "finished" and not (
+                result and set(result) == {"finished"}
+            ):
+                logger.info("Тег check=finished для %s сохранен", path)
+                return
+            tag_value = "-".join(sorted(result)) if result else ""
+            storage.set_tags(path, {"check": tag_value})
+        except Exception as error:
+            logger.error("Не удалось установить тег check для %s: %s", path, error)
+
+    def _read_report(self, path, normalizer):
+        storage = get_storage(path, self.config.get("s3_config"))
+        try:
+            data = json.loads(storage.read_text(path))
+        except Exception as error:
+            logger.error("Ошибка чтения отчета %s: %s", path, error)
+            result = {"filereaderror": [str(error)]}
+            self._set_check(storage, path, result)
+            return storage, None, result
+        try:
+            normalized = normalizer(data)
+            return storage, normalized, None
+        except Exception as error:
+            logger.error("Некорректный отчет %s: %s", path, error)
+            result = {"invalidreport": [str(error)]}
+            self._set_check(storage, path, result)
+            return storage, None, result
+
+    def check_disaggregation_report(self, path: str):
+        storage, payload, error = self._read_report(
+            path,
+            normalize_disaggregation_report,
+        )
+        if error:
+            return error
+
+        aggregate_codes = [item["uitu"] for item in payload["products_list"]]
+        status_results = self._check_statuses(aggregate_codes)
+        if isinstance(status_results, dict):
+            message = status_results.get("error") or str(status_results)
+            logger.error("Ошибка True API при проверке %s: %s", path, message)
+            return {"api_error": [message]}
+        composition = self._check_composition(aggregate_codes)
+        if not isinstance(composition, dict) or "error" in composition:
+            message = composition.get("error") if isinstance(composition, dict) else str(composition)
+            logger.error("Ошибка True API при проверке %s: %s", path, message)
+            return {"api_error": [message]}
+
+        status_map = self._status_map(status_results)
+        final_codes = {
+            code
+            for code in aggregate_codes
+            if (status_map.get(code) or {}).get("status")
+            in DISAGGREGATION_FINAL_STATUSES
+        }
+        if len(final_codes) == len(aggregate_codes):
+            result = {"finished": ["All aggregates are disaggregated"]}
+            self._set_check(storage, path, result)
+            return result
+        if final_codes:
+            result = {"partialdisaggregation": sorted(final_codes)}
+            self._set_check(storage, path, result)
+            return result
+
+        errors = defaultdict(list)
+        for code in aggregate_codes:
+            info = status_map.get(code) or {}
+            status = info.get("status")
+            package_type = info.get("packageType")
+            if not status or status == "NOT_FOUND":
+                errors["aggregatenotfound"].append(code)
+                continue
+            if package_type not in {"BOX", "SET", "GROUP"}:
+                errors["wrongpackagetype"].append(
+                    f"{code} (Тип: {package_type or 'Не указан'})"
+                )
+            if status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
+                errors["wrongstatus"].append(f"{code} (Статус: {status})")
+            if not self._direct_children(composition, code):
+                errors["emptyaggregate"].append(code)
+
+        result = dict(errors) if errors else None
+        self._set_check(storage, path, result)
+        return result
+
+    def check_reaggregation_removing_report(self, path: str):
+        storage, normalized, error = self._read_report(
+            path,
+            normalize_reaggregation_removing_report,
+        )
+        if error:
+            return error
+        payload, code_field = normalized
+        aggregate_code = payload["uitu"]
+        removed_codes = [item[code_field] for item in payload["uit_uitu_list"]]
+        all_codes = [aggregate_code] + removed_codes
+
+        status_results = self._check_statuses(all_codes)
+        if isinstance(status_results, dict):
+            message = status_results.get("error") or str(status_results)
+            logger.error("Ошибка True API при проверке %s: %s", path, message)
+            return {"api_error": [message]}
+        composition = self._check_composition([aggregate_code])
+        if not isinstance(composition, dict) or "error" in composition:
+            message = composition.get("error") if isinstance(composition, dict) else str(composition)
+            logger.error("Ошибка True API при проверке %s: %s", path, message)
+            return {"api_error": [message]}
+
+        status_map = self._status_map(status_results)
+        direct_children = self._direct_children(composition, aggregate_code)
+        present_codes = set(removed_codes) & direct_children
+        if not present_codes:
+            result = {"finished": ["All requested codes are removed"]}
+            self._set_check(storage, path, result)
+            return result
+        if len(present_codes) != len(removed_codes):
+            result = {"partialremoving": sorted(set(removed_codes) - present_codes)}
+            self._set_check(storage, path, result)
+            return result
+
+        errors = defaultdict(list)
+        participant_inn = payload["participant_inn"]
+        target_info = status_map.get(aggregate_code) or {}
+        target_status = target_info.get("status")
+        if not target_status or target_status == "NOT_FOUND":
+            errors["aggregatenotfound"].append(aggregate_code)
+        else:
+            if target_info.get("packageType") not in {"BOX", "SET"}:
+                errors["wrongpackagetype"].append(
+                    f"{aggregate_code} (Тип: {target_info.get('packageType') or 'Не указан'})"
+                )
+            if target_status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
+                errors["wrongstatus"].append(
+                    f"{aggregate_code} (Статус: {target_status})"
+                )
+
+        allowed_child_types = (
+            {"BOX"} if code_field == "kitu" else {"UNIT", "GROUP", "BUNDLE", "SET"}
+        )
+        for code in removed_codes:
+            info = status_map.get(code) or {}
+            status = info.get("status")
+            owner_inn = info.get("ownerInn")
+            if not status or status == "NOT_FOUND":
+                errors["codenotfound"].append(code)
+                continue
+            if info.get("packageType") not in allowed_child_types:
+                errors["wrongpackagetype"].append(
+                    f"{code} (Тип: {info.get('packageType') or 'Не указан'})"
+                )
+            if status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
+                errors["wrongstatus"].append(f"{code} (Статус: {status})")
+            if target_status and status != target_status:
+                errors["statusmismatch"].append(
+                    f"{code} ({status}) != {aggregate_code} ({target_status})"
+                )
+            if owner_inn and owner_inn != participant_inn:
+                errors["wrongowner"].append(
+                    f"{code} (Владелец: {owner_inn})"
+                )
+            parent = info.get("parent")
+            if parent and parent != aggregate_code:
+                errors["wrongparent"].append(
+                    f"{code} (Родитель: {parent})"
+                )
+
+        target_owner = target_info.get("ownerInn")
+        if target_owner and target_owner != participant_inn:
+            errors["wrongowner"].append(
+                f"{aggregate_code} (Владелец: {target_owner})"
+            )
+
+        result = dict(errors) if errors else None
+        self._set_check(storage, path, result)
+        return result
+
 # Глобальный кеш для ресурсов
 _RESOURCES_CACHE = {
     'config': None,
@@ -327,11 +575,104 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
 
     return resolved_path, api, nk, config
 
+
+def _resolve_aggregate_operation_report_path(path: str, config: Dict, path_key: str):
+    if (
+        not path.startswith("s3://")
+        and not path.lower().endswith(".json")
+        and "/" not in path
+        and "\\" not in path
+    ):
+        reports_path = config.get(path_key)
+        if reports_path:
+            if reports_path.startswith("s3://"):
+                return f"{reports_path.rstrip('/')}/{path}.json"
+            bucket = config.get("s3_config", {}).get("bucket")
+            if bucket:
+                return f"s3://{bucket}/{reports_path.strip('/')}/{path}.json"
+    return path
+
+
+def _ensure_aggregate_operation_api(
+    path: str,
+    path_key: str,
+    api: Optional[HonestSignAPI] = None,
+    config: Optional[Dict] = None,
+):
+    if config is None:
+        if _RESOURCES_CACHE["config"] is None:
+            _RESOURCES_CACHE["config"] = load_config("suz_worker_config")
+        config = _RESOURCES_CACHE["config"]
+    resolved_path = _resolve_aggregate_operation_report_path(path, config, path_key)
+    if api:
+        return resolved_path, api, config
+
+    token = os.getenv("TRUE_API_TOKEN") or _RESOURCES_CACHE["last_token"]
+    participant_inn = None
+    if not token:
+        storage = get_storage(resolved_path, config.get("s3_config"))
+        data = json.loads(storage.read_text(resolved_path))
+        participant_inn = data.get("participant_inn") if isinstance(data, dict) else None
+        if participant_inn:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            processor = TokenProcessor(orgs_dir=os.path.join(base_path, "my_orgs"))
+            token_data = processor.get_token_by_inn(str(participant_inn))
+            if token_data:
+                token = token_data.get("Токен")
+                _RESOURCES_CACHE["last_token"] = token
+    if not token:
+        raise ValueError(
+            f"Не удалось определить True API токен для {resolved_path}"
+            + (f" и ИНН {participant_inn}" if participant_inn else "")
+        )
+
+    if token not in _RESOURCES_CACHE["api"]:
+        _RESOURCES_CACHE["api"][token] = HonestSignAPI(
+            token=token,
+            host=config.get("true_api_host"),
+        )
+    return resolved_path, _RESOURCES_CACHE["api"][token], config
+
 def check_aggregation_report(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
     """Функция для проверки одного отчета об агрегации."""
     resolved_path, api, nk, config = _ensure_resources(path, api, nk, config)
     analyzer = AggregationAnalyzer(api, nk, config)
     return analyzer.check_report(resolved_path)
+
+
+def check_disaggregation_report(
+    path: str,
+    api: Optional[HonestSignAPI] = None,
+    config: Optional[Dict] = None,
+) -> Optional[Dict[str, List[str]]]:
+    """Check one equipment report for a DISAGGREGATION_DOCUMENT task."""
+    resolved_path, api, config = _ensure_aggregate_operation_api(
+        path,
+        "equipment-reports-disaggregation",
+        api,
+        config,
+    )
+    return AggregateOperationAnalyzer(api, config).check_disaggregation_report(
+        resolved_path
+    )
+
+
+def check_reaggregation_removing_report(
+    path: str,
+    api: Optional[HonestSignAPI] = None,
+    config: Optional[Dict] = None,
+) -> Optional[Dict[str, List[str]]]:
+    """Check one equipment report for a REAGGREGATION REMOVING task."""
+    resolved_path, api, config = _ensure_aggregate_operation_api(
+        path,
+        "equipment-reports-reaggregation-removing",
+        api,
+        config,
+    )
+    return AggregateOperationAnalyzer(
+        api,
+        config,
+    ).check_reaggregation_removing_report(resolved_path)
 
 def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Optional[str]:
     """
@@ -507,6 +848,54 @@ def check_aggregation_reports(paths: List[str], api: Optional[HonestSignAPI] = N
         except Exception as e:
             logger.error(f"Ошибка при проверке {path}: {e}")
             results[path] = {'error': [str(e)]}
+    return results
+
+
+def check_disaggregation_reports(
+    paths: List[str],
+    api: Optional[HonestSignAPI] = None,
+    config: Optional[Dict] = None,
+) -> Dict[str, Optional[Dict[str, List[str]]]]:
+    results = {}
+    for path in paths:
+        try:
+            resolved_path, current_api, current_config = _ensure_aggregate_operation_api(
+                path,
+                "equipment-reports-disaggregation",
+                api,
+                config,
+            )
+            results[resolved_path] = AggregateOperationAnalyzer(
+                current_api,
+                current_config,
+            ).check_disaggregation_report(resolved_path)
+        except Exception as error:
+            logger.error("Ошибка при проверке %s: %s", path, error)
+            results[path] = {"error": [str(error)]}
+    return results
+
+
+def check_reaggregation_removing_reports(
+    paths: List[str],
+    api: Optional[HonestSignAPI] = None,
+    config: Optional[Dict] = None,
+) -> Dict[str, Optional[Dict[str, List[str]]]]:
+    results = {}
+    for path in paths:
+        try:
+            resolved_path, current_api, current_config = _ensure_aggregate_operation_api(
+                path,
+                "equipment-reports-reaggregation-removing",
+                api,
+                config,
+            )
+            results[resolved_path] = AggregateOperationAnalyzer(
+                current_api,
+                current_config,
+            ).check_reaggregation_removing_report(resolved_path)
+        except Exception as error:
+            logger.error("Ошибка при проверке %s: %s", path, error)
+            results[path] = {"error": [str(error)]}
     return results
 
 def resolve_file_path(path: str, config: Dict) -> str:

@@ -114,6 +114,37 @@ class HonestSignAPI:
             logger.warning(f"Ошибка при запросе информации о {len(code)} кодах: {e}")
             return {"code": code, "error": str(e)}
 
+    def get_aggregated_cis_list(self, codes: List[str]) -> Dict[str, Any]:
+        """Return first-level children for up to 1000 aggregate codes."""
+        url = f"{self.host}/api/v3/true-api/cises/aggregated/list"
+        try:
+            logger.debug("get_aggregated_cis_list codes:%s", codes)
+            response = requests.post(
+                url,
+                json=codes,
+                headers=self.headers,
+                verify=False,
+            )
+            logger.debug(
+                "RAW POST | Status: %s | Body: %s",
+                response.status_code,
+                response.text,
+            )
+            if response.status_code == 404:
+                return {}
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("True API вернул некорректный состав агрегатов")
+            return result
+        except Exception as e:
+            logger.warning(
+                "Ошибка при запросе состава %s агрегатов: %s",
+                len(codes),
+                e,
+            )
+            return {"error": str(e)}
+
     def documents_create(self, wrapped_document_json: str, pg: str) -> Dict[str, Any]:
         """
         Отправка отчета в ЛК ЧЗ (Метод /api/v3/true-api/lk/documents/create)
