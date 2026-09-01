@@ -17,7 +17,9 @@ from .suz_api_models import (
     UtilisationReport, UtilisationReportReceipt, UtilisationReportStatus,
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
     EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument,
-    CisInformationChangeCodeGroup, CisInformationChangeMessage
+    CisInformationChangeCodeGroup, CisInformationChangeMessage,
+    DisaggregationProduct, DisaggregationMessage,
+    ReaggregationItem, ReaggregationMessage,
 )
 from .kiz_from_rep import extract_and_flatten
 from .suz import SUZ
@@ -4217,6 +4219,561 @@ def update_introduce_status(order_id: str, group: str):
         return str(e)
 
 
+# --- Расформирование и изъятие из агрегата (True API) ---
+
+AGGREGATE_OPERATION_MAX_CODES = 30000
+ALLOWED_TRUE_API_HOSTS = {
+    "https://markirovka.crpt.ru",
+    "https://markirovka.sandbox.crptech.ru",
+}
+AGGREGATE_OPERATION_SPECS = {
+    "disaggregation": {
+        "document_type": "DISAGGREGATION_DOCUMENT",
+        "task_keys": ("disaggregation-tasks", "disaggregation_tasks"),
+        "receipt_keys": ("disaggregation-receipts", "disaggregation_receipts"),
+        "status_keys": ("disaggregations", "disaggregation-statuses", "disaggregation_statuses"),
+        "fallback_leaves": (
+            "disaggregationTasks",
+            "disaggregationReceipts",
+            "disaggregations",
+        ),
+    },
+    "reaggregation": {
+        "document_type": "REAGGREGATION_DOCUMENT",
+        "task_keys": ("reaggregation-tasks", "reaggregation_tasks"),
+        "receipt_keys": ("reaggregation-receipts", "reaggregation_receipts"),
+        "status_keys": ("reaggregations", "reaggregation-statuses", "reaggregation_statuses"),
+        "fallback_leaves": (
+            "reaggregationTasks",
+            "reaggregationReceipts",
+            "reaggregations",
+        ),
+    },
+}
+
+
+def _first_config_value(config, keys):
+    for key in keys:
+        value = config.get(key)
+        if value:
+            return value
+    return None
+
+
+def _sibling_storage_path(base_path, leaf):
+    if not base_path:
+        return None
+    clean_path = str(base_path).rstrip("/")
+    parent, separator, _ = clean_path.rpartition("/")
+    if not separator:
+        return leaf
+    return f"{parent}/{leaf}"
+
+
+def _aggregate_operation_paths(config, operation):
+    """Return task, receipt and status paths with backwards-compatible fallbacks."""
+    spec = AGGREGATE_OPERATION_SPECS[operation]
+    explicit = (
+        _first_config_value(config, spec["task_keys"]),
+        _first_config_value(config, spec["receipt_keys"]),
+        _first_config_value(config, spec["status_keys"]),
+    )
+    fallback_bases = (
+        config.get("agg-tasks"),
+        config.get("agg-receipts"),
+        config.get("aggs"),
+    )
+    return tuple(
+        value or _sibling_storage_path(base, leaf)
+        for value, base, leaf in zip(
+            explicit,
+            fallback_bases,
+            spec["fallback_leaves"],
+        )
+    )
+
+
+def _validate_aggregate_operation_task_id(task_id):
+    task_id = str(task_id or "").strip()
+    if not task_id or task_id in {".", ".."} or "/" in task_id or "\\" in task_id:
+        raise ValueError("ID задачи не должен быть пустым или содержать разделители пути")
+    return task_id
+
+
+def _validate_participant_inn(participant_inn):
+    participant_inn = str(participant_inn or "").strip()
+    if not participant_inn.isdigit() or len(participant_inn) not in (10, 12):
+        raise ValueError("ИНН участника должен содержать 10 или 12 цифр")
+    return participant_inn
+
+
+def _normalize_kitu(code, field_name="КИТУ"):
+    """Return the GS1 AI 00 representation required by True API documents."""
+    clean_code = str(code or "").strip()
+    if len(clean_code) == 18 and clean_code.isdigit():
+        return f"00{clean_code}"
+    if len(clean_code) == 20 and clean_code.startswith("00") and clean_code.isdigit():
+        return clean_code
+    raise ValueError(
+        f"{field_name} должен содержать 18 цифр SSCC или 20 цифр с префиксом AI 00"
+    )
+
+
+def _validate_aggregate_codes(codes, field_name="codes", allow_group_separator=False):
+    if isinstance(codes, (str, bytes)) or not isinstance(codes, (list, tuple)):
+        raise ValueError(f"{field_name} должен быть списком кодов")
+    if not codes:
+        raise ValueError(f"{field_name} не содержит кодов")
+    if len(codes) > AGGREGATE_OPERATION_MAX_CODES:
+        raise ValueError(
+            f"Количество кодов {len(codes)} превышает лимит "
+            f"{AGGREGATE_OPERATION_MAX_CODES}"
+        )
+
+    clean_codes = []
+    seen = set()
+    for index, code in enumerate(codes, start=1):
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError(f"Пустой или некорректный код в позиции {index}")
+        clean_code = code.strip()
+        if any(
+            character.isspace()
+            and not (allow_group_separator and character == "\u001d")
+            for character in clean_code
+        ):
+            raise ValueError(f"Код в позиции {index} содержит пробельные символы")
+        if clean_code in seen:
+            raise ValueError(f"Коды должны быть уникальны: {clean_code}")
+        seen.add(clean_code)
+        clean_codes.append(clean_code)
+    return clean_codes
+
+
+def _read_aggregate_codes_source(source_path):
+    """Read aggregate or child codes from a local/S3 JSON or LF-delimited TXT file."""
+    if not source_path:
+        raise ValueError("Путь к источнику кодов обязателен")
+
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    storage = get_storage(source_path, s3_config)
+    if not storage.exists(source_path):
+        raise FileNotFoundError(f"Источник кодов не найден: {source_path}")
+    content = storage.read_text(source_path)
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return _validate_aggregate_codes(
+            [line.rstrip("\r") for line in content.split("\n") if line.rstrip("\r")],
+            allow_group_separator=True,
+        )
+
+    if isinstance(data, list):
+        codes = data
+    elif isinstance(data, dict) and isinstance(data.get("codes"), list):
+        codes = data["codes"]
+    elif isinstance(data, dict) and isinstance(data.get("uitus"), list):
+        codes = data["uitus"]
+    elif isinstance(data, dict) and isinstance(data.get("products_list"), list):
+        codes = [
+            item.get("uitu")
+            for item in data["products_list"]
+            if isinstance(item, dict) and item.get("uitu")
+        ]
+    else:
+        raise ValueError(
+            "Неподдерживаемый источник. Ожидается JSON-массив, объект с "
+            "codes/uitus/products_list или TXT с одним кодом в строке"
+        )
+    return _validate_aggregate_codes(codes, allow_group_separator=True)
+
+
+def _validate_disaggregation_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Тело DISAGGREGATION_DOCUMENT должно быть JSON-объектом")
+    _validate_participant_inn(payload.get("participant_inn"))
+    products = payload.get("products_list")
+    if not isinstance(products, list) or not products:
+        raise ValueError("В документе отсутствует массив products_list")
+    codes = []
+    for index, product in enumerate(products, start=1):
+        if not isinstance(product, dict) or set(product) != {"uitu"}:
+            raise ValueError(f"products_list[{index}] должен содержать только поле uitu")
+        codes.append(product.get("uitu"))
+    clean_codes = _validate_aggregate_codes(codes, "products_list")
+    for index, code in enumerate(clean_codes, start=1):
+        if _normalize_kitu(code, f"products_list[{index}].uitu") != code:
+            raise ValueError(
+                f"products_list[{index}].uitu должен быть записан с префиксом AI 00"
+            )
+    return payload
+
+
+def _validate_reaggregation_removing_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Тело REAGGREGATION_DOCUMENT должно быть JSON-объектом")
+    _validate_participant_inn(payload.get("participant_inn"))
+    if payload.get("reaggregation_type") != "REMOVING":
+        raise ValueError("Поддерживается только reaggregation_type=REMOVING")
+    target = _validate_aggregate_codes([payload.get("uitu")], "uitu")[0]
+    if _normalize_kitu(target, "uitu") != target:
+        raise ValueError("uitu должен быть записан с префиксом AI 00")
+    items = payload.get("uit_uitu_list")
+    if not isinstance(items, list) or not items:
+        raise ValueError("В документе отсутствует массив uit_uitu_list")
+
+    fields = []
+    codes = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"uit_uitu_list[{index}] должен быть объектом")
+        present = [field for field in ("uit_uitu", "kitu") if item.get(field)]
+        if len(present) != 1 or set(item) != {present[0]}:
+            raise ValueError(
+                f"uit_uitu_list[{index}] должен содержать ровно одно поле: "
+                "uit_uitu или kitu"
+            )
+        fields.append(present[0])
+        codes.append(item[present[0]])
+    if len(set(fields)) != 1:
+        raise ValueError("Нельзя смешивать uit_uitu и kitu в одном документе")
+    clean_codes = _validate_aggregate_codes(codes, "uit_uitu_list")
+    if fields[0] == "kitu":
+        for index, code in enumerate(clean_codes, start=1):
+            if _normalize_kitu(code, f"uit_uitu_list[{index}].kitu") != code:
+                raise ValueError(
+                    f"uit_uitu_list[{index}].kitu должен быть записан с префиксом AI 00"
+                )
+    if target in clean_codes:
+        raise ValueError("Код трансформируемого агрегата нельзя изъять из самого себя")
+    return fields[0]
+
+
+def _write_aggregate_operation_task(operation, task_id, payload):
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    tasks_path, _, _ = _aggregate_operation_paths(config, operation)
+    if not tasks_path:
+        raise RuntimeError(f"[!] Не настроено хранилище задач {operation}")
+
+    task_id = _validate_aggregate_operation_task_id(task_id)
+    storage = get_storage(tasks_path, s3_config)
+    task_path = f"{tasks_path.rstrip('/')}/{task_id}.json"
+    if storage.exists(task_path):
+        existing = json.loads(storage.read_text(task_path))
+        if existing == payload:
+            logger.info("[IDEMPOTENCY] Задача %s уже существует", task_id)
+            return task_id
+        raise RuntimeError(f"[!] Задача {task_id} уже существует с другим содержимым")
+    storage.write_text(
+        task_path,
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+    )
+    return task_id
+
+
+def create_disaggregation_task(source_path, participant_inn, task_id=None):
+    participant_inn = _validate_participant_inn(participant_inn)
+    aggregate_codes = [
+        _normalize_kitu(code, "products_list.uitu")
+        for code in _validate_aggregate_codes(
+            _read_aggregate_codes_source(source_path),
+            "products_list",
+        )
+    ]
+    task_id = task_id or f"{Path(str(source_path)).stem}-disaggregation"
+    message = DisaggregationMessage(
+        participant_inn=participant_inn,
+        products_list=[DisaggregationProduct(uitu=code) for code in aggregate_codes],
+    )
+    payload = message.to_dict()
+    _validate_disaggregation_payload(payload)
+    result = _write_aggregate_operation_task("disaggregation", task_id, payload)
+    logger.info("[+] Создано расформирование %s: агрегатов=%s", result, len(aggregate_codes))
+    return result
+
+
+def create_reaggregation_removing_task(
+    aggregate_code,
+    source_path,
+    participant_inn,
+    code_field="uit_uitu",
+    task_id=None,
+):
+    participant_inn = _validate_participant_inn(participant_inn)
+    aggregate_code = _normalize_kitu(
+        _validate_aggregate_codes([aggregate_code], "uitu")[0],
+        "uitu",
+    )
+    if code_field not in {"uit_uitu", "kitu"}:
+        raise ValueError("Тип изымаемого кода должен быть uit_uitu или kitu")
+    removed_codes = _read_aggregate_codes_source(source_path)
+    if code_field == "uit_uitu":
+        removed_codes = [cut_crypto_tail(code) for code in removed_codes]
+        removed_codes = _validate_aggregate_codes(removed_codes, "uit_uitu_list")
+    else:
+        removed_codes = [
+            _normalize_kitu(code, "uit_uitu_list.kitu") for code in removed_codes
+        ]
+
+    source_stem = Path(str(source_path)).stem
+    target_suffix = "".join(character for character in aggregate_code if character.isalnum())[-12:]
+    task_id = task_id or f"{source_stem}-remove-{target_suffix}"
+    items = [ReaggregationItem(**{code_field: code}) for code in removed_codes]
+    message = ReaggregationMessage(
+        participant_inn=participant_inn,
+        reaggregation_type="REMOVING",
+        uitu=aggregate_code,
+        uit_uitu_list=items,
+    )
+    payload = message.to_dict()
+    _validate_reaggregation_removing_payload(payload)
+    result = _write_aggregate_operation_task("reaggregation", task_id, payload)
+    logger.info(
+        "[+] Создано изъятие %s: агрегат=%s, кодов=%s, поле=%s",
+        result,
+        aggregate_code,
+        len(removed_codes),
+        code_field,
+    )
+    return result
+
+
+def _resolve_true_api_host(config, receipt=None):
+    receipt = receipt or {}
+    host = (
+        receipt.get("apiHost")
+        or os.getenv("TRUE_API_HOST")
+        or config.get("TRUE_API_HOST")
+        or config.get("true_api_host")
+        or "https://markirovka.crpt.ru"
+    ).rstrip("/")
+    if host not in ALLOWED_TRUE_API_HOSTS:
+        raise ValueError(
+            "Недопустимый True API host. Разрешены только промышленный "
+            "и официальный демонстрационный контуры Честного ЗНАКа"
+        )
+    return host
+
+
+def _aggregate_operation_validator(operation):
+    if operation == "disaggregation":
+        return _validate_disaggregation_payload
+    if operation == "reaggregation":
+        return _validate_reaggregation_removing_payload
+    raise ValueError(f"Неизвестная операция: {operation}")
+
+
+def _sign_and_send_aggregate_operation(
+    operation,
+    task_id,
+    group,
+    signing_dir,
+    timeout,
+    refresh_token=False,
+):
+    spec = AGGREGATE_OPERATION_SPECS[operation]
+    submission_storage = None
+    submission_lock_path = None
+    submission_ambiguous = False
+    accepted_not_persisted = False
+    try:
+        config = load_config("suz_worker_config")
+        s3_config = config.get("s3_config")
+        tasks_path, receipts_path, _ = _aggregate_operation_paths(config, operation)
+        signing_dir = config.get("sign") or signing_dir
+        timeout = config.get("SIGNING_TIMEOUT", timeout)
+        if not tasks_path or not receipts_path:
+            raise RuntimeError(f"[!] Не настроены хранилища задач/чеков {operation}")
+
+        task_id = _validate_aggregate_operation_task_id(task_id)
+        (
+            existing_receipt,
+            submission_storage,
+            receipt_path,
+            submission_lock_path,
+        ) = _claim_document_submission(receipts_path, s3_config, operation, task_id)
+        if existing_receipt is not None:
+            return existing_receipt
+
+        task_storage = get_storage(tasks_path, s3_config)
+        task_path = f"{tasks_path.rstrip('/')}/{task_id}.json"
+        if not task_storage.exists(task_path):
+            raise FileNotFoundError(f"Задача не найдена: {task_path}")
+        task_content = task_storage.read_text(task_path)
+        task_data = json.loads(task_content)
+        _aggregate_operation_validator(operation)(task_data)
+        participant_inn = str(task_data["participant_inn"])
+
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
+        token_processor = TokenProcessor(org_manager=org_manager)
+        if refresh_token:
+            token_processor.refresh_from_source()
+        token = token_processor.get_token_value_by_inn(participant_inn, token_type="JWT")
+        if not token:
+            raise RuntimeError(f"[!] JWT токен для ИНН {participant_inn} не найден")
+
+        signing_storage = get_storage(signing_dir, s3_config)
+        unique_id = uuid.uuid4()
+        body_filename = f"{participant_inn}_{unique_id}_{operation}.json"
+        signature_filename = f"{body_filename}.sig"
+        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
+        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
+        local_dir = Path("temp_signing")
+        local_dir.mkdir(exist_ok=True)
+        local_body_path = local_dir / body_filename
+        local_signature_path = local_dir / signature_filename
+
+        try:
+            signing_storage.write_text(remote_body_path, task_content)
+            body_bytes = task_content.encode("utf-8")
+            with open(local_body_path, "wb") as body_file:
+                body_file.write(body_bytes)
+
+            logger.info("[*] Ожидание подписи для %s...", remote_body_path)
+            started_at = time.time()
+            while not signing_storage.exists(remote_signature_path):
+                if time.time() - started_at > timeout:
+                    raise RuntimeError("[!] Таймаут ожидания подписи")
+                time.sleep(2)
+
+            signing_storage.download(remote_signature_path, str(local_signature_path))
+            with open(local_signature_path, "r", encoding="utf-8") as signature_file:
+                signature_base64 = signature_file.read().strip()
+
+            wrapper = DocumentWrapper(
+                document_format="MANUAL",
+                product_document=base64.b64encode(body_bytes).decode("utf-8"),
+                type=spec["document_type"],
+                signature=signature_base64,
+            )
+            api_host = _resolve_true_api_host(config)
+            api = HonestSignAPI(token=token, host=api_host)
+            submission_ambiguous = True
+            result = api.documents_create(wrapper.to_json(), pg=group)
+            submission_ambiguous = False
+            if not result or (isinstance(result, dict) and result.get("error")):
+                raise RuntimeError(f"[!] Ошибка отправки {operation}: {result}")
+
+            accepted_not_persisted = True
+            if isinstance(result, str):
+                result = {"document_id": result}
+            elif isinstance(result, dict) and result.get("id") and not result.get("document_id"):
+                result["document_id"] = result["id"]
+            if not isinstance(result, dict) or not result.get("document_id"):
+                raise RuntimeError(f"[!] True API не вернул document_id: {result}")
+            result["taskId"] = task_id
+            result["productGroup"] = group
+            result["apiHost"] = api_host
+            submission_storage.write_text(
+                receipt_path,
+                json.dumps(result, ensure_ascii=False, indent=4),
+            )
+            accepted_not_persisted = False
+            _release_document_submission_lock(submission_storage, submission_lock_path)
+            submission_lock_path = None
+            logger.info("[+] %s отправлен: %s", spec["document_type"], result)
+            return result
+        finally:
+            if local_body_path.exists():
+                local_body_path.unlink()
+            if local_signature_path.exists():
+                local_signature_path.unlink()
+            try:
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    local_dir.rmdir()
+            except Exception:
+                pass
+            try:
+                if signing_storage.exists(remote_body_path):
+                    signing_storage.delete(remote_body_path)
+                if signing_storage.exists(remote_signature_path):
+                    signing_storage.delete(remote_signature_path)
+            except Exception:
+                pass
+    except Exception:
+        if submission_lock_path and not submission_ambiguous and not accepted_not_persisted:
+            _release_document_submission_lock(submission_storage, submission_lock_path)
+        logger.exception("[!] Ошибка отправки %s", operation)
+        raise
+
+
+def sign_and_send_disaggregation(task_id, group, signing_dir, timeout, refresh_token=False):
+    return _sign_and_send_aggregate_operation(
+        "disaggregation", task_id, group, signing_dir, timeout, refresh_token
+    )
+
+
+def sign_and_send_reaggregation(task_id, group, signing_dir, timeout, refresh_token=False):
+    return _sign_and_send_aggregate_operation(
+        "reaggregation", task_id, group, signing_dir, timeout, refresh_token
+    )
+
+
+def _update_aggregate_operation_status(operation, task_id, group=None):
+    config = load_config("suz_worker_config")
+    s3_config = config.get("s3_config")
+    tasks_path, receipts_path, statuses_path = _aggregate_operation_paths(config, operation)
+    if not tasks_path or not receipts_path or not statuses_path:
+        raise RuntimeError(f"[!] Не настроены хранилища задач/чеков/статусов {operation}")
+
+    task_id = _validate_aggregate_operation_task_id(task_id)
+    receipt_storage = get_storage(receipts_path, s3_config)
+    receipt_path = f"{receipts_path.rstrip('/')}/{task_id}.json"
+    if not receipt_storage.exists(receipt_path):
+        raise FileNotFoundError(f"Чек отправки не найден: {receipt_path}")
+    receipt = json.loads(receipt_storage.read_text(receipt_path))
+    document_id = receipt.get("document_id") or receipt.get("id")
+    if not document_id:
+        raise RuntimeError(f"[!] В чеке {task_id} отсутствует document_id")
+    group = group or receipt.get("productGroup")
+    if not group:
+        raise ValueError("Товарная группа обязательна для запроса статуса")
+
+    task_storage = get_storage(tasks_path, s3_config)
+    task_path = f"{tasks_path.rstrip('/')}/{task_id}.json"
+    if not task_storage.exists(task_path):
+        raise FileNotFoundError(f"Задача не найдена: {task_path}")
+    task = json.loads(task_storage.read_text(task_path))
+    participant_inn = _validate_participant_inn(task.get("participant_inn"))
+
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
+    token_processor = TokenProcessor(org_manager=org_manager)
+    token = token_processor.get_token_value_by_inn(participant_inn, token_type="JWT")
+    if not token:
+        raise RuntimeError(f"[!] JWT токен для ИНН {participant_inn} не найден")
+
+    api_host = _resolve_true_api_host(config, receipt)
+    status_result = HonestSignAPI(token=token, host=api_host).doc(document_id, pg=group)
+    if not status_result:
+        raise RuntimeError("[!] True API вернул пустой статус")
+    if isinstance(status_result, dict) and status_result.get("error"):
+        return status_result
+
+    status_storage = get_storage(statuses_path, s3_config)
+    status_path = f"{statuses_path.rstrip('/')}/{task_id}.json"
+    status_storage.write_text(
+        status_path,
+        json.dumps(status_result, ensure_ascii=False, indent=4),
+    )
+    target = status_result[0] if isinstance(status_result, list) and status_result else status_result
+    if isinstance(target, dict) and target.get("status"):
+        status_storage.set_tags(status_path, {"status": target["status"]})
+    logger.info("[+] Статус %s сохранён в %s", operation, status_path)
+    return status_result
+
+
+def update_disaggregation_status(task_id, group=None):
+    return _update_aggregate_operation_status("disaggregation", task_id, group)
+
+
+def update_reaggregation_status(task_id, group=None):
+    return _update_aggregate_operation_status("reaggregation", task_id, group)
+
+
 # --- Корректировка даты производства / срока годности (True API) ---
 
 CIS_INFORMATION_CHANGE_MAX_CODES = 35000
@@ -4845,6 +5402,51 @@ def main():
     parser.add_argument("--send-introduce", help="Подписать и отправить отчет о вводе в оборот по orderId (UUID)")
     parser.add_argument("-is", "--introduce-status", help="Получить статус отчета о вводе в оборот по orderId (UUID)")
     parser.add_argument(
+        "--create-disaggregation",
+        metavar="SOURCE",
+        help="Создать DISAGGREGATION_DOCUMENT по локальному или s3:// источнику кодов агрегатов",
+    )
+    parser.add_argument(
+        "--send-disaggregation",
+        metavar="TASK_ID",
+        help="Подписать и отправить DISAGGREGATION_DOCUMENT",
+    )
+    parser.add_argument(
+        "--disaggregation-status",
+        metavar="TASK_ID",
+        help="Получить статус DISAGGREGATION_DOCUMENT",
+    )
+    parser.add_argument(
+        "--create-reaggregation-removing",
+        metavar="AGGREGATE_CODE",
+        help="Создать REAGGREGATION_DOCUMENT/REMOVING для указанного агрегата",
+    )
+    parser.add_argument(
+        "--reaggregation-codes",
+        metavar="SOURCE",
+        help="Локальный или s3:// источник изымаемых кодов",
+    )
+    parser.add_argument(
+        "--reaggregation-code-field",
+        choices=("uit_uitu", "kitu"),
+        default="uit_uitu",
+        help="Поле изымаемых кодов: uit_uitu (по умолчанию) или kitu для вложенных КИТУ",
+    )
+    parser.add_argument(
+        "--send-reaggregation",
+        metavar="TASK_ID",
+        help="Подписать и отправить REAGGREGATION_DOCUMENT",
+    )
+    parser.add_argument(
+        "--reaggregation-status",
+        metavar="TASK_ID",
+        help="Получить статус REAGGREGATION_DOCUMENT",
+    )
+    parser.add_argument(
+        "--operation-task-id",
+        help="Явный ID задачи расформирования/трансформации",
+    )
+    parser.add_argument(
         "--create-cis-information-change",
         metavar="SOURCE",
         help="Создать корректировку даты по локальному или s3:// пути с кодами",
@@ -4880,6 +5482,11 @@ def main():
     parser.add_argument("--oms_id", help="OMS ID (если не задан, будет найден в my_orgs по ИНН)")
     parser.add_argument("--inn", help="ИНН участника (переопределяет автоматическое определение)")
     parser.add_argument("--refresh-token", action="store_true", help="Принудительно получить новый токен")
+    parser.add_argument(
+        "--true-api-host",
+        choices=tuple(sorted(ALLOWED_TRUE_API_HOSTS)),
+        help="Корневой адрес True API; для теста: https://markirovka.sandbox.crptech.ru",
+    )
     parser.add_argument("--suz_worker_config", help="Путь к конфигурационному файлу")
     parser.add_argument("--debug", action="store_true", help="Выводить отладочную информацию (текст запроса)")
     parser.add_argument("--client_token", help="Client Token / Connection ID")
@@ -4897,6 +5504,10 @@ def main():
     if args.suz_worker_config:
         os.environ['suz_worker_config'] = args.suz_worker_config
         logger.info(f"[*] Переопределен путь к конфигу: {args.suz_worker_config}")
+
+    if args.true_api_host:
+        os.environ["TRUE_API_HOST"] = args.true_api_host.rstrip("/")
+        logger.info("[*] True API host: %s", os.environ["TRUE_API_HOST"])
 
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -4928,6 +5539,66 @@ def main():
             print(f"Успешно получено кодов: {len(result.get('codes', []))}")
         else:
             print("Не удалось получить коды.")
+        return
+
+    if args.create_disaggregation:
+        if not args.inn:
+            parser.error("Для --create-disaggregation укажите --inn")
+        result = create_disaggregation_task(
+            args.create_disaggregation,
+            args.inn,
+            task_id=args.operation_task_id,
+        )
+        print(result)
+        return
+
+    if args.send_disaggregation:
+        result = sign_and_send_disaggregation(
+            args.send_disaggregation,
+            args.group,
+            args.signing_dir,
+            args.timeout,
+            refresh_token=args.refresh_token,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if args.disaggregation_status:
+        result = update_disaggregation_status(args.disaggregation_status, args.group)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if args.create_reaggregation_removing:
+        if not args.inn:
+            parser.error("Для --create-reaggregation-removing укажите --inn")
+        if not args.reaggregation_codes:
+            parser.error(
+                "Для --create-reaggregation-removing укажите --reaggregation-codes"
+            )
+        result = create_reaggregation_removing_task(
+            args.create_reaggregation_removing,
+            args.reaggregation_codes,
+            args.inn,
+            code_field=args.reaggregation_code_field,
+            task_id=args.operation_task_id,
+        )
+        print(result)
+        return
+
+    if args.send_reaggregation:
+        result = sign_and_send_reaggregation(
+            args.send_reaggregation,
+            args.group,
+            args.signing_dir,
+            args.timeout,
+            refresh_token=args.refresh_token,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if args.reaggregation_status:
+        result = update_reaggregation_status(args.reaggregation_status, args.group)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
         return
 
     cis_create_source = (
