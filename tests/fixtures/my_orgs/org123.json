@@ -1,0 +1,8 @@
+{
+  "org_id": "org123",
+  "name": "Test Org",
+  "phone": "123",
+  "person": "Test Person",
+  "inn": "1234567890",
+  "connection_id": "conn_abc"
+}
