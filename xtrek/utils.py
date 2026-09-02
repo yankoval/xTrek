@@ -300,6 +300,11 @@ class AggregateOperationAnalyzer:
         return set()
 
     @staticmethod
+    def _package_type(info):
+        """Return the business package type exposed by current True API."""
+        return info.get("generalPackageType") or info.get("packageType")
+
+    @staticmethod
     def _set_check(storage, path, result):
         if result and "api_error" in result:
             return
@@ -333,7 +338,7 @@ class AggregateOperationAnalyzer:
             self._set_check(storage, path, result)
             return storage, None, result
 
-    def check_disaggregation_report(self, path: str):
+    def check_disaggregation_report(self, path: str, final: bool = False):
         storage, payload, error = self._read_report(
             path,
             normalize_disaggregation_report,
@@ -354,6 +359,16 @@ class AggregateOperationAnalyzer:
             return {"api_error": [message]}
 
         status_map = self._status_map(status_results)
+        missing_codes = {
+            code
+            for code in aggregate_codes
+            if not (status_map.get(code) or {}).get("status")
+            or (status_map.get(code) or {}).get("status") == "NOT_FOUND"
+        }
+        if final and len(missing_codes) == len(aggregate_codes):
+            result = {"finished": ["All aggregates are disaggregated"]}
+            self._set_check(storage, path, result)
+            return result
         final_codes = {
             code
             for code in aggregate_codes
@@ -373,7 +388,7 @@ class AggregateOperationAnalyzer:
         for code in aggregate_codes:
             info = status_map.get(code) or {}
             status = info.get("status")
-            package_type = info.get("packageType")
+            package_type = self._package_type(info)
             if not status or status == "NOT_FOUND":
                 errors["aggregatenotfound"].append(code)
                 continue
@@ -434,9 +449,10 @@ class AggregateOperationAnalyzer:
 
         errors = defaultdict(list)
         participant_inn = payload["participant_inn"]
-        if target_info.get("packageType") not in {"BOX", "SET"}:
+        target_package_type = self._package_type(target_info)
+        if target_package_type not in {"BOX", "SET"}:
             errors["wrongpackagetype"].append(
-                f"{aggregate_code} (Тип: {target_info.get('packageType') or 'Не указан'})"
+                f"{aggregate_code} (Тип: {target_package_type or 'Не указан'})"
             )
         if target_status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
             errors["wrongstatus"].append(
@@ -453,9 +469,10 @@ class AggregateOperationAnalyzer:
             if not status or status == "NOT_FOUND":
                 errors["codenotfound"].append(code)
                 continue
-            if info.get("packageType") not in allowed_child_types:
+            package_type = self._package_type(info)
+            if package_type not in allowed_child_types:
                 errors["wrongpackagetype"].append(
-                    f"{code} (Тип: {info.get('packageType') or 'Не указан'})"
+                    f"{code} (Тип: {package_type or 'Не указан'})"
                 )
             if status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
                 errors["wrongstatus"].append(f"{code} (Статус: {status})")
@@ -646,6 +663,7 @@ def check_disaggregation_report(
     path: str,
     api: Optional[HonestSignAPI] = None,
     config: Optional[Dict] = None,
+    final: bool = False,
 ) -> Optional[Dict[str, List[str]]]:
     """Check one equipment report for a DISAGGREGATION_DOCUMENT task."""
     resolved_path, api, config = _ensure_aggregate_operation_api(
@@ -655,7 +673,8 @@ def check_disaggregation_report(
         config,
     )
     return AggregateOperationAnalyzer(api, config).check_disaggregation_report(
-        resolved_path
+        resolved_path,
+        final=final,
     )
 
 
