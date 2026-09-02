@@ -120,6 +120,26 @@ def test_disaggregation_final_check_sets_finished(tmp_path):
     assert _tags(path) == {"check": "finished"}
 
 
+def test_disaggregation_missing_aggregate_is_finished_only_after_checked_ok(tmp_path):
+    path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
+    api = FakeTrueAPI({}, {})
+
+    initial_result = utils.check_disaggregation_report(path, api=api, config={})
+
+    assert initial_result == {"aggregatenotfound": [AGGREGATE]}
+    assert _tags(path) == {"check": "aggregatenotfound"}
+
+    final_result = utils.check_disaggregation_report(
+        path,
+        api=api,
+        config={},
+        final=True,
+    )
+
+    assert final_result == {"finished": ["All aggregates are disaggregated"]}
+    assert _tags(path) == {"check": "finished"}
+
+
 def test_true_api_error_does_not_create_check_tag(tmp_path):
     path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
     api = FailingTrueAPI(

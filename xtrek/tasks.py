@@ -712,7 +712,7 @@ def logic_update_disaggregation(full_key):
     return _finish_aggregate_operation_report(
         "disaggregation",
         task_id,
-        check_disaggregation_report(task_id),
+        check_disaggregation_report(task_id, final=True),
     )
 
 

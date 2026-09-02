@@ -338,7 +338,7 @@ class AggregateOperationAnalyzer:
             self._set_check(storage, path, result)
             return storage, None, result
 
-    def check_disaggregation_report(self, path: str):
+    def check_disaggregation_report(self, path: str, final: bool = False):
         storage, payload, error = self._read_report(
             path,
             normalize_disaggregation_report,
@@ -359,6 +359,16 @@ class AggregateOperationAnalyzer:
             return {"api_error": [message]}
 
         status_map = self._status_map(status_results)
+        missing_codes = {
+            code
+            for code in aggregate_codes
+            if not (status_map.get(code) or {}).get("status")
+            or (status_map.get(code) or {}).get("status") == "NOT_FOUND"
+        }
+        if final and len(missing_codes) == len(aggregate_codes):
+            result = {"finished": ["All aggregates are disaggregated"]}
+            self._set_check(storage, path, result)
+            return result
         final_codes = {
             code
             for code in aggregate_codes
@@ -653,6 +663,7 @@ def check_disaggregation_report(
     path: str,
     api: Optional[HonestSignAPI] = None,
     config: Optional[Dict] = None,
+    final: bool = False,
 ) -> Optional[Dict[str, List[str]]]:
     """Check one equipment report for a DISAGGREGATION_DOCUMENT task."""
     resolved_path, api, config = _ensure_aggregate_operation_api(
@@ -662,7 +673,8 @@ def check_disaggregation_report(
         config,
     )
     return AggregateOperationAnalyzer(api, config).check_disaggregation_report(
-        resolved_path
+        resolved_path,
+        final=final,
     )
 
 

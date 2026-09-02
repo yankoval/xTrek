@@ -584,7 +584,7 @@ def test_disaggregation_checked_ok_runs_final_report_check(monkeypatch):
 
     assert result == "disaggregation T-SSCC-1 finished and report tagged"
     update_status.assert_called_once_with("T-SSCC-1", "chemistry")
-    final_check.assert_called_once_with("T-SSCC-1")
+    final_check.assert_called_once_with("T-SSCC-1", final=True)
 
 
 def test_reaggregation_checked_ok_runs_final_report_check(monkeypatch):
