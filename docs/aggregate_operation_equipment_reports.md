@@ -55,3 +55,65 @@
 
 Проверка специальных состояний кодов остаётся на стороне True API при обработке
 документа: метод `/cises/info` не возвращает это поле.
+
+## Папки и Celery-цепочки
+
+Для каждой стадии сохраняется отдельный путь в `suz_worker_config.json`.
+Рекомендуемое соответствие ключей и папок внутреннего бакета:
+
+| Ключ конфигурации | Папка |
+|---|---|
+| `equipment-reports-disaggregation` | `equipment-reports-disaggregation/` |
+| `disaggregation-tasks` | `disaggregationTasks/` |
+| `disaggregation-receipts` | `disaggregationReceipts/` |
+| `disaggregations` | `disaggregation/` |
+| `equipment-reports-reaggregation-removing` | `equipment-reports-reaggregation-removing/` |
+| `reaggregation-tasks` | `reaggregationTasks/` |
+| `reaggregation-receipts` | `reaggregationReceipts/` |
+| `reaggregations` | `reaggregation/` |
+
+Имя JSON-файла без расширения передаётся между всеми стадиями без изменения и
+является `taskId`.
+
+Цепочка расформирования:
+
+1. `equipment-reports-disaggregation/` — начальная проверка и
+   `create_disaggregation_task_from_report()`;
+2. `disaggregationTasks/` — `sign_and_send_disaggregation()`;
+3. `disaggregationReceipts/` — `update_disaggregation_status()`;
+4. при `CHECKED_OK` повторная проверка исходного отчёта и установка
+   `check=finished` только по фактическому состоянию кодов.
+
+Цепочка изъятия устроена так же и использует
+`equipment-reports-reaggregation-removing/`, `reaggregationTasks/`,
+`reaggregationReceipts/` и функции для `REAGGREGATION REMOVING`.
+
+Промежуточный статус документа повторяется через механизм retry Celery. Ошибка
+True API также завершает обработчик исключением и не изменяет `check`.
+Бизнес-ошибка проверки кодов сохраняется в `check` и останавливает цепочку без
+retry.
+
+## Общий Object Storage trigger
+
+У Object Storage trigger может быть только один `prefix`. У перечисленных папок
+нет общего префикса, поэтому единый trigger должен слушать весь внутренний бакет
+с фильтром `suffix=.json`. Фильтрация папок после этого выполняется в
+`tasks.process_s3_event`; неизвестные пути безопасно получают `Skipped: No match`.
+
+Нельзя оставлять одновременно bucket-wide trigger и существующие prefix-триггеры,
+направленные в ту же очередь: одно событие будет доставляться дважды. Безопасный
+порядок миграции:
+
+1. развернуть версию worker с маршрутами всех старых и новых папок;
+2. добавить восемь новых путей в `suz_worker_config.json`;
+3. подготовить общий trigger в неактивном состоянии;
+4. зафиксировать время переключения, остановить старые prefix-триггеры,
+   направленные в Celery-очередь, и включить общий trigger;
+5. проверить по одному тестовому объекту каждой новой стадии и отсутствие
+   двойной доставки;
+6. отдельно проверить объекты, созданные в коротком окне переключения, и при
+   необходимости повторно передать их в очередь.
+
+Триггеры подписи, уведомлений оборудования и других функций в эту миграцию не
+входят: отключаются только триггеры, направленные в функцию передачи событий в
+Celery-очередь.

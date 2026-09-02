@@ -32,13 +32,23 @@ from xtrek.create_emission_task_sample import (
     update_aggregation_set_status,
     create_aggregation_report,
     sign_and_send_aggregation,
+    create_disaggregation_task_from_report,
+    sign_and_send_disaggregation,
+    update_disaggregation_status,
+    create_reaggregation_removing_task_from_report,
+    sign_and_send_reaggregation,
+    update_reaggregation_status,
 )
 from xtrek.prn_util import generate_prn_files
 from xtrek.utils import (
-        check_aggregation_reports,
-        set_ready_check,
-        check_aggregation_report,
-        )
+    check_aggregation_reports,
+    set_ready_check,
+    check_aggregation_report,
+    check_disaggregation_reports,
+    check_disaggregation_report,
+    check_reaggregation_removing_reports,
+    check_reaggregation_removing_report,
+)
 from xtrek.suz_api_models import (
     EmissionOrder, OrderAttributes, OrderProduct, EmissionOrderreceipts,
     EmissionOrderStatus, ProductionOrder, PasportData,
@@ -572,6 +582,195 @@ def logic_start_equipment_reports(full_key):
     
     print(f" Успешно обработан отчет оборудования {report_id}")
 
+
+def _aggregate_operation_report_path(full_key):
+    return full_key if full_key.startswith("s3://") else f"s3://{full_key}"
+
+
+def _aggregate_operation_precheck(result, report_id, operation):
+    if not result:
+        raise RuntimeError(
+            f"{operation} report precheck returned no result for {report_id}"
+        )
+
+    report_path, error = next(iter(result.items()))
+    if not error:
+        return None
+
+    if isinstance(error, dict):
+        api_error_value = error.get("api_error") or error.get("error")
+        if api_error_value:
+            _, status_codes = _equipment_report_api_error_details(api_error_value)
+            api_error = _describe_equipment_report_api_error(api_error_value)
+            if status_codes & set(_EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS):
+                _set_equipment_report_check_tag(
+                    report_path,
+                    "true-api-403-forbidden",
+                )
+                return (
+                    f"Обработка отчета оборудования {report_id} остановлена "
+                    f"без retry: {api_error}"
+                )
+            raise RuntimeError(
+                f"{operation} report precheck True API failure for "
+                f"{report_id}: {api_error}"
+            )
+
+    return (
+        f"Отчет оборудования {operation} {report_id} пропускаем. "
+        f"Найдены ошибки: {error}."
+    )
+
+
+def _aggregate_operation_status_target(result, operation, task_id):
+    if not result:
+        raise RuntimeError(
+            f"update_{operation}_status returned no result for {task_id}"
+        )
+    if isinstance(result, dict) and result.get("error"):
+        raise RuntimeError(
+            f"update_{operation}_status failed for {task_id}: {result}"
+        )
+    target = result[0] if isinstance(result, list) and result else result
+    if not isinstance(target, dict):
+        raise RuntimeError(
+            f"update_{operation}_status returned unexpected result for "
+            f"{task_id}: {result}"
+        )
+    return target
+
+
+def _finish_aggregate_operation_report(operation, task_id, check_result):
+    if check_result is None:
+        raise RuntimeError(
+            f"{operation} {task_id} is CHECKED_OK, but the operation is not "
+            "reflected in the current aggregate state yet"
+        )
+    if isinstance(check_result, dict):
+        api_error_value = check_result.get("api_error") or check_result.get("error")
+        if api_error_value:
+            api_error = _describe_equipment_report_api_error(api_error_value)
+            raise RuntimeError(
+                f"{operation} final report check True API failure for "
+                f"{task_id}: {api_error}"
+            )
+        if check_result.get("finished"):
+            return f"{operation} {task_id} finished and report tagged"
+    return (
+        f"{operation} {task_id} status is CHECKED_OK, but final report "
+        f"check stopped with errors: {check_result}"
+    )
+
+
+# --- Расформирование агрегата: equipment report -> task -> receipt/status ---
+def logic_create_disaggregation(full_key):
+    task_id = full_key.split("/")[-1].removesuffix(".json")
+    print(f"[LOGIC-30] Проверка отчета расформирования: {full_key}")
+    precheck = _aggregate_operation_precheck(
+        check_disaggregation_reports([task_id]),
+        task_id,
+        "disaggregation",
+    )
+    if precheck:
+        return precheck
+
+    result = create_disaggregation_task_from_report(
+        _aggregate_operation_report_path(full_key),
+        task_id=task_id,
+    )
+    if not result:
+        raise RuntimeError(f"create_disaggregation_task failed for {task_id}")
+    return f"Disaggregation task {task_id} created"
+
+
+def logic_send_disaggregation(full_key):
+    task_id = full_key.split("/")[-1].removesuffix(".json")
+    print(f"[LOGIC-31] Подписание и отправка расформирования: {task_id}")
+    result = sign_and_send_disaggregation(
+        task_id,
+        PRODUCT_GROUP,
+        signing_dir,
+        120,
+    )
+    if _is_failed_send_result(result):
+        raise RuntimeError(f"sign_and_send_disaggregation failed for {task_id}")
+    return f"Disaggregation task {task_id} sent"
+
+
+def logic_update_disaggregation(full_key):
+    task_id = full_key.split("/")[-1].removesuffix(".json")
+    print(f"[LOGIC-32] Проверка статуса расформирования: {task_id}")
+    target = _aggregate_operation_status_target(
+        update_disaggregation_status(task_id, PRODUCT_GROUP),
+        "disaggregation",
+        task_id,
+    )
+    if target.get("status") != "CHECKED_OK":
+        raise RuntimeError(
+            f"disaggregation {task_id} status is {target.get('status') or 'unknown'}"
+        )
+    return _finish_aggregate_operation_report(
+        "disaggregation",
+        task_id,
+        check_disaggregation_report(task_id),
+    )
+
+
+# --- Изъятие из агрегата: equipment report -> task -> receipt/status ---
+def logic_create_reaggregation_removing(full_key):
+    task_id = full_key.split("/")[-1].removesuffix(".json")
+    print(f"[LOGIC-33] Проверка отчета изъятия: {full_key}")
+    precheck = _aggregate_operation_precheck(
+        check_reaggregation_removing_reports([task_id]),
+        task_id,
+        "reaggregation-removing",
+    )
+    if precheck:
+        return precheck
+
+    result = create_reaggregation_removing_task_from_report(
+        _aggregate_operation_report_path(full_key),
+        task_id=task_id,
+    )
+    if not result:
+        raise RuntimeError(
+            f"create_reaggregation_removing_task failed for {task_id}"
+        )
+    return f"Reaggregation REMOVING task {task_id} created"
+
+
+def logic_send_reaggregation(full_key):
+    task_id = full_key.split("/")[-1].removesuffix(".json")
+    print(f"[LOGIC-34] Подписание и отправка изъятия: {task_id}")
+    result = sign_and_send_reaggregation(
+        task_id,
+        PRODUCT_GROUP,
+        signing_dir,
+        120,
+    )
+    if _is_failed_send_result(result):
+        raise RuntimeError(f"sign_and_send_reaggregation failed for {task_id}")
+    return f"Reaggregation REMOVING task {task_id} sent"
+
+
+def logic_update_reaggregation(full_key):
+    task_id = full_key.split("/")[-1].removesuffix(".json")
+    print(f"[LOGIC-35] Проверка статуса изъятия: {task_id}")
+    target = _aggregate_operation_status_target(
+        update_reaggregation_status(task_id, PRODUCT_GROUP),
+        "reaggregation",
+        task_id,
+    )
+    if target.get("status") != "CHECKED_OK":
+        raise RuntimeError(
+            f"reaggregation {task_id} status is {target.get('status') or 'unknown'}"
+        )
+    return _finish_aggregate_operation_report(
+        "reaggregation-removing",
+        task_id,
+        check_reaggregation_removing_report(task_id),
+    )
+
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: productionOrders/ ---
 def logic_start_virtualProdTask_emission(full_key):
     group, contact = PRODUCT_GROUP, CONTACT_PERSON
@@ -702,6 +901,38 @@ def process_s3_event(self, data):
         # Условие №20: Обработка отчета оборудования 
         elif bucket == INTERNAL_BUCKET and key.startswith("equipment-reports/"):
             result = logic_start_equipment_reports(full_key)
+            print(f"[OK] {result}")
+        # Условия №30-32: Расформирование агрегата
+        elif (
+            bucket == INTERNAL_BUCKET
+            and key.startswith("equipment-reports-disaggregation/")
+        ):
+            result = logic_create_disaggregation(full_key)
+            print(f"[OK] {result}")
+        elif bucket == INTERNAL_BUCKET and key.startswith("disaggregationTasks/"):
+            result = logic_send_disaggregation(full_key)
+            print(f"[OK] {result}")
+        elif (
+            bucket == INTERNAL_BUCKET
+            and key.startswith("disaggregationReceipts/")
+        ):
+            result = logic_update_disaggregation(full_key)
+            print(f"[OK] {result}")
+        # Условия №33-35: Изъятие без расформирования агрегата
+        elif (
+            bucket == INTERNAL_BUCKET
+            and key.startswith("equipment-reports-reaggregation-removing/")
+        ):
+            result = logic_create_reaggregation_removing(full_key)
+            print(f"[OK] {result}")
+        elif bucket == INTERNAL_BUCKET and key.startswith("reaggregationTasks/"):
+            result = logic_send_reaggregation(full_key)
+            print(f"[OK] {result}")
+        elif (
+            bucket == INTERNAL_BUCKET
+            and key.startswith("reaggregationReceipts/")
+        ):
+            result = logic_update_reaggregation(full_key)
             print(f"[OK] {result}")
         # Условие №21: Обработка виртуального заказа на производство
         elif bucket == INTERNAL_BUCKET and key.startswith("productionOrders/"):
