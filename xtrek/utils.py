@@ -414,6 +414,13 @@ class AggregateOperationAnalyzer:
             return {"api_error": [message]}
 
         status_map = self._status_map(status_results)
+        target_info = status_map.get(aggregate_code) or {}
+        target_status = target_info.get("status")
+        if not target_status or target_status == "NOT_FOUND":
+            result = {"aggregatenotfound": [aggregate_code]}
+            self._set_check(storage, path, result)
+            return result
+
         direct_children = self._direct_children(composition, aggregate_code)
         present_codes = set(removed_codes) & direct_children
         if not present_codes:
@@ -427,19 +434,14 @@ class AggregateOperationAnalyzer:
 
         errors = defaultdict(list)
         participant_inn = payload["participant_inn"]
-        target_info = status_map.get(aggregate_code) or {}
-        target_status = target_info.get("status")
-        if not target_status or target_status == "NOT_FOUND":
-            errors["aggregatenotfound"].append(aggregate_code)
-        else:
-            if target_info.get("packageType") not in {"BOX", "SET"}:
-                errors["wrongpackagetype"].append(
-                    f"{aggregate_code} (Тип: {target_info.get('packageType') or 'Не указан'})"
-                )
-            if target_status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
-                errors["wrongstatus"].append(
-                    f"{aggregate_code} (Статус: {target_status})"
-                )
+        if target_info.get("packageType") not in {"BOX", "SET"}:
+            errors["wrongpackagetype"].append(
+                f"{aggregate_code} (Тип: {target_info.get('packageType') or 'Не указан'})"
+            )
+        if target_status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
+            errors["wrongstatus"].append(
+                f"{aggregate_code} (Статус: {target_status})"
+            )
 
         allowed_child_types = (
             {"BOX"} if code_field == "kitu" else {"UNIT", "GROUP", "BUNDLE", "SET"}
