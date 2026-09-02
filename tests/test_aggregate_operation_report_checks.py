@@ -81,6 +81,26 @@ def test_disaggregation_initial_check_sets_empty_check_tag(tmp_path):
     assert _tags(path) == {"check": ""}
 
 
+def test_disaggregation_accepts_true_api_level1_box(tmp_path):
+    path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
+    api = FakeTrueAPI(
+        {
+            AGGREGATE: {
+                "cis": AGGREGATE,
+                "status": "INTRODUCED",
+                "packageType": "LEVEL1",
+                "generalPackageType": "BOX",
+            },
+        },
+        {AGGREGATE: {CHILD: []}},
+    )
+
+    result = utils.check_disaggregation_report(path, api=api, config={})
+
+    assert result is None
+    assert _tags(path) == {"check": ""}
+
+
 def test_disaggregation_final_check_sets_finished(tmp_path):
     path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
     api = FakeTrueAPI(
@@ -127,6 +147,34 @@ def test_reaggregation_removing_initial_check_sets_empty_tag(tmp_path):
                 "cis": AGGREGATE,
                 "status": "INTRODUCED",
                 "packageType": "BOX",
+                "ownerInn": "7701234567",
+            },
+            CHILD: {
+                "cis": CHILD,
+                "status": "INTRODUCED",
+                "packageType": "UNIT",
+                "ownerInn": "7701234567",
+                "parent": AGGREGATE,
+            },
+        },
+        {AGGREGATE: {CHILD: []}},
+    )
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert result is None
+    assert _tags(path) == {"check": ""}
+
+
+def test_reaggregation_removing_accepts_true_api_level1_box(tmp_path):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    api = FakeTrueAPI(
+        {
+            AGGREGATE: {
+                "cis": AGGREGATE,
+                "status": "INTRODUCED",
+                "packageType": "LEVEL1",
+                "generalPackageType": "BOX",
                 "ownerInn": "7701234567",
             },
             CHILD: {

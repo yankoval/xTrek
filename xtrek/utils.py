@@ -300,6 +300,11 @@ class AggregateOperationAnalyzer:
         return set()
 
     @staticmethod
+    def _package_type(info):
+        """Return the business package type exposed by current True API."""
+        return info.get("generalPackageType") or info.get("packageType")
+
+    @staticmethod
     def _set_check(storage, path, result):
         if result and "api_error" in result:
             return
@@ -373,7 +378,7 @@ class AggregateOperationAnalyzer:
         for code in aggregate_codes:
             info = status_map.get(code) or {}
             status = info.get("status")
-            package_type = info.get("packageType")
+            package_type = self._package_type(info)
             if not status or status == "NOT_FOUND":
                 errors["aggregatenotfound"].append(code)
                 continue
@@ -434,9 +439,10 @@ class AggregateOperationAnalyzer:
 
         errors = defaultdict(list)
         participant_inn = payload["participant_inn"]
-        if target_info.get("packageType") not in {"BOX", "SET"}:
+        target_package_type = self._package_type(target_info)
+        if target_package_type not in {"BOX", "SET"}:
             errors["wrongpackagetype"].append(
-                f"{aggregate_code} (Тип: {target_info.get('packageType') or 'Не указан'})"
+                f"{aggregate_code} (Тип: {target_package_type or 'Не указан'})"
             )
         if target_status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
             errors["wrongstatus"].append(
@@ -453,9 +459,10 @@ class AggregateOperationAnalyzer:
             if not status or status == "NOT_FOUND":
                 errors["codenotfound"].append(code)
                 continue
-            if info.get("packageType") not in allowed_child_types:
+            package_type = self._package_type(info)
+            if package_type not in allowed_child_types:
                 errors["wrongpackagetype"].append(
-                    f"{code} (Тип: {info.get('packageType') or 'Не указан'})"
+                    f"{code} (Тип: {package_type or 'Не указан'})"
                 )
             if status not in AGGREGATE_OPERATION_ACTIVE_STATUSES:
                 errors["wrongstatus"].append(f"{code} (Статус: {status})")
