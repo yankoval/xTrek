@@ -60,7 +60,7 @@ from xtrek.suz_api_models import (
 ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
 SECRET_KEY = os.environ.get('YMQ_SECRET_KEY')
 QUEUE_URL = os.environ.get('YMQ_QUEUE_URL')
-REAL_QUEUE_NAME = 'queue_task_create_1C'
+REAL_QUEUE_NAME = os.environ.get('YMQ_QUEUE_NAME', 'queue_task_create_1C')
 
 safe_secret = quote(SECRET_KEY, safe='')
 BROKER_URL = f'sqs://{ACCESS_KEY}:{safe_secret}@'

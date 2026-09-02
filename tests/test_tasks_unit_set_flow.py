@@ -76,6 +76,14 @@ def test_tasks_module_is_available_from_package_and_legacy_entrypoint(monkeypatc
     assert legacy_tasks is package_tasks
 
 
+def test_celery_queue_name_can_be_isolated_by_environment(monkeypatch):
+    monkeypatch.setenv("YMQ_QUEUE_NAME", "queue_xtrek_aggregate_test")
+
+    tasks = import_tasks(monkeypatch, "xtrek.tasks")
+
+    assert tasks.REAL_QUEUE_NAME == "queue_xtrek_aggregate_test"
+
+
 def test_celery_task_boundaries_clear_token_snapshot(monkeypatch):
     tasks = import_tasks(monkeypatch)
     clear = MagicMock()
