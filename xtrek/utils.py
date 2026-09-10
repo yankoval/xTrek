@@ -483,12 +483,10 @@ class AggregateOperationAnalyzer:
         self._set_check(storage, path, result)
         return result
 
-# Глобальный кеш для ресурсов
+# Кэшируем только конфигурацию. Токены и клиенты не переносятся между отчётами;
+# повторные чтения tokens.json ограничивает снимок задачи в TokenProcessor.
 _RESOURCES_CACHE = {
     'config': None,
-    'api': {}, # token -> api
-    'nk': {},  # token -> nk
-    'last_token': None,
 }
 
 def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None):
@@ -514,12 +512,9 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
     if not token:
         token = os.getenv("TRUE_API_TOKEN")
 
-    # Если токен все еще не найден, пробуем использовать последний успешно определенный
-    if not token:
-        token = _RESOURCES_CACHE['last_token']
-
     if not token:
         # Автодетекция ИНН по файлу
+        detected_inn = None
         s3_config = config.get('s3_config')
         try:
             storage = get_storage(resolved_path, s3_config)
@@ -557,23 +552,16 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
             token_data = tp.get_token_by_inn(detected_inn)
             if token_data:
                 token = token_data.get('Токен')
-                _RESOURCES_CACHE['last_token'] = token
 
     if not token:
         raise ValueError(f"Не удалось определить токен для проверки {resolved_path}. "
                          f"Укажите токен явно или обеспечьте наличие ИНН в базе для GTIN из файла.")
 
     if not api:
-        if token not in _RESOURCES_CACHE['api']:
-            host = config.get('true_api_host')
-            _RESOURCES_CACHE['api'][token] = HonestSignAPI(token=token, host=host)
-        api = _RESOURCES_CACHE['api'][token]
+        api = HonestSignAPI(token=token, host=config.get('true_api_host'))
 
     if not nk:
-        if token not in _RESOURCES_CACHE['nk']:
-            host = config.get('nk_api_host')
-            _RESOURCES_CACHE['nk'][token] = NK(token=token, host=host)
-        nk = _RESOURCES_CACHE['nk'][token]
+        nk = NK(token=token, host=config.get('nk_api_host'))
 
     return resolved_path, api, nk, config
 
