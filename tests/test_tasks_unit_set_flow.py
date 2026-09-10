@@ -76,6 +76,14 @@ def test_tasks_module_is_available_from_package_and_legacy_entrypoint(monkeypatc
     assert legacy_tasks is package_tasks
 
 
+def test_celery_queue_name_can_be_isolated_by_environment(monkeypatch):
+    monkeypatch.setenv("YMQ_QUEUE_NAME", "queue_xtrek_aggregate_test")
+
+    tasks = import_tasks(monkeypatch, "xtrek.tasks")
+
+    assert tasks.REAL_QUEUE_NAME == "queue_xtrek_aggregate_test"
+
+
 def test_celery_task_boundaries_clear_token_snapshot(monkeypatch):
     tasks = import_tasks(monkeypatch)
     clear = MagicMock()
@@ -370,3 +378,274 @@ def test_set_utilisation_success_still_checks_set_readiness(monkeypatch):
     trigger_ready.assert_called_once_with("T-SET")
     tasks.create_introduce_task_from_report.assert_not_called()
     tasks.sign_and_send_introduce.assert_not_called()
+
+
+def test_process_s3_event_routes_all_aggregate_operation_stages(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    routes = {
+        "equipment-reports-disaggregation/T-SSCC-1.json": (
+            "logic_create_disaggregation",
+            "internal-bucket/equipment-reports-disaggregation/T-SSCC-1.json",
+        ),
+        "disaggregationTasks/T-SSCC-1.json": (
+            "logic_send_disaggregation",
+            "internal-bucket/disaggregationTasks/T-SSCC-1.json",
+        ),
+        "disaggregationReceipts/T-SSCC-1.json": (
+            "logic_update_disaggregation",
+            "internal-bucket/disaggregationReceipts/T-SSCC-1.json",
+        ),
+        "equipment-reports-reaggregation-removing/T-SSCC-2.json": (
+            "logic_create_reaggregation_removing",
+            "internal-bucket/equipment-reports-reaggregation-removing/T-SSCC-2.json",
+        ),
+        "reaggregationTasks/T-SSCC-2.json": (
+            "logic_send_reaggregation",
+            "internal-bucket/reaggregationTasks/T-SSCC-2.json",
+        ),
+        "reaggregationReceipts/T-SSCC-2.json": (
+            "logic_update_reaggregation",
+            "internal-bucket/reaggregationReceipts/T-SSCC-2.json",
+        ),
+    }
+    handlers = {
+        name: MagicMock(return_value="handled")
+        for name, _ in routes.values()
+    }
+    for name, handler in handlers.items():
+        monkeypatch.setattr(tasks, name, handler)
+
+    for key in routes:
+        result = tasks.process_s3_event.apply(args=[{
+            "bucket": "internal-bucket",
+            "key": key,
+        }])
+        assert result.successful()
+
+    for _, (handler_name, full_key) in routes.items():
+        handlers[handler_name].assert_called_once_with(full_key)
+
+
+def test_disaggregation_report_creates_task_with_report_task_id(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    report_path = (
+        "s3://internal-bucket/"
+        "equipment-reports-disaggregation/T-SSCC-uuid.json"
+    )
+    monkeypatch.setattr(
+        tasks,
+        "check_disaggregation_reports",
+        MagicMock(return_value={report_path: None}),
+    )
+    create_task = MagicMock(return_value="T-SSCC-uuid")
+    monkeypatch.setattr(tasks, "create_disaggregation_task_from_report", create_task)
+
+    result = tasks.logic_create_disaggregation(report_path.removeprefix("s3://"))
+
+    assert result == "Disaggregation task T-SSCC-uuid created"
+    tasks.check_disaggregation_reports.assert_called_once_with(["T-SSCC-uuid"])
+    create_task.assert_called_once_with(report_path, task_id="T-SSCC-uuid")
+
+
+def test_reaggregation_report_creates_task_with_report_task_id(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    report_path = (
+        "s3://internal-bucket/"
+        "equipment-reports-reaggregation-removing/T-SSCC-uuid.json"
+    )
+    monkeypatch.setattr(
+        tasks,
+        "check_reaggregation_removing_reports",
+        MagicMock(return_value={report_path: None}),
+    )
+    create_task = MagicMock(return_value="T-SSCC-uuid")
+    monkeypatch.setattr(
+        tasks,
+        "create_reaggregation_removing_task_from_report",
+        create_task,
+    )
+
+    result = tasks.logic_create_reaggregation_removing(
+        report_path.removeprefix("s3://")
+    )
+
+    assert result == "Reaggregation REMOVING task T-SSCC-uuid created"
+    tasks.check_reaggregation_removing_reports.assert_called_once_with(
+        ["T-SSCC-uuid"]
+    )
+    create_task.assert_called_once_with(report_path, task_id="T-SSCC-uuid")
+
+
+def test_aggregate_operation_precheck_api_error_retries_without_creating_task(
+    monkeypatch,
+):
+    tasks = import_tasks(monkeypatch)
+    report_path = (
+        "s3://internal-bucket/"
+        "equipment-reports-disaggregation/T-None-uuid.json"
+    )
+    monkeypatch.setattr(
+        tasks,
+        "check_disaggregation_reports",
+        MagicMock(return_value={
+            report_path: {"api_error": ["503 Service Unavailable"]},
+        }),
+    )
+    create_task = MagicMock()
+    monkeypatch.setattr(tasks, "create_disaggregation_task_from_report", create_task)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports-disaggregation/T-None-uuid.json",
+    }])
+
+    assert not result.successful()
+    assert "HTTP 503 Service Unavailable" in str(result.result)
+    create_task.assert_not_called()
+
+
+def test_aggregate_operation_business_error_stops_without_retry(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    report_path = (
+        "s3://internal-bucket/"
+        "equipment-reports-reaggregation-removing/T-SSCC-uuid.json"
+    )
+    monkeypatch.setattr(
+        tasks,
+        "check_reaggregation_removing_reports",
+        MagicMock(return_value={
+            report_path: {"wrongowner": ["00000123456789012345"]},
+        }),
+    )
+    create_task = MagicMock()
+    monkeypatch.setattr(
+        tasks,
+        "create_reaggregation_removing_task_from_report",
+        create_task,
+    )
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "equipment-reports-reaggregation-removing/T-SSCC-uuid.json",
+    }])
+
+    assert result.successful()
+    create_task.assert_not_called()
+
+
+def test_aggregate_operation_task_events_sign_and_send(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    send_disaggregation = MagicMock(return_value={"document_id": "doc-1"})
+    send_reaggregation = MagicMock(return_value={"document_id": "doc-2"})
+    monkeypatch.setattr(
+        tasks,
+        "sign_and_send_disaggregation",
+        send_disaggregation,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "sign_and_send_reaggregation",
+        send_reaggregation,
+    )
+
+    tasks.logic_send_disaggregation(
+        "internal-bucket/disaggregationTasks/T-SSCC-1.json"
+    )
+    tasks.logic_send_reaggregation(
+        "internal-bucket/reaggregationTasks/T-SSCC-2.json"
+    )
+
+    send_disaggregation.assert_called_once_with(
+        "T-SSCC-1",
+        "chemistry",
+        "/tmp/sign",
+        120,
+    )
+    send_reaggregation.assert_called_once_with(
+        "T-SSCC-2",
+        "chemistry",
+        "/tmp/sign",
+        120,
+    )
+
+
+def test_disaggregation_checked_ok_runs_final_report_check(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    update_status = MagicMock(return_value={"status": "CHECKED_OK"})
+    final_check = MagicMock(return_value={
+        "finished": ["All aggregates are disaggregated"],
+    })
+    monkeypatch.setattr(tasks, "update_disaggregation_status", update_status)
+    monkeypatch.setattr(tasks, "check_disaggregation_report", final_check)
+
+    result = tasks.logic_update_disaggregation(
+        "internal-bucket/disaggregationReceipts/T-SSCC-1.json"
+    )
+
+    assert result == "disaggregation T-SSCC-1 finished and report tagged"
+    update_status.assert_called_once_with("T-SSCC-1", "chemistry")
+    final_check.assert_called_once_with("T-SSCC-1", final=True)
+
+
+def test_reaggregation_checked_ok_runs_final_report_check(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    update_status = MagicMock(return_value=[{"status": "CHECKED_OK"}])
+    final_check = MagicMock(return_value={
+        "finished": ["All requested codes are removed"],
+    })
+    monkeypatch.setattr(tasks, "update_reaggregation_status", update_status)
+    monkeypatch.setattr(
+        tasks,
+        "check_reaggregation_removing_report",
+        final_check,
+    )
+
+    result = tasks.logic_update_reaggregation(
+        "internal-bucket/reaggregationReceipts/T-SSCC-2.json"
+    )
+
+    assert result == "reaggregation-removing T-SSCC-2 finished and report tagged"
+    update_status.assert_called_once_with("T-SSCC-2", "chemistry")
+    final_check.assert_called_once_with("T-SSCC-2")
+
+
+def test_aggregate_operation_nonfinal_status_retries(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    final_check = MagicMock()
+    monkeypatch.setattr(
+        tasks,
+        "update_disaggregation_status",
+        MagicMock(return_value={"status": "IN_PROGRESS"}),
+    )
+    monkeypatch.setattr(tasks, "check_disaggregation_report", final_check)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "disaggregationReceipts/T-SSCC-1.json",
+    }])
+
+    assert not result.successful()
+    assert "status is IN_PROGRESS" in str(result.result)
+    final_check.assert_not_called()
+
+
+def test_aggregate_operation_waits_for_true_api_state_after_checked_ok(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(
+        tasks,
+        "update_reaggregation_status",
+        MagicMock(return_value={"status": "CHECKED_OK"}),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "check_reaggregation_removing_report",
+        MagicMock(return_value=None),
+    )
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": "reaggregationReceipts/T-SSCC-2.json",
+    }])
+
+    assert not result.successful()
+    assert "not reflected in the current aggregate state yet" in str(result.result)
