@@ -1,1 +1,2 @@
 pytest
+celery>=5,<6
