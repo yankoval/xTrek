@@ -145,3 +145,25 @@ def test_pallet_assignment_passes_explicit_auth_mode(get_sscc):
         "0",
         auth_mode="yandex_iam",
     )
+
+
+@patch('xtrek.SSCC_Utils.time.monotonic')
+@patch('xtrek.SSCC_Utils.requests.get')
+def test_iam_cache_refreshes_before_expiry_without_restart(get, monotonic):
+    monotonic.side_effect = [0, 3539, 3540]
+    get.side_effect = [
+        _response(payload={'access_token': 'first', 'expires_in': 3600}),
+        _response(payload={'access_token': 'second', 'expires_in': 3600}),
+    ]
+    assert SSCC_Utils._get_yandex_iam_token() == 'first'
+    assert SSCC_Utils._get_yandex_iam_token() == 'first'
+    assert SSCC_Utils._get_yandex_iam_token() == 'second'
+    assert get.call_count == 2
+
+
+@patch('xtrek.SSCC_Utils.requests.get')
+@patch('xtrek.SSCC_Utils.requests.post')
+def test_metadata_failure_does_not_send_unauthenticated_sscc_request(post, get):
+    get.side_effect = requests.Timeout('metadata timeout')
+    assert SSCC_Utils.get_sscc_from_service(FUNCTION_URL, '460705179', 1, auth_mode='yandex_iam') == []
+    post.assert_not_called()
