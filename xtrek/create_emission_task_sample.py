@@ -3836,11 +3836,15 @@ def _create_pallet_assignment(prod_data, config):
             "and sscc_prefix"
         )
 
+    sscc_request_kwargs = {}
+    if config.get('sscc_auth_mode'):
+        sscc_request_kwargs['auth_mode'] = config['sscc_auth_mode']
     raw_codes = get_sscc_from_service(
         sscc_service_url,
         sscc_prefix,
         sscc_count,
         sscc_extension,
+        **sscc_request_kwargs,
     )
     if not isinstance(raw_codes, list) or len(raw_codes) != sscc_count:
         actual_count = len(raw_codes) if isinstance(raw_codes, list) else 0
@@ -3897,7 +3901,18 @@ def create_equipment_aggregation_task(production_order_id: str):
         target_path = f"{equipment_tasks_path.rstrip('/')}/{prod_filename}"
 
         if storage_tasks.exists(target_path):
-            raise FileExistsError(f"Задание для оборудования уже существует: {target_path}")
+            # A Celery retry must reuse an already allocated SSCC assignment.
+            existing = json.loads(storage_tasks.read_text(target_path))
+            expected_id = prod_filename[:-5]
+            codes = existing.get('palletNumbers')
+            if existing.get('id') != expected_id or not isinstance(codes, list) or not codes:
+                raise ValueError(f"Existing equipment task has no valid pallet assignment: {target_path}")
+            normalized = [normalize_sscc(code, 'existing pallet SSCC') for code in codes]
+            required = int(existing.get('plannedPalletCount', 1)) + int(existing.get('palletSsccReserve', 0))
+            if required < 1 or len(codes) < required or len(set(normalized)) != len(codes):
+                raise ValueError(f"Existing equipment task has incomplete or duplicate pallet SSCCs: {target_path}")
+            logger.info("Задание оборудования с SSCC уже создано: %s", target_path)
+            return production_order_id
 
         if not storage_prod.exists(prod_order_path):
             logger.error(f"[!] Файл производственного заказа не найден: {prod_order_path}")

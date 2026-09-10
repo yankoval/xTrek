@@ -265,7 +265,9 @@ def logic_create_order(full_key):
     if not production_order_id:
         return "No production_order_id created"
 
-    create_equipment_aggregation_task(production_order_id)
+    equipment_task = create_equipment_aggregation_task(production_order_id)
+    if not equipment_task:
+        raise RuntimeError(f"create_equipment_aggregation_task failed for {production_order_id}")
     resultCEmT = create_emission_task(production_order_id, group, contact)
     
     if not resultCEmT:
