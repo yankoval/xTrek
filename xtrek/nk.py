@@ -246,7 +246,7 @@ def main():
     try:
         tokenInn  = args.find_token_by_inn if args.find_token_by_inn else os.getenv("FIND_TOKEN_BY_INN")
         tokens = TokenProcessor()
-        token = tokens.get_token_by_inn(tokenInn)
+        token = tokens.get_token_by_inn(tokenInn, token_type="JWT")
         if token:
             logger.info(' '.join([str(token.get(k)) for k in [ 'user_status', 'full_name', 'scope', 'inn', 'pid', 'id', 'exp']]))
         nk = NK(sandbox=args.sandbox,token=token['Токен']if token else None)
