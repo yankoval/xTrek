@@ -539,27 +539,30 @@ class TokenProcessor:
 
         return active_tokens
 
-    def get_token_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
+    def get_token_by_inn(self, inn: str, token_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Находит токен по полю ИНН. Предпочтение отдается активным токенам.
-        Если активный токен не найден, пытается синхронизироваться с S3.
+        Находит активный токен по ИНН в снимке текущей команды.
+        При заданном типе не подставляет токен другого типа.
 
         Args:
             inn (str): ИНН для поиска
+            token_type (Optional[str]): Тип токена (JWT или UUID), если требуется
 
         Returns:
             Optional[Dict[str, Any]]: Найденный токен или None
         """
-        token = self._find_best_token_in_memory(inn)
+        token = self._find_best_token_in_memory(inn, token_type=token_type)
         return token
 
-    def _find_best_token_in_memory(self, inn: str) -> Optional[Dict[str, Any]]:
+    def _find_best_token_in_memory(self, inn: str, token_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Внутренний метод для поиска активного токена в памяти."""
         if not self.processed_tokens:
             self.process_tokens()
 
         active_tokens = self.get_active_tokens()
         for token in active_tokens:
+            if token_type is not None and token.get('ТипТокена') != token_type:
+                continue
             token_inn = token.get('inn')
             if token_inn and str(token_inn) == str(inn):
                 return token

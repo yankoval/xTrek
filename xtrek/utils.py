@@ -549,7 +549,7 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
             base_path = os.path.dirname(os.path.abspath(__file__))
             orgs_dir = os.path.join(base_path, 'my_orgs')
             tp = TokenProcessor(orgs_dir=orgs_dir)
-            token_data = tp.get_token_by_inn(detected_inn)
+            token_data = tp.get_token_by_inn(detected_inn, token_type="JWT")
             if token_data:
                 token = token_data.get('Токен')
 
@@ -597,7 +597,7 @@ def _ensure_aggregate_operation_api(
     if api:
         return resolved_path, api, config
 
-    token = os.getenv("TRUE_API_TOKEN") or _RESOURCES_CACHE["last_token"]
+    token = os.getenv("TRUE_API_TOKEN")
     participant_inn = None
     if not token:
         storage = get_storage(resolved_path, config.get("s3_config"))
@@ -606,22 +606,16 @@ def _ensure_aggregate_operation_api(
         if participant_inn:
             base_path = os.path.dirname(os.path.abspath(__file__))
             processor = TokenProcessor(orgs_dir=os.path.join(base_path, "my_orgs"))
-            token_data = processor.get_token_by_inn(str(participant_inn))
+            token_data = processor.get_token_by_inn(str(participant_inn), token_type="JWT")
             if token_data:
                 token = token_data.get("Токен")
-                _RESOURCES_CACHE["last_token"] = token
     if not token:
         raise ValueError(
             f"Не удалось определить True API токен для {resolved_path}"
             + (f" и ИНН {participant_inn}" if participant_inn else "")
         )
 
-    if token not in _RESOURCES_CACHE["api"]:
-        _RESOURCES_CACHE["api"][token] = HonestSignAPI(
-            token=token,
-            host=config.get("true_api_host"),
-        )
-    return resolved_path, _RESOURCES_CACHE["api"][token], config
+    return resolved_path, HonestSignAPI(token=token, host=config.get("true_api_host")), config
 
 def check_aggregation_report(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
     """Функция для проверки одного отчета об агрегации."""
@@ -934,7 +928,7 @@ def main():
         base_path = os.path.dirname(os.path.abspath(__file__))
         orgs_dir = os.path.join(base_path, 'my_orgs')
         tp = TokenProcessor(orgs_dir=orgs_dir)
-        token_data = tp.get_token_by_inn(args.inn)
+        token_data = tp.get_token_by_inn(args.inn, token_type="JWT")
         if token_data:
             token = token_data.get('Токен')
             logger.info(f"Получен токен для ИНН {args.inn}")

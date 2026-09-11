@@ -134,7 +134,12 @@ def test_celery_picks_up_updated_token_without_process_restart(report_resources,
     expiry = datetime.now(timezone.utc).timestamp() + 3600
     old_token = _jwt("123", expiry)
     new_token = _jwt("123", expiry + 60)
-    source = [{"Идентификатор": "pid", "Токен": old_token}]
+    auth = {
+        "Идентификатор": "connection", "inn": "123",
+        "Токен": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "ДействуетДо": "2099-01-01T00:00:00",
+    }
+    source = [{"Идентификатор": "pid", "Токен": old_token}, auth]
     storage = _storage_with(source)
 
     response = MagicMock(status_code=200)
@@ -143,7 +148,9 @@ def test_celery_picks_up_updated_token_without_process_restart(report_resources,
         with patch("xtrek.tokens.get_storage", return_value=storage), \
              patch("xtrek.trueapi.requests.post", return_value=response) as request:
             first_pid, old_api, old_nk = check_report.delay().get()
-            source[0]["Токен"] = new_token
+            # The master removes the old JWT and appends its replacement.
+            # Auth is still valid and remains first until its own refresh.
+            source[:] = [auth, {"Идентификатор": "pid", "Токен": new_token}]
             second_pid, new_api, new_nk = check_report.delay().get()
         assert [call.kwargs["headers"]["Authorization"] for call in request.call_args_list] == [
             f"Bearer {old_token}", f"Bearer {new_token}",
@@ -297,3 +304,45 @@ def test_suz_reloads_token_and_retries_get_once():
     assert request.call_count == 2
     assert request.call_args.kwargs["headers"]["clientToken"] == "new-client-token"
     refresher.assert_called_once_with()
+
+
+@pytest.mark.parametrize("path_kind", ["equipment", "aggregate"])
+@pytest.mark.parametrize("jwt_state", ["active", "expired", "missing"])
+def test_true_api_selects_jwt_when_suz_auth_is_first(
+    report_resources, monkeypatch, path_kind, jwt_state,
+):
+    expiry = datetime.now(timezone.utc).timestamp() + (3600 if jwt_state == "active" else -60)
+    jwt = _jwt("123", expiry)
+    auth = {
+        "Идентификатор": "connection", "inn": "123",
+        "Токен": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "ДействуетДо": "2099-01-01T00:00:00",
+    }
+    entries = [auth]
+    if jwt_state != "missing":
+        entries.append({"Идентификатор": "pid", "Токен": jwt})
+    storage = _storage_with(entries)
+    if path_kind == "aggregate":
+        report_storage = MagicMock()
+        report_storage.read_text.return_value = json.dumps({"participant_inn": "123"})
+        monkeypatch.setattr(utils, "get_storage", lambda *args: report_storage)
+
+    def resources():
+        if path_kind == "equipment":
+            _, api, nk, _ = utils._ensure_resources("first.json", config=report_resources)
+            assert nk.token == jwt
+            return api
+        return utils._ensure_aggregate_operation_api(
+            "first.json", "equipment-reports", config=report_resources,
+        )[1]
+
+    with patch("xtrek.tokens.get_storage", return_value=storage), \
+         patch("xtrek.trueapi.requests.post") as request:
+        if jwt_state == "active":
+            api = resources()
+            assert api.headers["Authorization"] == f"Bearer {jwt}"
+        else:
+            with pytest.raises(ValueError, match="Не удалось определить"):
+                resources()
+        request.assert_not_called()
+    assert storage.download.call_count == 1
