@@ -1,0 +1,16 @@
+[Unit]
+Description=xTrek master token refresh (one cycle)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ivankiselev1975
+WorkingDirectory=/home/ivankiselev1975/Scripts/Testing/token-worker-current
+Environment=PYTHONUNBUFFERED=1
+Environment=TOKENS_CONFIG=/home/ivankiselev1975/Scripts/Testing/tokens_config.json
+Environment=suz_worker_config=/home/ivankiselev1975/Scripts/Testing/suz_worker_config.json
+Environment=token_config=/home/ivankiselev1975/Scripts/Testing/suz_worker_config.json
+ExecStart=/usr/bin/flock -n /home/ivankiselev1975/.cache/xtrek/token-worker.lock /home/ivankiselev1975/Scripts/Testing/venv/bin/python -m xtrek.token_worker --once
+TimeoutStartSec=9min
+UMask=0077
