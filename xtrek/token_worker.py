@@ -1,119 +1,103 @@
-import time
+"""One-shot master token refresh, suitable for a systemd timer or cron."""
+import argparse
 import logging
-import os
-import json
 from pathlib import Path
 
-# Импорты ваших модулей
 from .tokens import TokenProcessor
 from .org_manager import OrganizationManager
 from .config_loader import load_config
+from .crpt_auth import get_new_token as refresh_token
 
-# Импортируем ваш метод получения токена
-try:
-    from .crpt_auth import get_new_token as refresh_token
-except ImportError as e:
-    logging.error(f"Критическая ошибка импорта crpt_auth: {e}")
-    raise e
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
 logger = logging.getLogger("TokenWorker")
+
 
 class TokenRefreshWorker:
     def __init__(self):
         self.config = load_config()
-        # Путь к базе организаций
+        self.refresh_before_expiry = int(
+            self.config.get('tokens_refresh_before_expiry_seconds', 1800)
+        )
+        if self.refresh_before_expiry <= 0:
+            raise ValueError("tokens_refresh_before_expiry_seconds must be positive")
         org_storage = Path(__file__).parent / "my_orgs"
         self.org_manager = OrganizationManager(str(org_storage))
         self.tp = TokenProcessor(org_manager=self.org_manager, tokens_read_only=False)
-        self.interval = self.config.get('tokens_update_interval', 600)
-        self.refresh_before_expiry = self.config.get('tokens_refresh_before_expiry_seconds', 900)
 
     def check_and_refresh(self):
-        logger.info("--- Запуск цикла проверки токенов (JWT + Auth/СУЗ) ---")
-        
-        # Синхронизация данных
+        """Refresh only missing/expiring tokens; return False on any failure."""
+        logger.info("--- Проверка токенов в режиме мастера ---")
+        # Never publish over S3 using an unavailable or stale source.
         self.tp._sync_from_s3(required=True)
-
-        if hasattr(self.org_manager, '_sync_from_s3'):
-            self.org_manager._sync_from_s3()
-        self.org_manager.sync_from_disk()
-        
         organizations = self.org_manager.list()
-
+        allowed_inns = self.config.get('tokens_allowed_inns')
+        if allowed_inns is not None:
+            if not isinstance(allowed_inns, list) or not allowed_inns:
+                raise ValueError("tokens_allowed_inns must be a non-empty list")
+            allowed_inns = {str(inn) for inn in allowed_inns}
+            available_inns = {str(org.inn) for org in organizations}
+            if allowed_inns - available_inns:
+                logger.error("Не найдены рабочие ИНН: %s", sorted(allowed_inns - available_inns))
+                return False
+            organizations = [org for org in organizations if str(org.inn) in allowed_inns]
         if not organizations:
-            logger.warning("Список организаций пуст.")
-            return
+            logger.error("Список организаций пуст")
+            return False
 
+        current = refreshed = failed = 0
         for org in organizations:
             inn = str(org.inn) if org.inn else None
             conid = str(org.connection_id) if org.connection_id else None
-            name = org.name
-
             if not inn:
-                logger.debug(f"Пропуск {name}: отсутствует ИНН")
+                logger.error("Организация %s: отсутствует ИНН", org.name)
+                failed += 1
                 continue
 
-            # --- БЛОК 1: Мониторинг JWT (Простой токен) ---
-            # Передаем conid=None, чтобы TokenProcessor искал именно "чистый" JWT для ИНН
-            jwt_token = self.tp.get_token_value_by_inn(inn, conid=None)
-            
-            jwt_remaining = self.tp.get_token_remaining_seconds(inn, token_type='JWT')
-            if jwt_token and (jwt_remaining is None or jwt_remaining > self.refresh_before_expiry):
-                logger.info(f"[{name}] JWT: Актуален")
-            else:
-                logger.warning(f"[{name}] JWT: Требуется обновление (mode='jwt')...")
-                try:
-                    new_jwt = refresh_token(inn, mode='jwt')
-                    if new_jwt:
-                        # Сохраняем без conid (как основной токен организации)
-                        self.tp.save_token(new_jwt, conid=None)
-                        logger.info(f"[{name}] JWT: Успешно обновлен")
-                    else:
-                        logger.error(f"[{name}] JWT: Ошибка получения (проверьте подпись)")
-                except Exception as e:
-                    logger.error(f"Ошибка при обновлении JWT для {name}: {e}")
-
-            # --- БЛОК 2: Мониторинг Auth (Токен СУЗ через Connection ID) ---
+            specs = [('JWT', 'jwt', None)]
             if conid:
-                # Ищем токен именно для этой связки ИНН + ConnectionID
-                auth_token = self.tp.get_token_value_by_inn(inn, token_type='auth', conid=conid)
-                
-                auth_remaining = self.tp.get_token_remaining_seconds(inn, token_type='auth', conid=conid)
-                if auth_token and (auth_remaining is None or auth_remaining > self.refresh_before_expiry):
-                    logger.info(f"[{name}] Auth (СУЗ): Актуален")
-                else:
-                    logger.warning(f"[{name}] Auth (СУЗ): Требуется обновление (mode='auth')...")
-                    try:
-                        # Вызываем с указанием conid и режима auth
-                        new_auth = refresh_token(inn, conid=conid, mode='auth')
-                        if new_auth:
-                            # Сохраняем с привязкой к conid
-                            self.tp.save_token(new_auth, conid=conid)
-                            logger.info(f"[{name}] Auth (СУЗ): Успешно обновлен")
-                        else:
-                            logger.error(f"[{name}] Auth: Ошибка получения (проверьте подпись)")
-                    except Exception as e:
-                        logger.error(f"Ошибка при обновлении Auth для {name}: {e}")
-            else:
-                logger.debug(f"[{name}] Auth: Пропуск (нет ConnectionID)")
+                specs.append(('auth', 'auth', conid))
+            for token_type, mode, connection in specs:
+                try:
+                    token = self.tp.get_token_value_by_inn(
+                        inn, token_type=token_type, conid=connection
+                    )
+                    remaining = self.tp.get_token_remaining_seconds(
+                        inn, token_type=token_type, conid=connection
+                    )
+                    if token and remaining is not None and remaining > self.refresh_before_expiry:
+                        current += 1
+                        logger.info("ИНН %s, %s: актуален, осталось %.0f сек", inn, mode, remaining)
+                        continue
 
-    def start(self, interval: int = None):
-        if interval is None:
-            interval = self.interval
-        logger.info("Воркер мониторинга запущен (Интервал: %s сек).", interval)
-        try:
-            while True:
-                self.check_and_refresh()
-                logger.info("Ожидание следующей итерации...")
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            logger.info("Воркер остановлен пользователем.")
+                    logger.info("ИНН %s, %s: требуется обновление", inn, mode)
+                    new_token = refresh_token(inn, conid=connection, mode=mode)
+                    if not new_token:
+                        raise RuntimeError("Не удалось получить новый токен")
+                    self.tp.save_token(new_token, conid=connection)
+                    if self.tp.get_token_value_by_inn(
+                        inn, token_type=token_type, conid=connection
+                    ) != new_token:
+                        raise RuntimeError("Сохранённый токен не прошёл проверку активности и ИНН")
+                    refreshed += 1
+                    logger.info("ИНН %s, %s: успешно обновлён", inn, mode)
+                except Exception as exc:
+                    failed += 1
+                    logger.error("ИНН %s, %s: ошибка обновления: %s", inn, mode, exc)
+
+        logger.info("Цикл завершён: актуальны=%s, обновлены=%s, ошибки=%s", current, refreshed, failed)
+        return failed == 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Однократное обновление истекающих токенов в режиме мастера")
+    parser.add_argument('--once', action='store_true', help="Выполнить один цикл (поведение по умолчанию)")
+    parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    try:
+        return 0 if TokenRefreshWorker().check_and_refresh() else 1
+    except Exception as exc:
+        logger.error("Цикл обновления токенов не выполнен: %s", exc)
+        return 1
+
 
 if __name__ == "__main__":
-    worker = TokenRefreshWorker()
-    worker.start()
+    raise SystemExit(main())
