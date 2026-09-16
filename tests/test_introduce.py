@@ -73,7 +73,7 @@ def test_create_introduce_task_basic(mock_token_proc, mock_org_man, mock_nk, moc
         {"number": "CERT123", "date": "2024-09-27", "type": "CONFORMITY_DECLARATION"}
     ]
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     # Mock for emission receipts search
     mock_storage.list_objects_v2.return_value = {"Contents": []}

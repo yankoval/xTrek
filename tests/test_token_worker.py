@@ -7,10 +7,11 @@ from xtrek import token_worker
 @pytest.fixture
 def worker(monkeypatch):
     manager = MagicMock()
-    manager.list.return_value = [SimpleNamespace(inn='123', connection_id='connection', name='Company')]
+    manager.list.return_value = [SimpleNamespace(inn='1234567890', connection_id='connection', oms_id='oms', name='Company')]
     processor = MagicMock()
-    processor.get_token_value_by_inn.return_value = 'current'
-    processor.get_token_remaining_seconds.return_value = 3600
+    processor.remaining_for.return_value = 3600
+    processor.true_api_format.return_value = 'UUID'
+    processor.get_token_value_for.return_value = 'new'
     monkeypatch.setattr(token_worker, 'load_config', lambda: {})
     monkeypatch.setattr(token_worker, 'OrganizationManager', lambda path: manager)
     factory = MagicMock(return_value=processor)
@@ -21,50 +22,52 @@ def worker(monkeypatch):
 
 
 def test_fresh_tokens_are_not_reissued_or_written(worker, monkeypatch):
-    refresh = MagicMock()
-    monkeypatch.setattr(token_worker, 'refresh_token', refresh)
+    issue = MagicMock()
+    monkeypatch.setattr(token_worker, 'issue_token', issue)
     assert worker.check_and_refresh()
     worker.tp._sync_from_s3.assert_called_once_with(required=True)
-    refresh.assert_not_called()
-    worker.tp.save_token.assert_not_called()
+    issue.assert_not_called()
+    worker.tp.save_record.assert_not_called()
 
 
 @pytest.mark.parametrize('remaining', [1800, 0, None])
-def test_only_due_token_is_refreshed(worker, monkeypatch, remaining):
-    worker.tp.get_token_remaining_seconds.side_effect = [remaining, 3600]
-    worker.tp.get_token_value_by_inn.side_effect = ['old', 'new', 'current-auth']
-    refresh = MagicMock(return_value='new')
-    monkeypatch.setattr(token_worker, 'refresh_token', refresh)
+def test_only_due_true_api_token_is_refreshed(worker, monkeypatch, remaining):
+    worker.tp.remaining_for.side_effect = [remaining, 3600]
+    record = SimpleNamespace(token='new')
+    issue = MagicMock(return_value=record)
+    monkeypatch.setattr(token_worker, 'issue_token', issue)
     assert worker.check_and_refresh()
-    refresh.assert_called_once_with('123', conid=None, mode='jwt')
-    worker.tp.save_token.assert_called_once_with('new', conid=None)
+    issue.assert_called_once_with('1234567890', purpose='true_api', token_format='UUID',
+                                  connection_id=None, oms_id=None, config=worker.config)
+    worker.tp.save_record.assert_called_once_with(record)
 
 
-def test_missing_auth_is_created_with_connection(worker, monkeypatch):
-    worker.tp.get_token_remaining_seconds.side_effect = [3600, None]
-    worker.tp.get_token_value_by_inn.side_effect = ['current-jwt', None, 'new-auth']
-    refresh = MagicMock(return_value='new-auth')
-    monkeypatch.setattr(token_worker, 'refresh_token', refresh)
+def test_missing_suz_is_created_with_connection_and_oms(worker, monkeypatch):
+    worker.tp.remaining_for.side_effect = [3600, None]
+    record = SimpleNamespace(token='new')
+    issue = MagicMock(return_value=record)
+    monkeypatch.setattr(token_worker, 'issue_token', issue)
     assert worker.check_and_refresh()
-    refresh.assert_called_once_with('123', conid='connection', mode='auth')
-    worker.tp.save_token.assert_called_once_with('new-auth', conid='connection')
+    issue.assert_called_once_with('1234567890', purpose='suz', token_format='UUID',
+                                  connection_id='connection', oms_id='oms', config=worker.config)
+    worker.tp.save_record.assert_called_once_with(record)
 
 
-def test_refresh_failure_preserves_tokens_and_returns_failure(worker, monkeypatch):
-    worker.tp.get_token_remaining_seconds.return_value = 0
-    monkeypatch.setattr(token_worker, 'refresh_token', lambda *a, **kw: None)
+def test_probe_failure_prevents_publish_and_logs_no_secret(worker, monkeypatch, caplog):
+    worker.tp.remaining_for.return_value = 0
+    monkeypatch.setattr(token_worker, 'issue_token', MagicMock(side_effect=RuntimeError('secret credential')))
     assert not worker.check_and_refresh()
-    worker.tp.save_token.assert_not_called()
+    worker.tp.save_record.assert_not_called()
+    assert 'secret credential' not in caplog.text
 
 
 def test_s3_unavailable_prevents_refresh(worker, monkeypatch):
     worker.tp._sync_from_s3.side_effect = RuntimeError('S3 unavailable')
-    refresh = MagicMock()
-    monkeypatch.setattr(token_worker, 'refresh_token', refresh)
+    issue = MagicMock()
+    monkeypatch.setattr(token_worker, 'issue_token', issue)
     monkeypatch.setattr(token_worker, 'TokenRefreshWorker', lambda: worker)
     assert token_worker.main(['--once']) == 1
-    refresh.assert_not_called()
-    worker.tp.save_token.assert_not_called()
+    issue.assert_not_called()
 
 
 @pytest.mark.parametrize('argv', [[], ['--once']])
@@ -78,27 +81,25 @@ def test_cli_runs_exactly_once_and_returns_status(monkeypatch, argv, success):
 
 
 def test_publish_failure_marks_cycle_failed(worker, monkeypatch):
-    worker.tp.get_token_remaining_seconds.side_effect = [0, 3600]
-    worker.tp.save_token.side_effect = RuntimeError('S3 upload failed')
-    monkeypatch.setattr(token_worker, 'refresh_token', lambda *a, **kw: 'new')
+    worker.tp.remaining_for.side_effect = [0, 3600]
+    worker.tp.save_record.side_effect = RuntimeError('S3 upload failed')
+    monkeypatch.setattr(token_worker, 'issue_token', MagicMock(return_value=SimpleNamespace(token='new')))
     assert not worker.check_and_refresh()
 
 
-def test_allowed_inns_exclude_test_organization(worker, monkeypatch):
-    worker.config['tokens_allowed_inns'] = ['123']
-    worker.org_manager.list.return_value.append(
-        SimpleNamespace(inn='1234567890', connection_id='test', name='Test Org')
-    )
-    refresh = MagicMock()
-    monkeypatch.setattr(token_worker, 'refresh_token', refresh)
+def test_allowed_inns_exclude_other_organizations(worker, monkeypatch):
+    worker.config['tokens_allowed_inns'] = ['1234567890']
+    worker.org_manager.list.return_value.append(SimpleNamespace(inn='0987654321', connection_id='other', name='Other'))
+    issue = MagicMock()
+    monkeypatch.setattr(token_worker, 'issue_token', issue)
     assert worker.check_and_refresh()
-    assert worker.tp.get_token_remaining_seconds.call_count == 2
-    refresh.assert_not_called()
+    assert worker.tp.remaining_for.call_count == 2
+    issue.assert_not_called()
 
 
 def test_missing_allowed_organization_fails_without_issuing(worker, monkeypatch):
     worker.config['tokens_allowed_inns'] = ['missing']
-    refresh = MagicMock()
-    monkeypatch.setattr(token_worker, 'refresh_token', refresh)
+    issue = MagicMock()
+    monkeypatch.setattr(token_worker, 'issue_token', issue)
     assert not worker.check_and_refresh()
-    refresh.assert_not_called()
+    issue.assert_not_called()

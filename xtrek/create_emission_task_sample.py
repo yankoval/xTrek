@@ -58,8 +58,8 @@ from .aggregate_operation_reports import (
 #   другого ИНН. Поэтому локальной GS1-базы недостаточно: если ИНН владельца
 #   карточки не найден локально, он определяется через True API product/info
 #   с токеном текущего участника.
-# - Если JWT владельца карточки отсутствует, для чтения linked-карточки и
-#   разрешительных документов используется JWT текущего участника. Это
+# - Если токен True API владельца карточки отсутствует, для чтения linked-карточки и
+#   разрешительных документов используется токен True API текущего участника. Это
 #   корректно для карточек, предоставленных участнику по субаккаунту.
 # - Для операций СУЗ, подписи, отчета о нанесении и ввода в оборот используется
 #   ИНН производителя/участника из производственного задания
@@ -331,11 +331,11 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
 
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
         if not token:
-            raise ValueError(f"JWT token for INN {inn} not found")
+            raise ValueError(f"True API token for INN {inn} not found")
 
-        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(inn, 'true_api'))
 
         # 1. Получаем информацию о gtin из исходного задания на производство с помощью NK.feedproduct
         feed = get_product_info_robust(nk, source_gtin)
@@ -562,19 +562,19 @@ def process_incoming_task(s3_full_key: str):
 
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
-        # У участника может не быть JWT владельца карточки linked GTIN. При
-        # этом его собственный JWT имеет право читать предоставленную карточку,
+        # У участника может не быть токен True API владельца карточки linked GTIN. При
+        # этом его собственный токен True API имеет право читать предоставленную карточку,
         # поэтому используем participant_token только как fallback доступа к НК.
         if not token and participant_token:
-            logger.info(f"[*] JWT токен владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
+            logger.info(f"[*] токен True API владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
             token = participant_token
 
         if not token:
-            raise ValueError(f"JWT токен для ИНН {inn} не найден")
+            raise ValueError(f"токен True API для ИНН {inn} не найден")
 
-        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(inn, 'true_api'))
         feed = get_product_info_robust(nk, normalized_gtin)
 
         if feed is None:
@@ -723,18 +723,18 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
         if not cis_type:
             org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
             token_processor = TokenProcessor(org_manager=org_manager)
-            token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+            token = token_processor.get_token_value_for(inn, purpose='true_api')
 
             # Для linked GTIN карточка читается токеном текущего участника,
-            # если JWT владельца карточки недоступен.
+            # если токен True API владельца карточки недоступен.
             if not token and participant_token:
-                logger.info(f"[*] JWT токен владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
+                logger.info(f"[*] токен True API владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
                 token = participant_token
 
             if not token:
-                raise ValueError(f"JWT токен для ИНН {inn} отсутствует в актуальном снимке S3")
+                raise ValueError(f"токен True API для ИНН {inn} отсутствует в актуальном снимке S3")
 
-            nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
+            nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(inn, 'true_api'))
             feed = get_product_info_robust(nk, gtin)
             if not feed:
                 raise ValueError(f"Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
@@ -882,7 +882,7 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
             raise RuntimeError(f"[!] Недостаточно данных для ИНН {inn} (OMS ID или Client Token)")
 
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=final_client_token)
+        token = token_processor.get_token_value_for(inn, purpose='suz', conid=final_client_token, oms_id=final_oms_id)
 
         if not token:
             storage_orders.mark_error(order_path)
@@ -1064,15 +1064,15 @@ def get_emission_kodes(order_id: str):
             return None
 
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(found_org.inn, token_type='UUID', conid=found_org.connection_id)
+        token = token_processor.get_token_value_for(found_org.inn, purpose='suz', conid=found_org.connection_id, oms_id=oms_id)
         if not token:
             logger.error(f"[!] Активный UUID токен для ИНН {found_org.inn} не найден.")
             return None
 
         suz_api = SUZ(
             token=token, omsId=oms_id, clientToken=found_org.connection_id,
-            token_refresher=lambda: token_processor.refresh_token_value(
-                found_org.inn, 'UUID', found_org.connection_id
+            token_refresher=lambda: token_processor.refresh_token_for(
+                found_org.inn, 'suz', found_org.connection_id, oms_id=oms_id
             ),
         )
 
@@ -1202,25 +1202,21 @@ def _find_production_order_id_by_suz_order_id(order_id: str):
 
 def _get_participant_token():
     """
-    Возвращает любой доступный JWT токен для выполнения запросов к True API (product/info).
+    Возвращает любой доступный токен True API для выполнения запросов к True API (product/info).
     Используется для определения владельца карточки товара (ИНН).
     """
     try:
-        config = load_config('suz_worker_config')
-        # 1. Проверяем в конфиге
-        token = config.get('client_token')
-        if token: return token
-
-        # 2. Проверяем в организации по умолчанию
+        # Назначение client_token неоднозначно: True API читаем только из реестра.
+        # Ищем доступного участника для чтения карточки товара.
         base_path = os.path.dirname(os.path.abspath(__file__))
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         tp = TokenProcessor(org_manager=org_manager)
 
-        # Берем любой первый попавшийся активный JWT токен
+        # Берем любой первый попавшийся активный токен True API
         for org in org_manager.list():
             if not getattr(org, 'inn', None):
                 continue
-            t = tp.get_token_value_by_inn(org.inn, token_type='JWT')
+            t = tp.get_token_value_for(org.inn, purpose='true_api')
             if t: return t
 
         return None
@@ -1654,13 +1650,13 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
         # 5. Получаем данные из НК (ТН ВЭД и разрешительные документы)
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
         if not token:
-            logger.error(f"[!] JWT токен для ИНН {inn} не найден")
+            logger.error(f"[!] токен True API для ИНН {inn} не найден")
             return None
 
-        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(inn, 'true_api'))
         feed = get_product_info_robust(nk, gtin, rd_info=True)
         if not feed:
             logger.error(f"[!] Не удалось получить информацию из НК для GTIN {gtin}")
@@ -1926,7 +1922,7 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
             raise RuntimeError(f"[!] Недостаточно данных для ИНН {inn}")
 
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=final_client_token)
+        token = token_processor.get_token_value_for(inn, purpose='suz', conid=final_client_token, oms_id=final_oms_id)
 
         if not token:
             storage_tasks.mark_error(task_path)
@@ -2074,7 +2070,7 @@ def update_emission_order_status(production_order_id: str):
             return None
 
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(found_org.inn, token_type='UUID', conid=found_org.connection_id)
+        token = token_processor.get_token_value_for(found_org.inn, purpose='suz', conid=found_org.connection_id, oms_id=oms_id)
 
         if not token:
             logger.error(f"[!] Активный токен для ИНН {found_org.inn} не найден.")
@@ -2082,8 +2078,8 @@ def update_emission_order_status(production_order_id: str):
 
         suz_api = SUZ(
             token=token, omsId=oms_id, clientToken=found_org.connection_id,
-            token_refresher=lambda: token_processor.refresh_token_value(
-                found_org.inn, 'UUID', found_org.connection_id
+            token_refresher=lambda: token_processor.refresh_token_for(
+                found_org.inn, 'suz', found_org.connection_id, oms_id=oms_id
             ),
         )
         logger.info(f"[*] Запрос статуса для orderId: {order_id}, gtin: {gtin}")
@@ -2381,15 +2377,11 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
 
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
         if not token:
-            raise RuntimeError(f"[!] JWT токен для ИНН {inn} отсутствует в актуальном снимке S3")
+            raise RuntimeError(f"[!] токен True API для ИНН {inn} отсутствует в актуальном снимке S3")
 
-        # Декодируем JWT для логов, чтобы проверить PID/INN
-        try:
-            payload = token_processor._decode_jwt_payload(token)
-            logger.info(f"[*] Токен участника: INN={payload.get('inn')}, PID={payload.get('pid')}, Name={payload.get('full_name')}")
-        except: pass
+        logger.info("[*] Выбран токен True API участника ИНН %s", inn)
 
         # 3. Подготовка к подписи
         storage_sign = get_storage(signing_dir, s3_config)
@@ -2556,7 +2548,7 @@ def update_utilisation_report_status(order_id: str):
             return None
 
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(found_org.inn, token_type='UUID', conid=found_org.connection_id)
+        token = token_processor.get_token_value_for(found_org.inn, purpose='suz', conid=found_org.connection_id, oms_id=oms_id)
 
         if not token:
             logger.error(f"[!] Токен не найден.")
@@ -2564,8 +2556,8 @@ def update_utilisation_report_status(order_id: str):
 
         suz_api = SUZ(
             token=token, omsId=oms_id, clientToken=found_org.connection_id,
-            token_refresher=lambda: token_processor.refresh_token_value(
-                found_org.inn, 'UUID', found_org.connection_id
+            token_refresher=lambda: token_processor.refresh_token_for(
+                found_org.inn, 'suz', found_org.connection_id, oms_id=oms_id
             ),
         )
 
@@ -2713,19 +2705,19 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         # ИНН владельца карточки или через participant_token для linked доступа.
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
         # Если карточка предоставлена по субаккаунту, токена владельца карточки
         # может не быть. Для чтения НК используем токен текущего участника.
         if not token and participant_token:
-            logger.info(f"[*] JWT токен владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
+            logger.info(f"[*] токен True API владельца карточки {inn} не найден, используем токен участника для доступа к linked GTIN")
             token = participant_token
 
         if not token:
-            logger.error(f"[!] JWT токен для ИНН {inn} не найден, не удалось получить данные из НК")
+            logger.error(f"[!] токен True API для ИНН {inn} не найден, не удалось получить данные из НК")
             return None
 
-        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(inn, 'true_api'))
         feed = get_product_info_robust(nk, gtin, rd_info=True)
         if not feed:
             logger.error(f"[!] Не удалось получить информацию о товаре из НК (feedProduct) для GTIN {gtin}")
@@ -2876,10 +2868,10 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
 
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
         if not token:
-            raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}")
+            raise RuntimeError(f"[!] Не удалось получить токен True API для ИНН {inn}")
 
         # Подпись
         storage_sign = get_storage(signing_dir, s3_config)
@@ -3038,10 +3030,10 @@ def update_aggregation_status(task_uuid: str, group: str):
         base_path = os.path.dirname(os.path.abspath(__file__))
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
         if not token:
-            logger.error(f"[!] JWT токен для ИНН {inn} не найден.")
+            logger.error(f"[!] токен True API для ИНН {inn} не найден.")
             return None
 
         api = HonestSignAPI(token=token)
@@ -3152,7 +3144,7 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
                 gtin = clean_box_number[2:16]
 
                 # Ищем ИНН через NK.feedProduct
-                # Нам нужен токен для NK. Попробуем найти любой доступный JWT токен.
+                # Нам нужен токен для NK. Попробуем найти любой доступный токен True API.
                 base_path = os.path.dirname(os.path.abspath(__file__))
                 org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
                 token_processor = TokenProcessor(org_manager=org_manager)
@@ -3160,11 +3152,11 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
                 # Перебираем организации, пока не найдем токен
                 token = None
                 for org in org_manager.list():
-                    token = token_processor.get_token_value_by_inn(org.inn, token_type='JWT')
+                    token = token_processor.get_token_value_for(org.inn, purpose='true_api')
                     if token: break
 
                 if token:
-                    nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(org.inn, 'JWT'))
+                    nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(org.inn, 'true_api'))
                     feed = get_product_info_robust(nk, gtin)
                     if feed:
                         # В feedProduct обычно ИНН владельца лежит в owner_inn или в result[0].owner_inn
@@ -3288,10 +3280,10 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
 
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
         if not token:
-            raise RuntimeError(f"[!] Не удалось получить JWT токен для ИНН {inn}")
+            raise RuntimeError(f"[!] Не удалось получить токен True API для ИНН {inn}")
 
         # 3. Подготовка к подписи
         storage_sign = get_storage(signing_dir, s3_config)
@@ -3436,11 +3428,11 @@ def create_equipment_set_report(production_order_id: str):
 
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
         if not token:
-            raise ValueError(f"JWT token for INN {inn} not found")
+            raise ValueError(f"True API token for INN {inn} not found")
 
-        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(inn, 'true_api'))
         set_feed = nk.get_set_by_gtin(main_gtin)
         if not set_feed or not set_feed.get('result'):
              raise ValueError(f"Failed to get set composition for {main_gtin}")
@@ -3647,11 +3639,11 @@ def create_equipment_set_report_from_report(production_order_id: str):
 
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
         if not token:
-            raise ValueError(f"JWT token for INN {inn} not found")
+            raise ValueError(f"True API token for INN {inn} not found")
 
-        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_value(inn, 'JWT'))
+        nk = NK(token=token, token_refresher=lambda: token_processor.refresh_token_for(inn, 'true_api'))
         set_feed = nk.get_set_by_gtin(main_gtin)
         if not set_feed or not set_feed.get('result'):
              raise ValueError(f"Failed to get set composition for {main_gtin}")
@@ -4086,10 +4078,10 @@ def update_aggregation_set_status(task_uuid: str, group: str):
         base_path = os.path.dirname(os.path.abspath(__file__))
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
         if not token:
-            logger.error(f"[!] JWT токен для ИНН {inn} не найден.")
+            logger.error(f"[!] токен True API для ИНН {inn} не найден.")
             return None
 
         api = HonestSignAPI(token=token)
@@ -4182,10 +4174,10 @@ def update_introduce_status(order_id: str, group: str):
         base_path = os.path.dirname(os.path.abspath(__file__))
         org_manager = OrganizationManager(os.path.join(base_path, 'my_orgs'))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(inn, token_type='JWT')
+        token = token_processor.get_token_value_for(inn, purpose='true_api')
 
         if not token:
-            logger.error(f"[!] JWT токен для ИНН {inn} не найден.")
+            logger.error(f"[!] токен True API для ИНН {inn} не найден.")
             return None
 
         api = HonestSignAPI(token=token)
@@ -4626,9 +4618,9 @@ def _sign_and_send_aggregate_operation(
         token_processor = TokenProcessor(org_manager=org_manager)
         if refresh_token:
             token_processor.refresh_from_source()
-        token = token_processor.get_token_value_by_inn(participant_inn, token_type="JWT")
+        token = token_processor.get_token_value_for(participant_inn, purpose="true_api")
         if not token:
-            raise RuntimeError(f"[!] JWT токен для ИНН {participant_inn} не найден")
+            raise RuntimeError(f"[!] токен True API для ИНН {participant_inn} не найден")
 
         signing_storage = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
@@ -4757,9 +4749,9 @@ def _update_aggregate_operation_status(operation, task_id, group=None):
     base_path = os.path.dirname(os.path.abspath(__file__))
     org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
     token_processor = TokenProcessor(org_manager=org_manager)
-    token = token_processor.get_token_value_by_inn(participant_inn, token_type="JWT")
+    token = token_processor.get_token_value_for(participant_inn, purpose="true_api")
     if not token:
-        raise RuntimeError(f"[!] JWT токен для ИНН {participant_inn} не найден")
+        raise RuntimeError(f"[!] токен True API для ИНН {participant_inn} не найден")
 
     api_host = _resolve_true_api_host(config, receipt)
     status_result = HonestSignAPI(token=token, host=api_host).doc(document_id, pg=group)
@@ -5242,13 +5234,13 @@ def sign_and_send_cis_information_change(
         base_path = os.path.dirname(os.path.abspath(__file__))
         org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
         token_processor = TokenProcessor(org_manager=org_manager)
-        token = token_processor.get_token_value_by_inn(
+        token = token_processor.get_token_value_for(
             participant_inn,
-            token_type="JWT",
+            purpose="true_api",
         )
         if not token:
             raise RuntimeError(
-                f"[!] Не удалось получить JWT токен для ИНН {participant_inn}"
+                f"[!] Не удалось получить токен True API для ИНН {participant_inn}"
             )
 
         signing_storage = get_storage(signing_dir, s3_config)
@@ -5369,9 +5361,9 @@ def update_cis_information_change_status(task_id: str, group: str = None):
     base_path = os.path.dirname(os.path.abspath(__file__))
     org_manager = OrganizationManager(os.path.join(base_path, "my_orgs"))
     token_processor = TokenProcessor(org_manager=org_manager)
-    token = token_processor.get_token_value_by_inn(participant_inn, token_type="JWT")
+    token = token_processor.get_token_value_for(participant_inn, purpose="true_api")
     if not token:
-        raise RuntimeError(f"[!] JWT токен для ИНН {participant_inn} не найден")
+        raise RuntimeError(f"[!] токен True API для ИНН {participant_inn} не найден")
 
     status_result = HonestSignAPI(token=token).doc(document_id, pg=group)
     if not status_result:

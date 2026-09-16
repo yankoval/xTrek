@@ -55,7 +55,7 @@ class TestGetEmissionKodes(unittest.TestCase):
         mock_org_manager.return_value.list.return_value = [mock_org]
 
         # Mock Token Processor
-        mock_token_processor.return_value.get_token_value_by_inn.return_value = 'test-token'
+        mock_token_processor.return_value.get_token_value_for.return_value = 'test-token'
 
         # Mock SUZ API
         mock_suz_instance = mock_suz.return_value
@@ -105,7 +105,7 @@ class TestGetEmissionKodes(unittest.TestCase):
             mock_org = MagicMock()
             mock_org.oms_id = self.oms_id
             mock_om.return_value.list.return_value = [mock_org]
-            mock_tp.return_value.get_token_value_by_inn.return_value = 'token'
+            mock_tp.return_value.get_token_value_for.return_value = 'token'
 
             # Execute and check for ValueError
             result = get_emission_kodes(self.order_id)

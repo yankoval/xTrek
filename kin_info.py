@@ -2,7 +2,7 @@
 """
 kin_info.py — запрос информации о КИН-коде через True API.
 
-Поиск токена: HONEST_SIGN_TOKEN → ~/tokens.json → tokens_config.json
+Поиск токена: HONEST_SIGN_TOKEN → настроенный реестр TokenProcessor
 Вывод: тип, статус, история, док-ты, вложения для SET.
 
 Использование:
@@ -34,43 +34,16 @@ def find_token():
     t = os.getenv('HONEST_SIGN_TOKEN','')
     if t: print(f'Токен из HONEST_SIGN_TOKEN (ИНН {_jwt_inn(t)})'); return t
 
-    tk = Path.home() / 'tokens.json'
-    if tk.exists():
-        try:
-            with open(tk) as f: d = json.load(f)
-            if isinstance(d,list):
-                for i in d:
-                    tok = i.get('Токен','')
-                    if tok and _jwt_inn(tok)==TARGET_INN: print(f'Токен из ~/tokens.json (ИНН {TARGET_INN})'); return tok
-                if d: tok = d[0].get('Токен','')
-                if tok: print(f'Токен из ~/tokens.json ({_jwt_inn(tok)})'); return tok
-            elif isinstance(d,dict):
-                tok = d.get('Токен','')
-                if tok: print(f'Токен из ~/tokens.json ({_jwt_inn(tok)})'); return tok
-        except: pass
+    from xtrek.tokens import TokenProcessor
+    from xtrek.org_manager import OrganizationManager
 
-    cfg = Path(__file__).parent / 'tokens_config.json'
-    if cfg.exists():
-        try:
-            with open(cfg) as f: c = json.load(f)
-            sc = c.get('s3_config',{})
-            if sc.get('endpoint_url') and sc.get('aws_access_key_id'):
-                import boto3
-                s3 = boto3.client('s3',endpoint_url=sc['endpoint_url'],
-                    aws_access_key_id=sc['aws_access_key_id'],
-                    aws_secret_access_key=sc.get('aws_secret_access_key',''),
-                    region_name=sc.get('region_name','ru-central1'))
-                m = re.match(r's3://([^/]+)/(.+)',c.get('tokens_path',''))
-                if m:
-                    try:
-                        tokens = json.loads(s3.get_object(Bucket=m.group(1),Key=m.group(2))['Body'].read())
-                        if isinstance(tokens,list):
-                            for i in tokens:
-                                tok = i.get('Токен','')
-                                if tok and _jwt_inn(tok)==TARGET_INN: print(f'Токен из S3'); return tok
-                    except: pass
-        except: pass
-    return ''
+    manager = OrganizationManager(str(Path(__file__).parent / 'xtrek' / 'my_orgs'))
+    processor = TokenProcessor(org_manager=manager)
+    token = processor.get_token_value_for(TARGET_INN, purpose='true_api')
+    if token:
+        print(f'Токен True API из настроенного реестра (ИНН {TARGET_INN})')
+    return token or ''
+
 
 
 def get_cis_info(code, token):
