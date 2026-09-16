@@ -236,3 +236,20 @@ def test_create_equipment_aggregation_task_duplicate(mock_get_storage, mock_load
 
     # Verify upload was NOT called
     assert not mock_storage_tasks.upload.called
+
+
+@pytest.mark.parametrize('codes, expected', [
+    (['046070517921585754'], 'PROD123'),
+    ([], None),
+    (['invalid'], None),
+    (['046070517921585754', '046070517921585754'], None),
+])
+def test_retry_reuses_existing_valid_sscc_without_allocating(mock_suz_config, codes, expected):
+    storage = MagicMock()
+    storage.read_text.return_value = json.dumps({'id': 'PROD123', 'palletNumbers': codes})
+    with patch('xtrek.create_emission_task_sample.load_config', return_value=mock_suz_config), \
+         patch('xtrek.create_emission_task_sample.get_storage', return_value=storage), \
+         patch('xtrek.create_emission_task_sample.get_sscc_from_service') as allocate:
+        assert create_equipment_aggregation_task('PROD123') == expected
+    allocate.assert_not_called()
+    storage.upload.assert_not_called()

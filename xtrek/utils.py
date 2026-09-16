@@ -31,6 +31,13 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+def _environment_true_api_token(config=None):
+    # Versioned selection must not be bypassed by a stale shell JWT.
+    if (config or {}).get('tokens_registry_path') or load_config().get('tokens_registry_path'):
+        return None
+    return os.getenv('TRUE_API_TOKEN')
+
+
 def cut_crypto_tail(code: str) -> str:
     """Обрезает криптохвост кода (разделитель \u001d)."""
     return code.split('\u001d')[0]
@@ -500,12 +507,10 @@ class AggregateOperationAnalyzer:
         self._set_check(storage, path, result)
         return result
 
-# Глобальный кеш для ресурсов
+# Кэшируем только конфигурацию. Токены и клиенты не переносятся между отчётами;
+# повторные чтения tokens.json ограничивает снимок задачи в TokenProcessor.
 _RESOURCES_CACHE = {
     'config': None,
-    'api': {}, # token -> api
-    'nk': {},  # token -> nk
-    'last_token': None,
 }
 
 def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None):
@@ -529,14 +534,11 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
         token = nk.token # У NK тоже есть атрибут token
 
     if not token:
-        token = os.getenv("TRUE_API_TOKEN")
-
-    # Если токен все еще не найден, пробуем использовать последний успешно определенный
-    if not token:
-        token = _RESOURCES_CACHE['last_token']
+        token = _environment_true_api_token(config)
 
     if not token:
         # Автодетекция ИНН по файлу
+        detected_inn = None
         s3_config = config.get('s3_config')
         try:
             storage = get_storage(resolved_path, s3_config)
@@ -571,26 +573,19 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
             base_path = os.path.dirname(os.path.abspath(__file__))
             orgs_dir = os.path.join(base_path, 'my_orgs')
             tp = TokenProcessor(orgs_dir=orgs_dir)
-            token_data = tp.get_token_by_inn(detected_inn)
+            token_data = tp.get_token_for(detected_inn, purpose="true_api")
             if token_data:
                 token = token_data.get('Токен')
-                _RESOURCES_CACHE['last_token'] = token
 
     if not token:
         raise ValueError(f"Не удалось определить токен для проверки {resolved_path}. "
                          f"Укажите токен явно или обеспечьте наличие ИНН в базе для GTIN из файла.")
 
     if not api:
-        if token not in _RESOURCES_CACHE['api']:
-            host = config.get('true_api_host')
-            _RESOURCES_CACHE['api'][token] = HonestSignAPI(token=token, host=host)
-        api = _RESOURCES_CACHE['api'][token]
+        api = HonestSignAPI(token=token, host=config.get('true_api_host'))
 
     if not nk:
-        if token not in _RESOURCES_CACHE['nk']:
-            host = config.get('nk_api_host')
-            _RESOURCES_CACHE['nk'][token] = NK(token=token, host=host)
-        nk = _RESOURCES_CACHE['nk'][token]
+        nk = NK(token=token, host=config.get('nk_api_host'))
 
     return resolved_path, api, nk, config
 
@@ -626,7 +621,7 @@ def _ensure_aggregate_operation_api(
     if api:
         return resolved_path, api, config
 
-    token = os.getenv("TRUE_API_TOKEN") or _RESOURCES_CACHE["last_token"]
+    token = _environment_true_api_token(config)
     participant_inn = None
     if not token:
         storage = get_storage(resolved_path, config.get("s3_config"))
@@ -635,22 +630,16 @@ def _ensure_aggregate_operation_api(
         if participant_inn:
             base_path = os.path.dirname(os.path.abspath(__file__))
             processor = TokenProcessor(orgs_dir=os.path.join(base_path, "my_orgs"))
-            token_data = processor.get_token_by_inn(str(participant_inn))
+            token_data = processor.get_token_for(str(participant_inn), purpose="true_api")
             if token_data:
                 token = token_data.get("Токен")
-                _RESOURCES_CACHE["last_token"] = token
     if not token:
         raise ValueError(
             f"Не удалось определить True API токен для {resolved_path}"
             + (f" и ИНН {participant_inn}" if participant_inn else "")
         )
 
-    if token not in _RESOURCES_CACHE["api"]:
-        _RESOURCES_CACHE["api"][token] = HonestSignAPI(
-            token=token,
-            host=config.get("true_api_host"),
-        )
-    return resolved_path, _RESOURCES_CACHE["api"][token], config
+    return resolved_path, HonestSignAPI(token=token, host=config.get("true_api_host")), config
 
 def check_aggregation_report(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
     """Функция для проверки одного отчета об агрегации."""
@@ -959,13 +948,13 @@ def main():
     # Подготовка API и NK если переданы токен или ИНН
     api = None
     nk = None
-    token = args.token or os.getenv("TRUE_API_TOKEN")
+    token = args.token or _environment_true_api_token()
 
     if not token and args.inn:
         base_path = os.path.dirname(os.path.abspath(__file__))
         orgs_dir = os.path.join(base_path, 'my_orgs')
         tp = TokenProcessor(orgs_dir=orgs_dir)
-        token_data = tp.get_token_by_inn(args.inn)
+        token_data = tp.get_token_for(args.inn, purpose="true_api")
         if token_data:
             token = token_data.get('Токен')
             logger.info(f"Получен токен для ИНН {args.inn}")

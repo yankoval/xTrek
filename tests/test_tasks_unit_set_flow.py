@@ -649,3 +649,25 @@ def test_aggregate_operation_waits_for_true_api_state_after_checked_ok(monkeypat
 
     assert not result.successful()
     assert "not reflected in the current aggregate state yet" in str(result.result)
+
+
+def test_order_stops_before_emission_when_equipment_task_fails(monkeypatch):
+    import pytest
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(tasks, 'process_incoming_task', MagicMock(return_value='T-SSCC'))
+    monkeypatch.setattr(tasks, 'create_equipment_aggregation_task', MagicMock(return_value=None))
+    emission = MagicMock()
+    monkeypatch.setattr(tasks, 'create_emission_task', emission)
+    with pytest.raises(RuntimeError, match='create_equipment_aggregation_task failed'):
+        tasks.logic_create_order('input-bucket/Задания/order.json')
+    emission.assert_not_called()
+
+
+def test_order_starts_emission_after_equipment_task_is_ready(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(tasks, 'process_incoming_task', MagicMock(return_value='T-SSCC'))
+    monkeypatch.setattr(tasks, 'create_equipment_aggregation_task', MagicMock(return_value='T-SSCC'))
+    emission = MagicMock(return_value=True)
+    monkeypatch.setattr(tasks, 'create_emission_task', emission)
+    assert 'emission task started' in tasks.logic_create_order('input-bucket/Задания/order.json')
+    emission.assert_called_once_with('T-SSCC', 'chemistry', 'scan')

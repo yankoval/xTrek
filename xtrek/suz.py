@@ -329,7 +329,7 @@ def main():
         logger.debug("Processing:" + args.input_filename)
 
     # Получение параметров
-    token = args.token or os.getenv('HONEST_SIGN_TOKEN')
+    token = args.token or (None if args.inn else os.getenv('HONEST_SIGN_TOKEN'))
     omsId = args.omsId or os.getenv('OMSID')
     clientToken = args.client_token or os.getenv('CLIENT_TOKEN')
     inn = args.inn
@@ -356,7 +356,7 @@ def main():
 
             if not token:
                 token_processor = TokenProcessor(orgs_dir=orgs_dir, org_manager=org_manager)
-                token = token_processor.get_token_value_by_inn(inn, token_type='UUID', conid=clientToken)
+                token = token_processor.get_token_value_for(inn, purpose='suz', conid=clientToken, oms_id=omsId)
                 if token:
                     logger.info("[*] Токен успешно получен из базы")
 

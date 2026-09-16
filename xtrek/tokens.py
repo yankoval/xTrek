@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 from .org_manager import OrganizationManager
 from .storage import get_storage
 from .config_loader import load_config
+from .token_access import PurposeTokenAccess
+from .token_registry import TokenRegistry, TokenValidationError
 
 # Настройка логирования
 logger = logging.getLogger("TokenProcessor")
@@ -20,7 +22,7 @@ home_dir = Path.home()
 
 
 file_path = Path(home_dir,'tokens.json')
-class TokenProcessor:
+class TokenProcessor(PurposeTokenAccess):
     """
     Класс для обработки токенов из JSON файла
     """
@@ -47,8 +49,14 @@ class TokenProcessor:
         self.config = load_config()
 
         self.s3_config = self.config.get('s3_config')
-        self.tokens_path = self.config.get('tokens_path')
-        self.file_path = file_path if file_path else Path(home_dir, 'tokens.json')
+        self.registry_enabled = bool(self.config.get('tokens_registry_path'))
+        self.registry = TokenRegistry()
+        self.tokens_path = self.config.get('tokens_registry_path') or self.config.get('tokens_path')
+        if self.registry_enabled and (self.tokens_path == self.config.get('tokens_path') or
+                                      not self.tokens_path.startswith('s3://') or
+                                      self.tokens_path.rstrip('/').endswith('/tokens.json')):
+            raise TokenValidationError('Use a separate S3 object for tokens_registry_path')
+        self.file_path = file_path if file_path else Path(home_dir, 'tokens-v2.json' if self.registry_enabled else 'tokens.json')
         configured_read_only = self.config.get('tokens_read_only', True)
         if tokens_read_only is None:
             tokens_read_only = configured_read_only
@@ -87,12 +95,13 @@ class TokenProcessor:
             logger.debug("Используется локальное хранилище токенов")
 
         # Если данные еще не загружены (например, не было S3 синхронизации), загружаем сейчас
-        if not self.processed_tokens:
+        if not self._tokens_loaded:
             self.read_tokens_file()
             self.process_tokens()
 
-    @staticmethod
-    def _validate_tokens(data):
+    def _validate_tokens(self, data):
+        if self.registry_enabled:
+            return TokenRegistry.from_dict(data).to_dict()
         if not isinstance(data, list):
             raise ValueError("tokens.json должен содержать JSON-массив")
         for index, item in enumerate(data):
@@ -116,13 +125,14 @@ class TokenProcessor:
                 temporary_path.unlink(missing_ok=True)
 
     def _apply_tokens(self, data):
-        self.tokens = [item.copy() for item in data]
+        data = self._validate_tokens(data)
+        self.tokens = data if self.registry_enabled else [item.copy() for item in data]
         self._tokens_loaded = True
         self.process_tokens()
 
     def _load_command_snapshot(self, force=False):
         """Загружает единый снимок S3 на время текущего процесса CLI."""
-        snapshot_key = str(self.tokens_path)
+        snapshot_key = (str(self.tokens_path), self.registry_enabled)
         try:
             with self._snapshot_lock:
                 if force or snapshot_key not in self._command_snapshots:
@@ -180,6 +190,8 @@ class TokenProcessor:
 
     def _write_tokens_file_atomic(self):
         target = Path(self.file_path)
+        if target.is_symlink():
+            raise TokenValidationError("Token file must not be a symlink")
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = None
         try:
@@ -212,6 +224,9 @@ class TokenProcessor:
 
     def get_token_remaining_seconds(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[float]:
         """Возвращает оставшееся время лучшего токена; None означает отсутствие срока."""
+        if self.registry_enabled:
+            raise TokenValidationError('Use explicit purpose-based token access with registry v2')
+
         normalized_type = 'UUID' if token_type.lower() in {'auth', 'uuid'} else token_type.upper()
         candidates = [
             token for token in self.processed_tokens
@@ -233,6 +248,9 @@ class TokenProcessor:
 
     def get_token_value_by_inn(self, inn: str, token_type: str = 'JWT', conid: Optional[str] = None) -> Optional[str]:
         """Возвращает строку активного токена из снимка текущей команды."""
+        if self.registry_enabled:
+            raise TokenValidationError('Use explicit purpose-based token access with registry v2')
+
         return self._find_active_token(inn, token_type, conid)
 
     @staticmethod
@@ -313,6 +331,12 @@ class TokenProcessor:
             List[Dict[str, Any]]: Список токенов из файла
         """
         if self.tokens_read_only:
+            return self.tokens
+        if self.registry_enabled:
+            path = Path(self.file_path)
+            self.registry = TokenRegistry.load(path) if path.exists() else TokenRegistry()
+            self.tokens = self.registry.to_dict()
+            self._tokens_loaded = True
             return self.tokens
         try:
             # Преобразуем в Path если это строка
@@ -465,6 +489,10 @@ class TokenProcessor:
         if not self._tokens_loaded:
             self.read_tokens_file()
 
+        if self.registry_enabled:
+            self.registry = TokenRegistry.from_dict(self.tokens)
+            self.processed_tokens = [self._record_view(r) for r in self.registry.records]
+            return self.processed_tokens
         self.processed_tokens = []
 
         for token_data in self.tokens:
@@ -539,27 +567,33 @@ class TokenProcessor:
 
         return active_tokens
 
-    def get_token_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
+    def get_token_by_inn(self, inn: str, token_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Находит токен по полю ИНН. Предпочтение отдается активным токенам.
-        Если активный токен не найден, пытается синхронизироваться с S3.
+        Находит активный токен по ИНН в снимке текущей команды.
+        При заданном типе не подставляет токен другого типа.
 
         Args:
             inn (str): ИНН для поиска
+            token_type (Optional[str]): Тип токена (JWT или UUID), если требуется
 
         Returns:
             Optional[Dict[str, Any]]: Найденный токен или None
         """
-        token = self._find_best_token_in_memory(inn)
+        if self.registry_enabled:
+            raise TokenValidationError('Use explicit purpose-based token access with registry v2')
+
+        token = self._find_best_token_in_memory(inn, token_type=token_type)
         return token
 
-    def _find_best_token_in_memory(self, inn: str) -> Optional[Dict[str, Any]]:
+    def _find_best_token_in_memory(self, inn: str, token_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Внутренний метод для поиска активного токена в памяти."""
         if not self.processed_tokens:
             self.process_tokens()
 
         active_tokens = self.get_active_tokens()
         for token in active_tokens:
+            if token_type is not None and token.get('ТипТокена') != token_type:
+                continue
             token_inn = token.get('inn')
             if token_inn and str(token_inn) == str(inn):
                 return token
@@ -637,6 +671,9 @@ class TokenProcessor:
         if self.tokens_read_only:
             logger.warning("Запрещённая попытка сохранить токен в клиентском режиме")
             raise PermissionError("save_token() запрещён при tokens_read_only=true")
+
+        if self.registry_enabled:
+            raise TokenValidationError('Use explicit purpose-based token access with registry v2')
 
         # 1. Синхронизация перед сохранением для получения актуального состояния
         if self.storage and self.tokens_path:
@@ -813,7 +850,7 @@ def main():
 
         # Пример поиска по INN из вашего файла
         inn_to_find = "9723161905"
-        found_token = processor.get_token_by_inn(inn_to_find)
+        found_token = processor.get_token_for(inn_to_find, purpose="true_api")
 
         if found_token:
             logger.info(f"Найден токен для ИНН {inn_to_find}:")

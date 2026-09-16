@@ -245,8 +245,13 @@ def main():
 
     try:
         tokenInn  = args.find_token_by_inn if args.find_token_by_inn else os.getenv("FIND_TOKEN_BY_INN")
-        tokens = TokenProcessor()
-        token = tokens.get_token_by_inn(tokenInn)
+        token = None
+        if tokenInn:
+            tokens = TokenProcessor()
+            token = tokens.get_token_for(tokenInn, purpose="true_api",
+                                         environment="sandbox" if args.sandbox else "production")
+            if not token:
+                raise RuntimeError("Нет активного токена True API для выбранного ИНН")
         if token:
             logger.info(' '.join([str(token.get(k)) for k in [ 'user_status', 'full_name', 'scope', 'inn', 'pid', 'id', 'exp']]))
         nk = NK(sandbox=args.sandbox,token=token['Токен']if token else None)

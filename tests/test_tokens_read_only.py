@@ -1,6 +1,8 @@
 import base64
+import importlib
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,6 +13,7 @@ import pytest
 from xtrek.tokens import TokenProcessor
 from xtrek.nkapi import NK
 from xtrek.suz import SUZ
+from xtrek import utils
 
 
 def _jwt(inn, exp):
@@ -80,6 +83,119 @@ def test_clearing_command_snapshot_downloads_fresh_tokens_for_next_command(tmp_p
     assert first.get_jwt_token_value_by_inn("123") == first_token
     assert second.get_jwt_token_value_by_inn("456") == second_token
     assert storage.download.call_count == 2
+
+
+@pytest.fixture
+def report_resources(monkeypatch):
+    monkeypatch.delenv("TRUE_API_TOKEN", raising=False)
+    config = {"tokens_path": "s3://bucket/tokens.json"}
+    monkeypatch.setattr("xtrek.tokens.load_config", lambda: config)
+    # Avoid organization file synchronization; these JWTs contain the INN.
+    monkeypatch.setattr("xtrek.tokens.OrganizationManager", MagicMock())
+    reports = MagicMock()
+    reports.read_text.side_effect = lambda path: json.dumps({
+        "readyBox": [{"productNumbersFull": [
+            "01" + {"first.json": "04610117654308", "second.json": "04670404506352"}[path] + "21serial"
+        ]}]
+    })
+    monkeypatch.setattr(utils, "get_storage", lambda *args: reports)
+    monkeypatch.setattr(utils, "get_inn_by_gtin", lambda gtin: {
+        "04610117654308": "123", "04670404506352": "456"
+    }[gtin])
+    return config
+
+
+def test_celery_picks_up_updated_token_without_process_restart(report_resources, monkeypatch):
+    from celery import Celery
+
+    # Load the production signal handlers with harmless local configuration.
+    monkeypatch.setenv("YMQ_ACCESS_KEY", "test-access")
+    monkeypatch.setenv("YMQ_SECRET_KEY", "test-secret")
+    monkeypatch.setenv("YMQ_QUEUE_URL", "https://example.test/queue")
+    # Use a separate module namespace so legacy-entrypoint tests stay isolated.
+    spec = importlib.util.spec_from_file_location(
+        "xtrek._token_refresh_test_tasks", Path(utils.__file__).with_name("tasks.py")
+    )
+    tasks = importlib.util.module_from_spec(spec)
+    with patch("xtrek.config_loader.load_config", return_value={
+        "input_bucket": "input-bucket", "internal_bucket": "internal-bucket",
+        "product_group": "chemistry", "contact_person": "scan", "sign": "/tmp/sign",
+    }):
+        spec.loader.exec_module(tasks)
+    app = Celery("token-refresh-regression", broker="memory://")
+    app.conf.update(task_always_eager=True, task_eager_propagates=True)
+
+    @app.task
+    def check_report():
+        _, api, nk, _ = utils._ensure_resources("first.json", config=report_resources)
+        api.get_list_cis_info(["fake-cis"])
+        return os.getpid(), api, nk
+
+    expiry = datetime.now(timezone.utc).timestamp() + 3600
+    old_token = _jwt("123", expiry)
+    new_token = _jwt("123", expiry + 60)
+    auth = {
+        "Идентификатор": "connection", "inn": "123",
+        "Токен": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "ДействуетДо": "2099-01-01T00:00:00",
+    }
+    source = [{"Идентификатор": "pid", "Токен": old_token}, auth]
+    storage = _storage_with(source)
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = []
+    try:
+        with patch("xtrek.tokens.get_storage", return_value=storage), \
+             patch("xtrek.trueapi.requests.post", return_value=response) as request:
+            first_pid, old_api, old_nk = check_report.delay().get()
+            # The master removes the old JWT and appends its replacement.
+            # Auth is still valid and remains first until its own refresh.
+            source[:] = [auth, {"Идентификатор": "pid", "Токен": new_token}]
+            second_pid, new_api, new_nk = check_report.delay().get()
+        assert [call.kwargs["headers"]["Authorization"] for call in request.call_args_list] == [
+            f"Bearer {old_token}", f"Bearer {new_token}",
+        ]
+    finally:
+        from celery.signals import task_postrun, task_prerun
+        task_prerun.disconnect(tasks._start_token_snapshot)
+        task_postrun.disconnect(tasks._finish_token_snapshot)
+        app.close()
+        tasks.app.close()
+
+    assert first_pid == second_pid == os.getpid()
+    assert old_api.headers["Authorization"] == f"Bearer {old_token}"
+    assert new_api.headers["Authorization"] == f"Bearer {new_token}"
+    assert new_nk.token == new_token
+    assert new_api is not old_api
+    assert new_nk is not old_nk
+    assert storage.download.call_count == 2
+
+
+def test_reports_select_their_own_inn_with_one_token_download(report_resources):
+    expiry = datetime.now(timezone.utc).timestamp() + 3600
+    first_token, second_token = _jwt("123", expiry), _jwt("456", expiry)
+    storage = _storage_with([
+        {"Идентификатор": "pid-1", "Токен": first_token},
+        {"Идентификатор": "pid-2", "Токен": second_token},
+    ])
+
+    with patch("xtrek.tokens.get_storage", return_value=storage):
+        _, first_api, first_nk, _ = utils._ensure_resources("first.json", config=report_resources)
+        _, second_api, second_nk, _ = utils._ensure_resources("second.json", config=report_resources)
+
+    assert first_api.token == first_nk.token == first_token
+    assert second_api.token == second_nk.token == second_token
+    assert storage.download.call_count == 1
+
+
+def test_report_does_not_reuse_previous_token_when_its_inn_is_unknown(report_resources, monkeypatch):
+    token = _jwt("123", datetime.now(timezone.utc).timestamp() + 3600)
+    storage = _storage_with([{"Идентификатор": "pid", "Токен": token}])
+    with patch("xtrek.tokens.get_storage", return_value=storage):
+        utils._ensure_resources("first.json", config=report_resources)
+        monkeypatch.setattr(utils, "get_inn_by_gtin", lambda gtin: None)
+        with pytest.raises(ValueError, match="Не удалось определить токен"):
+            utils._ensure_resources("second.json", config=report_resources)
 
 
 def test_client_fails_closed_when_s3_is_unavailable(tmp_path, orgs_dir):
@@ -188,3 +304,45 @@ def test_suz_reloads_token_and_retries_get_once():
     assert request.call_count == 2
     assert request.call_args.kwargs["headers"]["clientToken"] == "new-client-token"
     refresher.assert_called_once_with()
+
+
+@pytest.mark.parametrize("path_kind", ["equipment", "aggregate"])
+@pytest.mark.parametrize("jwt_state", ["active", "expired", "missing"])
+def test_true_api_selects_jwt_when_suz_auth_is_first(
+    report_resources, monkeypatch, path_kind, jwt_state,
+):
+    expiry = datetime.now(timezone.utc).timestamp() + (3600 if jwt_state == "active" else -60)
+    jwt = _jwt("123", expiry)
+    auth = {
+        "Идентификатор": "connection", "inn": "123",
+        "Токен": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "ДействуетДо": "2099-01-01T00:00:00",
+    }
+    entries = [auth]
+    if jwt_state != "missing":
+        entries.append({"Идентификатор": "pid", "Токен": jwt})
+    storage = _storage_with(entries)
+    if path_kind == "aggregate":
+        report_storage = MagicMock()
+        report_storage.read_text.return_value = json.dumps({"participant_inn": "123"})
+        monkeypatch.setattr(utils, "get_storage", lambda *args: report_storage)
+
+    def resources():
+        if path_kind == "equipment":
+            _, api, nk, _ = utils._ensure_resources("first.json", config=report_resources)
+            assert nk.token == jwt
+            return api
+        return utils._ensure_aggregate_operation_api(
+            "first.json", "equipment-reports", config=report_resources,
+        )[1]
+
+    with patch("xtrek.tokens.get_storage", return_value=storage), \
+         patch("xtrek.trueapi.requests.post") as request:
+        if jwt_state == "active":
+            api = resources()
+            assert api.headers["Authorization"] == f"Bearer {jwt}"
+        else:
+            with pytest.raises(ValueError, match="Не удалось определить"):
+                resources()
+        request.assert_not_called()
+    assert storage.download.call_count == 1

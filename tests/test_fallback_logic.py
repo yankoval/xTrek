@@ -43,7 +43,7 @@ def test_process_incoming_task_fallback_to_product_info(mock_token_proc, mock_or
         "tnVedCode10": "3305900009"
     }
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     result = process_incoming_task("s3://bucket/tasks/task1.json")
 
@@ -93,7 +93,7 @@ def test_process_incoming_task_inn_fallback(mock_get_part_token, mock_token_proc
         "tnVedCode10": "3305900009"
     }
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     # We need to handle the fact that NK(token=...) is called twice now
     # 1st for INN detection, 2nd for feedProduct replacement
@@ -132,7 +132,7 @@ def test_process_incoming_task_skips_unit_not_in_allowed_gtins(mock_token_proc, 
     })
 
     mock_get_inn.return_value = "9718180660"
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     mock_nk_inst = mock_nk.return_value
     mock_nk_inst.feedProduct.return_value = {
@@ -174,7 +174,7 @@ def test_process_incoming_task_allows_unit_by_manufacturer_inn(mock_token_proc, 
     })
 
     mock_get_inn.return_value = "9718180660"
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
     mock_nk.return_value.feedProduct.return_value = {"result": [{"is_set": False}]}
 
     result = process_incoming_task("s3://bucket/tasks/task1.json")
@@ -210,7 +210,7 @@ def test_process_incoming_task_logs_vbg_for_skipped_unit(mock_token_proc, mock_o
     })
 
     mock_get_inn.return_value = "9718180660"
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
     mock_nk.return_value.feedProduct.return_value = {"result": [{"is_set": False}]}
 
     result = process_incoming_task("s3://bucket/tasks/task1.json")
@@ -258,7 +258,7 @@ def test_create_introduce_task_with_fallback(mock_token_proc, mock_org_man, mock
         {"number": "CERT123", "date": "2024-09-27", "type": "CONFORMITY_DECLARATION"}
     ]
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     res = create_introduce_task("uuid", production_date="2026-04-01")
 

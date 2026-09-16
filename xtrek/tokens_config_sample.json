@@ -2,8 +2,7 @@
     "tokens_path": "s3://your-bucket-name/tokens.json",
     "tokens_read_only": true,
     "orgs_path": "s3://your-bucket-name/my_orgs/",
-    "tokens_update_interval": 60,
-    "tokens_refresh_before_expiry_seconds": 900,
+    "tokens_refresh_before_expiry_seconds": 1800,
     "vbg_api_key_path": "s3://your-bucket-name/secrets/gs1rus-api-key",
     "sign": "s3://your-bucket-name/tst/",
     "SIGNING_TIMEOUT": 60,
@@ -13,5 +12,10 @@
         "aws_access_key_id": "YOUR_ACCESS_KEY",
         "aws_secret_access_key": "YOUR_SECRET_KEY",
         "region_name": "ru-central1"
-    }
+    },
+    "tokens_environment": "production",
+    "true_api_token_format": "UUID",
+    "true_api_token_formats": {},
+    "suz_ping_sign": true,
+    "tokens_registry_path": "s3://your-bucket-name/tokens-v2.json"
 }

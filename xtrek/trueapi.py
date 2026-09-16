@@ -240,7 +240,9 @@ def main():
             base_path = os.path.dirname(os.path.abspath(__file__))
             orgs_dir = os.path.join(base_path, 'my_orgs')
             tp = TokenProcessor(orgs_dir=orgs_dir)
-            token_data = tp.get_token_by_inn(token_inn)
+            token_data = tp.get_token_for(token_inn, purpose="true_api")
+            if not token_data:
+                raise RuntimeError("Нет активного токена True API для выбранного ИНН")
             if token_data:
                 meta = ['user_status', 'full_name', 'scope', 'inn', 'pid', 'id', 'exp']
                 logger.info('Токен: ' + ' '.join([str(token_data.get(k, '-')) for k in meta]))

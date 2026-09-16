@@ -205,7 +205,7 @@ def test_sign_and_send_uses_manual_cis_information_change_wrapper(tmp_path, monk
     (sign_dir / signature_name).write_text("BASE64-SIGNATURE")
 
     token_processor = MagicMock()
-    token_processor.get_token_value_by_inn.return_value = "JWT"
+    token_processor.get_token_value_for.return_value = "JWT"
     monkeypatch.setattr(workflow, "OrganizationManager", MagicMock())
     monkeypatch.setattr(workflow, "TokenProcessor", MagicMock(return_value=token_processor))
     api = MagicMock()
@@ -249,7 +249,7 @@ def test_update_status_uses_receipt_group_and_persists_result(tmp_path, monkeypa
     }))
 
     token_processor = MagicMock()
-    token_processor.get_token_value_by_inn.return_value = "JWT"
+    token_processor.get_token_value_for.return_value = "JWT"
     monkeypatch.setattr(workflow, "OrganizationManager", MagicMock())
     monkeypatch.setattr(workflow, "TokenProcessor", MagicMock(return_value=token_processor))
     api = MagicMock()
