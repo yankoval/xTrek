@@ -48,7 +48,7 @@ def test_create_emission_task_set(mock_dependencies):
     deps['get_inn'].return_value = '1234567890'
 
     # Mock Token
-    deps['tp'].return_value.get_token_value_by_inn.return_value = 'fake-token'
+    deps['tp'].return_value.get_token_value_for.return_value = 'fake-token'
 
     # Mock NK.feedProduct for SET
     mock_nk_instance = deps['nk'].return_value
@@ -90,7 +90,7 @@ def test_create_emission_task_unit(mock_dependencies):
     deps['get_inn'].return_value = '1234567890'
 
     # Mock Token
-    deps['tp'].return_value.get_token_value_by_inn.return_value = 'fake-token'
+    deps['tp'].return_value.get_token_value_for.return_value = 'fake-token'
 
     # Mock NK.feedProduct for UNIT
     mock_nk_instance = deps['nk'].return_value
@@ -132,7 +132,7 @@ def test_create_emission_task_nk_failure(mock_dependencies):
     deps['get_inn'].return_value = '1234567890'
 
     # Mock Token
-    deps['tp'].return_value.get_token_value_by_inn.return_value = 'fake-token'
+    deps['tp'].return_value.get_token_value_for.return_value = 'fake-token'
 
     # Mock NK failure (both methods)
     mock_nk_instance = deps['nk'].return_value

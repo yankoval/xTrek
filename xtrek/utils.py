@@ -31,6 +31,13 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+def _environment_true_api_token(config=None):
+    # Versioned selection must not be bypassed by a stale shell JWT.
+    if (config or {}).get('tokens_registry_path') or load_config().get('tokens_registry_path'):
+        return None
+    return os.getenv('TRUE_API_TOKEN')
+
+
 def cut_crypto_tail(code: str) -> str:
     """Обрезает криптохвост кода (разделитель \u001d)."""
     return code.split('\u001d')[0]
@@ -510,7 +517,7 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
         token = nk.token # У NK тоже есть атрибут token
 
     if not token:
-        token = os.getenv("TRUE_API_TOKEN")
+        token = _environment_true_api_token(config)
 
     if not token:
         # Автодетекция ИНН по файлу
@@ -549,7 +556,7 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
             base_path = os.path.dirname(os.path.abspath(__file__))
             orgs_dir = os.path.join(base_path, 'my_orgs')
             tp = TokenProcessor(orgs_dir=orgs_dir)
-            token_data = tp.get_token_by_inn(detected_inn, token_type="JWT")
+            token_data = tp.get_token_for(detected_inn, purpose="true_api")
             if token_data:
                 token = token_data.get('Токен')
 
@@ -597,7 +604,7 @@ def _ensure_aggregate_operation_api(
     if api:
         return resolved_path, api, config
 
-    token = os.getenv("TRUE_API_TOKEN")
+    token = _environment_true_api_token(config)
     participant_inn = None
     if not token:
         storage = get_storage(resolved_path, config.get("s3_config"))
@@ -606,7 +613,7 @@ def _ensure_aggregate_operation_api(
         if participant_inn:
             base_path = os.path.dirname(os.path.abspath(__file__))
             processor = TokenProcessor(orgs_dir=os.path.join(base_path, "my_orgs"))
-            token_data = processor.get_token_by_inn(str(participant_inn), token_type="JWT")
+            token_data = processor.get_token_for(str(participant_inn), purpose="true_api")
             if token_data:
                 token = token_data.get("Токен")
     if not token:
@@ -922,13 +929,13 @@ def main():
     # Подготовка API и NK если переданы токен или ИНН
     api = None
     nk = None
-    token = args.token or os.getenv("TRUE_API_TOKEN")
+    token = args.token or _environment_true_api_token()
 
     if not token and args.inn:
         base_path = os.path.dirname(os.path.abspath(__file__))
         orgs_dir = os.path.join(base_path, 'my_orgs')
         tp = TokenProcessor(orgs_dir=orgs_dir)
-        token_data = tp.get_token_by_inn(args.inn, token_type="JWT")
+        token_data = tp.get_token_for(args.inn, purpose="true_api")
         if token_data:
             token = token_data.get('Токен')
             logger.info(f"Получен токен для ИНН {args.inn}")

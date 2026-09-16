@@ -65,7 +65,7 @@ def test_create_equipment_set_report_from_report_success(
     # 3. NK and tokens
     mock_get_inn.return_value = "1234567890"
     mock_token_processor = mock_token_processor_class.return_value
-    mock_token_processor.get_token_value_by_inn.return_value = "token"
+    mock_token_processor.get_token_value_for.return_value = "token"
     mock_nk = mock_nk_class.return_value
     mock_nk.get_set_by_gtin.return_value = {
         "result": [{
@@ -158,7 +158,7 @@ def test_create_equipment_set_report_insufficient_codes(
     # 3. NK and tokens
     mock_get_inn.return_value = "1234567890"
     mock_token_processor = mock_token_processor_class.return_value
-    mock_token_processor.get_token_value_by_inn.return_value = "token"
+    mock_token_processor.get_token_value_for.return_value = "token"
     mock_nk = mock_nk_class.return_value
     mock_nk.get_set_by_gtin.return_value = {
         "result": [{

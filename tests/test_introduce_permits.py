@@ -59,7 +59,7 @@ def test_create_introduce_task_with_new_permits_logic(mock_token_proc, mock_org_
         }
     ]
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     res = create_introduce_task("uuid", production_date="2026-04-01")
 
@@ -129,7 +129,7 @@ def test_create_introduce_task_with_new_permits_logic_verified(mock_token_proc, 
         }
     ]
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     res = create_introduce_task("uuid", production_date="2026-04-01")
 
@@ -175,7 +175,7 @@ def test_create_introduce_task_error_no_permits(mock_token_proc, mock_org_man, m
 
     mock_nk_inst.get_active_permit_documents_by_gtin.return_value = []
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     res = create_introduce_task("uuid", production_date="2026-04-01")
 

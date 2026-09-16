@@ -156,7 +156,7 @@ def test_auto_inn_detection(mock_get_storage, mock_tp_class, mock_get_inn, tmp_p
     # Mock GS1 processor and TokenProcessor
     mock_get_inn.return_value = "1234567890"
     mock_tp = mock_tp_class.return_value
-    mock_tp.get_token_by_inn.return_value = {"Токен": "AUTO_TOKEN"}
+    mock_tp.get_token_for.return_value = {"Токен": "AUTO_TOKEN"}
 
     from xtrek.utils import main
     import sys

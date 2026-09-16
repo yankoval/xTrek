@@ -24,7 +24,7 @@ def _config(tmp_path):
 
 def _mock_token_lookup(monkeypatch):
     token_processor = MagicMock()
-    token_processor.get_token_value_by_inn.return_value = "JWT"
+    token_processor.get_token_value_for.return_value = "JWT"
     monkeypatch.setattr(workflow, "OrganizationManager", MagicMock())
     monkeypatch.setattr(
         workflow,

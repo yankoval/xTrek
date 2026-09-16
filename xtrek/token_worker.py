@@ -6,7 +6,7 @@ from pathlib import Path
 from .tokens import TokenProcessor
 from .org_manager import OrganizationManager
 from .config_loader import load_config
-from .crpt_auth import get_new_token as refresh_token
+from .crpt_auth import issue_token
 
 logger = logging.getLogger("TokenWorker")
 
@@ -25,6 +25,10 @@ class TokenRefreshWorker:
 
     def check_and_refresh(self):
         """Refresh only missing/expiring tokens; return False on any failure."""
+        with self.tp.writer_lock():
+            return self._check_and_refresh_locked()
+
+    def _check_and_refresh_locked(self):
         logger.info("--- Проверка токенов в режиме мастера ---")
         # Never publish over S3 using an unavailable or stale source.
         self.tp._sync_from_s3(required=True)
@@ -43,6 +47,11 @@ class TokenRefreshWorker:
             logger.error("Список организаций пуст")
             return False
 
+        purposes = self.config.get('tokens_purposes', ['true_api', 'suz'])
+        if (not isinstance(purposes, list) or not purposes
+                or any(p not in {'true_api', 'suz'} for p in purposes)):
+            raise ValueError('tokens_purposes must be a non-empty list of true_api/suz')
+
         current = refreshed = failed = 0
         for org in organizations:
             inn = str(org.inn) if org.inn else None
@@ -52,36 +61,36 @@ class TokenRefreshWorker:
                 failed += 1
                 continue
 
-            specs = [('JWT', 'jwt', None)]
-            if conid:
-                specs.append(('auth', 'auth', conid))
-            for token_type, mode, connection in specs:
+            specs = [('true_api', None)] if 'true_api' in purposes else []
+            if conid and 'suz' in purposes:
+                specs.append(('suz', conid))
+            for purpose, connection in specs:
+                issuance_attempted = False
                 try:
-                    token = self.tp.get_token_value_by_inn(
-                        inn, token_type=token_type, conid=connection
-                    )
-                    remaining = self.tp.get_token_remaining_seconds(
-                        inn, token_type=token_type, conid=connection
-                    )
-                    if token and remaining is not None and remaining > self.refresh_before_expiry:
+                    environment = self.config.get('tokens_environment', 'production')
+                    oms = org.oms_id if purpose == 'suz' else None
+                    scope = dict(conid=connection, oms_id=oms, environment=environment)
+                    token_format = self.tp.true_api_format(inn) if purpose == 'true_api' else 'UUID'
+                    remaining = self.tp.remaining_for(inn, purpose, **scope)
+                    if remaining is not None and remaining > self.refresh_before_expiry:
                         current += 1
-                        logger.info("ИНН %s, %s: актуален, осталось %.0f сек", inn, mode, remaining)
+                        logger.info("ИНН %s, %s: актуален, осталось %.0f сек", inn, purpose, remaining)
                         continue
-
-                    logger.info("ИНН %s, %s: требуется обновление", inn, mode)
-                    new_token = refresh_token(inn, conid=connection, mode=mode)
-                    if not new_token:
-                        raise RuntimeError("Не удалось получить новый токен")
-                    self.tp.save_token(new_token, conid=connection)
-                    if self.tp.get_token_value_by_inn(
-                        inn, token_type=token_type, conid=connection
-                    ) != new_token:
-                        raise RuntimeError("Сохранённый токен не прошёл проверку активности и ИНН")
+                    # Validate the selected organization/OMS before any issuance.
+                    self.tp._scope(inn, purpose, **scope)
+                    issuance_attempted = True
+                    record = issue_token(inn, purpose=purpose, token_format=token_format,
+                                         connection_id=connection, oms_id=oms, config=self.config)
+                    self.tp.save_record(record)
+                    if self.tp.get_token_value_for(inn, purpose, **scope) != record.token:
+                        raise RuntimeError("Saved token is not active in its scope")
                     refreshed += 1
-                    logger.info("ИНН %s, %s: успешно обновлён", inn, mode)
+                    logger.info("ИНН %s, %s: проверен и опубликован", inn, purpose)
                 except Exception as exc:
                     failed += 1
-                    logger.error("ИНН %s, %s: ошибка обновления: %s", inn, mode, exc)
+                    if purpose == 'suz' and issuance_attempted:
+                        logger.error("СУЗ: выдача или публикация не подтверждена; прежний токен подключения мог быть отозван")
+                    logger.error("ИНН %s, %s: ошибка обновления (%s)", inn, purpose, type(exc).__name__)
 
         logger.info("Цикл завершён: актуальны=%s, обновлены=%s, ошибки=%s", current, refreshed, failed)
         return failed == 0

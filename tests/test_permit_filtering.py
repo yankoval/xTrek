@@ -150,7 +150,7 @@ def test_create_introduce_task_uses_new_permit_method(mock_token_proc, mock_org_
         }
     ]
 
-    mock_token_proc.return_value.get_token_value_by_inn.return_value = "fake_token"
+    mock_token_proc.return_value.get_token_value_for.return_value = "fake_token"
 
     res = create_introduce_task("uuid", production_date="2026-04-01")
 

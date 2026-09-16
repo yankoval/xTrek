@@ -12,5 +12,10 @@
         "aws_access_key_id": "YOUR_ACCESS_KEY",
         "aws_secret_access_key": "YOUR_SECRET_KEY",
         "region_name": "ru-central1"
-    }
+    },
+    "tokens_environment": "production",
+    "true_api_token_format": "UUID",
+    "true_api_token_formats": {},
+    "suz_ping_sign": true,
+    "tokens_registry_path": "s3://your-bucket-name/tokens-v2.json"
 }

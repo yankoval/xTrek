@@ -35,7 +35,7 @@ def test_create_virtual_production_tasks(mock_nk_class, mock_token_processor_cla
     mock_storage.read_text.return_value = json.dumps(source_order)
 
     mock_get_inn.return_value = "1234567890"
-    mock_token_processor_class.return_value.get_token_value_by_inn.return_value = "mock_jwt_token"
+    mock_token_processor_class.return_value.get_token_value_for.return_value = "mock_jwt_token"
 
     mock_nk = mock_nk_class.return_value
     mock_nk.feedProduct.side_effect = [
