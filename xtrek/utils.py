@@ -289,7 +289,8 @@ class AggregateOperationAnalyzer:
             if not isinstance(item, dict):
                 continue
             info = item.get("cisInfo") or {}
-            requested_code = item.get("requestedCis")
+            # Emptied aggregates may expose only cisInfo.requestedCis, without cis.
+            requested_code = item.get("requestedCis") or info.get("requestedCis")
             code = info.get("cis") or requested_code
             if code:
                 status_map[code] = info

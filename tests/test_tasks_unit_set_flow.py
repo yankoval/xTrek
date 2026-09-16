@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -607,6 +608,48 @@ def test_reaggregation_checked_ok_runs_final_report_check(monkeypatch):
     assert result == "reaggregation-removing T-SSCC-2 finished and report tagged"
     update_status.assert_called_once_with("T-SSCC-2", "chemistry")
     final_check.assert_called_once_with("T-SSCC-2")
+
+
+def test_reaggregation_receipt_finishes_last_set_with_nested_requested_cis(monkeypatch, tmp_path):
+    from xtrek import utils
+
+    tasks = import_tasks(monkeypatch)
+    task_id = "T-SSCC-last-set"
+    aggregate = "00000123456789012345"
+    child = "010460000000000021ABC"
+    report = tmp_path / f"{task_id}.json"
+    report.write_text(json.dumps({
+        "participant_inn": "7701234567",
+        "reaggregation_type": "REMOVING",
+        "uitu": aggregate,
+        "uit_uitu_list": [{"uit_uitu": child}],
+    }))
+    api = MagicMock()
+    api.get_list_cis_info.return_value = [
+        {"cisInfo": {"requestedCis": aggregate, "status": "DISAGGREGATION"}},
+        {"cisInfo": {"cis": child, "status": "INTRODUCED", "packageType": "SET"}},
+    ]
+    api.get_aggregated_cis_list.return_value = {}
+    monkeypatch.setattr(
+        utils, "_ensure_aggregate_operation_api",
+        lambda *args: (str(report), api, {}),
+    )
+    monkeypatch.setattr(tasks, "update_reaggregation_status", MagicMock(
+        return_value={"status": "CHECKED_OK"},
+    ))
+    monkeypatch.setattr(tasks, "check_reaggregation_removing_report",
+                        utils.check_reaggregation_removing_report)
+    send = MagicMock()
+    monkeypatch.setattr(tasks, "sign_and_send_reaggregation", send)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket",
+        "key": f"reaggregationReceipts/{task_id}.json",
+    }])
+
+    assert result.successful()
+    assert json.loads(report.with_suffix(".json.tags").read_text()) == {"check": "finished"}
+    send.assert_not_called()
 
 
 def test_aggregate_operation_nonfinal_status_retries(monkeypatch):

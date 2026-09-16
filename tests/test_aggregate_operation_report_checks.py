@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+import requests
+
 from xtrek import utils
 from xtrek.trueapi import HonestSignAPI
 
@@ -238,6 +241,84 @@ def test_reaggregation_removing_final_check_sets_finished(tmp_path):
 
     assert result == {"finished": ["All requested codes are removed"]}
     assert _tags(path) == {"check": "finished"}
+
+
+@pytest.mark.parametrize("composition_status", [200, 404])
+def test_removing_last_set_recognizes_nested_requested_cis(tmp_path, composition_status):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    # An emptied box can omit cis and return only cisInfo.requestedCis.
+    info = MagicMock(status_code=200)
+    info.json.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"}},
+        {"cisInfo": {"cis": CHILD, "status": "INTRODUCED", "packageType": "SET"}},
+    ]
+    composition = MagicMock(status_code=composition_status)
+    composition.json.return_value = {AGGREGATE: {}}
+    Path(f"{path}.tags").write_text(json.dumps({"check": "aggregatenotfound"}))
+
+    with patch("xtrek.trueapi.requests.post", side_effect=[info, composition]):
+        result = utils.check_reaggregation_removing_report(
+            path, api=HonestSignAPI(token="test-token"), config={},
+        )
+
+    assert result == {"finished": ["All requested codes are removed"]}
+    assert _tags(path) == {"check": "finished"}
+
+
+def test_disaggregation_recognizes_nested_requested_cis(tmp_path):
+    path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
+    api = MagicMock()
+    api.get_list_cis_info.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"}},
+    ]
+    api.get_aggregated_cis_list.return_value = {}
+
+    result = utils.check_disaggregation_report(path, api=api, config={})
+
+    assert result == {"finished": ["All aggregates are disaggregated"]}
+    assert _tags(path) == {"check": "finished"}
+
+
+@pytest.mark.parametrize("status", [None, "NOT_FOUND"])
+def test_nested_requested_cis_without_known_aggregate_is_not_finished(tmp_path, status):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    api = MagicMock()
+    api.get_list_cis_info.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": status}},
+    ]
+    api.get_aggregated_cis_list.return_value = {}
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert result == {"aggregatenotfound": [AGGREGATE]}
+    assert _tags(path) == {"check": "aggregatenotfound"}
+
+
+@pytest.mark.parametrize("endpoint", ["info", "composition"])
+@pytest.mark.parametrize("existing_tag", [None, ""])
+def test_removing_retryable_http_error_preserves_tag(tmp_path, endpoint, existing_tag):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    tags_path = Path(f"{path}.tags")
+    if existing_tag is not None:
+        tags_path.write_text(json.dumps({"check": existing_tag}))
+    info = MagicMock(status_code=200)
+    info.json.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"}},
+    ]
+    failure = MagicMock(status_code=503)
+    failure.raise_for_status.side_effect = requests.HTTPError("503 Service Unavailable")
+    responses = [failure] if endpoint == "info" else [info, failure]
+
+    with patch("xtrek.trueapi.requests.post", side_effect=responses):
+        result = utils.check_reaggregation_removing_report(
+            path, api=HonestSignAPI(token="test-token"), config={},
+        )
+
+    assert result == {"api_error": ["503 Service Unavailable"]}
+    if existing_tag is None:
+        assert not tags_path.exists()
+    else:
+        assert _tags(path) == {"check": existing_tag}
 
 
 def test_reaggregation_removing_missing_aggregate_is_not_finished(tmp_path):
