@@ -446,6 +446,16 @@ class AggregateOperationAnalyzer:
 
         direct_children = self._direct_children(composition, aggregate_code)
         present_codes = set(removed_codes) & direct_children
+        # A disaggregated parent may retain its historical composition. Only
+        # disregard it when every requested code is known and no longer points
+        # to that parent; a missing/error response must never imply success.
+        if target_status in DISAGGREGATION_FINAL_STATUSES and all(
+            (status_map.get(code) or {}).get("status")
+            in AGGREGATE_OPERATION_ACTIVE_STATUSES | DISAGGREGATION_FINAL_STATUSES
+            and (status_map.get(code) or {}).get("parent") != aggregate_code
+            for code in removed_codes
+        ):
+            present_codes = set()
         if not present_codes:
             result = {"finished": ["All requested codes are removed"]}
             self._set_check(storage, path, result)

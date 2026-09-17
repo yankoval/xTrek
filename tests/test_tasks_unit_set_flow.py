@@ -4,6 +4,8 @@ import sys
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 class _EagerResult:
     def __init__(self, value=None, error=None):
@@ -610,26 +612,31 @@ def test_reaggregation_checked_ok_runs_final_report_check(monkeypatch):
     final_check.assert_called_once_with("T-SSCC-2")
 
 
-def test_reaggregation_receipt_finishes_last_set_with_nested_requested_cis(monkeypatch, tmp_path):
+@pytest.mark.parametrize("retained_composition", [False, True])
+@pytest.mark.parametrize("child_type", ["SET", "BOX"])
+def test_reaggregation_receipt_finishes_last_child_with_nested_requested_cis(
+    monkeypatch, tmp_path, retained_composition, child_type,
+):
     from xtrek import utils
 
     tasks = import_tasks(monkeypatch)
     task_id = "T-SSCC-last-set"
     aggregate = "00000123456789012345"
-    child = "010460000000000021ABC"
+    child = "00000123456789012346" if child_type == "BOX" else "010460000000000021ABC"
+    code_field = "kitu" if child_type == "BOX" else "uit_uitu"
     report = tmp_path / f"{task_id}.json"
     report.write_text(json.dumps({
         "participant_inn": "7701234567",
         "reaggregation_type": "REMOVING",
         "uitu": aggregate,
-        "uit_uitu_list": [{"uit_uitu": child}],
+        "uit_uitu_list": [{code_field: child}],
     }))
     api = MagicMock()
     api.get_list_cis_info.return_value = [
         {"cisInfo": {"requestedCis": aggregate, "status": "DISAGGREGATION"}},
-        {"cisInfo": {"cis": child, "status": "INTRODUCED", "packageType": "SET"}},
+        {"cisInfo": {"cis": child, "status": "INTRODUCED", "packageType": child_type}},
     ]
-    api.get_aggregated_cis_list.return_value = {}
+    api.get_aggregated_cis_list.return_value = {aggregate: {child: []}} if retained_composition else {}
     monkeypatch.setattr(
         utils, "_ensure_aggregate_operation_api",
         lambda *args: (str(report), api, {}),
