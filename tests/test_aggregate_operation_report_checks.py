@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+import requests
+
 from xtrek import utils
 from xtrek.trueapi import HonestSignAPI
 
@@ -81,6 +84,26 @@ def test_disaggregation_initial_check_sets_empty_check_tag(tmp_path):
     assert _tags(path) == {"check": ""}
 
 
+def test_disaggregation_accepts_true_api_level1_box(tmp_path):
+    path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
+    api = FakeTrueAPI(
+        {
+            AGGREGATE: {
+                "cis": AGGREGATE,
+                "status": "INTRODUCED",
+                "packageType": "LEVEL1",
+                "generalPackageType": "BOX",
+            },
+        },
+        {AGGREGATE: {CHILD: []}},
+    )
+
+    result = utils.check_disaggregation_report(path, api=api, config={})
+
+    assert result is None
+    assert _tags(path) == {"check": ""}
+
+
 def test_disaggregation_final_check_sets_finished(tmp_path):
     path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
     api = FakeTrueAPI(
@@ -97,6 +120,26 @@ def test_disaggregation_final_check_sets_finished(tmp_path):
     result = utils.check_disaggregation_report(path, api=api, config={})
 
     assert result == {"finished": ["All aggregates are disaggregated"]}
+    assert _tags(path) == {"check": "finished"}
+
+
+def test_disaggregation_missing_aggregate_is_finished_only_after_checked_ok(tmp_path):
+    path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
+    api = FakeTrueAPI({}, {})
+
+    initial_result = utils.check_disaggregation_report(path, api=api, config={})
+
+    assert initial_result == {"aggregatenotfound": [AGGREGATE]}
+    assert _tags(path) == {"check": "aggregatenotfound"}
+
+    final_result = utils.check_disaggregation_report(
+        path,
+        api=api,
+        config={},
+        final=True,
+    )
+
+    assert final_result == {"finished": ["All aggregates are disaggregated"]}
     assert _tags(path) == {"check": "finished"}
 
 
@@ -146,6 +189,34 @@ def test_reaggregation_removing_initial_check_sets_empty_tag(tmp_path):
     assert _tags(path) == {"check": ""}
 
 
+def test_reaggregation_removing_accepts_true_api_level1_box(tmp_path):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    api = FakeTrueAPI(
+        {
+            AGGREGATE: {
+                "cis": AGGREGATE,
+                "status": "INTRODUCED",
+                "packageType": "LEVEL1",
+                "generalPackageType": "BOX",
+                "ownerInn": "7701234567",
+            },
+            CHILD: {
+                "cis": CHILD,
+                "status": "INTRODUCED",
+                "packageType": "UNIT",
+                "ownerInn": "7701234567",
+                "parent": AGGREGATE,
+            },
+        },
+        {AGGREGATE: {CHILD: []}},
+    )
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert result is None
+    assert _tags(path) == {"check": ""}
+
+
 def test_reaggregation_removing_final_check_sets_finished(tmp_path):
     path = _write_report(tmp_path / "removing.json", _removing_report())
     api = FakeTrueAPI(
@@ -170,6 +241,148 @@ def test_reaggregation_removing_final_check_sets_finished(tmp_path):
 
     assert result == {"finished": ["All requested codes are removed"]}
     assert _tags(path) == {"check": "finished"}
+
+
+@pytest.mark.parametrize("composition_status", [200, 404])
+def test_removing_last_set_recognizes_nested_requested_cis(tmp_path, composition_status):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    # An emptied box can omit cis and return only cisInfo.requestedCis.
+    info = MagicMock(status_code=200)
+    info.json.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"}},
+        {"cisInfo": {"cis": CHILD, "status": "INTRODUCED", "packageType": "SET"}},
+    ]
+    composition = MagicMock(status_code=composition_status)
+    composition.json.return_value = {AGGREGATE: {}}
+    Path(f"{path}.tags").write_text(json.dumps({"check": "aggregatenotfound"}))
+
+    with patch("xtrek.trueapi.requests.post", side_effect=[info, composition]):
+        result = utils.check_reaggregation_removing_report(
+            path, api=HonestSignAPI(token="test-token"), config={},
+        )
+
+    assert result == {"finished": ["All requested codes are removed"]}
+    assert _tags(path) == {"check": "finished"}
+
+
+@pytest.mark.parametrize("target_status", ["DISAGGREGATION", "DISAGGREGATED"])
+@pytest.mark.parametrize("child_status", ["INTRODUCED", "DISAGGREGATION"])
+@pytest.mark.parametrize("parent", [None, "00000123456789012346"])
+def test_removing_ignores_retained_composition_of_disaggregated_parent(
+    tmp_path, target_status, child_status, parent,
+):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    api = FakeTrueAPI({
+        AGGREGATE: {"requestedCis": AGGREGATE, "status": target_status},
+        CHILD: {"cis": CHILD, "status": child_status, "parent": parent},
+    }, {AGGREGATE: {CHILD: []}})
+    Path(f"{path}.tags").write_text(json.dumps({"check": "statusmismatch-wrongstatus"}))
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert result == {"finished": ["All requested codes are removed"]}
+    assert _tags(path) == {"check": "finished"}
+
+
+@pytest.mark.parametrize("child_info", [
+    {}, {"status": "NOT_FOUND"}, {"status": "UNKNOWN"},
+    {"status": "INTRODUCED", "parent": AGGREGATE},
+])
+def test_retained_composition_is_not_finished_without_confirmed_detachment(tmp_path, child_info):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    api = FakeTrueAPI({
+        AGGREGATE: {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"},
+        CHILD: child_info,
+    }, {AGGREGATE: {CHILD: []}})
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert "finished" not in result
+    assert _tags(path)["check"] != "finished"
+
+
+def test_retained_composition_requires_every_requested_code_to_be_detached(tmp_path):
+    second = CHILD + "2"
+    report = _removing_report()
+    report["uit_uitu_list"].append({"uit_uitu": second})
+    path = _write_report(tmp_path / "removing.json", report)
+    api = FakeTrueAPI({
+        AGGREGATE: {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"},
+        CHILD: {"cis": CHILD, "status": "INTRODUCED"},
+        second: {"cis": second, "status": "INTRODUCED", "parent": AGGREGATE},
+    }, {AGGREGATE: {CHILD: [], second: []}})
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert "finished" not in result
+    assert _tags(path)["check"] != "finished"
+
+
+def test_active_parent_composition_is_not_ignored_when_child_has_no_parent(tmp_path):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    api = FakeTrueAPI({
+        AGGREGATE: {"cis": AGGREGATE, "status": "INTRODUCED", "packageType": "BOX"},
+        CHILD: {"cis": CHILD, "status": "INTRODUCED", "packageType": "UNIT"},
+    }, {AGGREGATE: {CHILD: []}})
+
+    assert utils.check_reaggregation_removing_report(path, api=api, config={}) is None
+    assert _tags(path) == {"check": ""}
+
+
+def test_disaggregation_recognizes_nested_requested_cis(tmp_path):
+    path = _write_report(tmp_path / "disaggregation.json", _disaggregation_report())
+    api = MagicMock()
+    api.get_list_cis_info.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"}},
+    ]
+    api.get_aggregated_cis_list.return_value = {}
+
+    result = utils.check_disaggregation_report(path, api=api, config={})
+
+    assert result == {"finished": ["All aggregates are disaggregated"]}
+    assert _tags(path) == {"check": "finished"}
+
+
+@pytest.mark.parametrize("status", [None, "NOT_FOUND"])
+def test_nested_requested_cis_without_known_aggregate_is_not_finished(tmp_path, status):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    api = MagicMock()
+    api.get_list_cis_info.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": status}},
+    ]
+    api.get_aggregated_cis_list.return_value = {}
+
+    result = utils.check_reaggregation_removing_report(path, api=api, config={})
+
+    assert result == {"aggregatenotfound": [AGGREGATE]}
+    assert _tags(path) == {"check": "aggregatenotfound"}
+
+
+@pytest.mark.parametrize("endpoint", ["info", "composition"])
+@pytest.mark.parametrize("existing_tag", [None, "", "statusmismatch-wrongstatus"])
+def test_removing_retryable_http_error_preserves_tag(tmp_path, endpoint, existing_tag):
+    path = _write_report(tmp_path / "removing.json", _removing_report())
+    tags_path = Path(f"{path}.tags")
+    if existing_tag is not None:
+        tags_path.write_text(json.dumps({"check": existing_tag}))
+    info = MagicMock(status_code=200)
+    info.json.return_value = [
+        {"cisInfo": {"requestedCis": AGGREGATE, "status": "DISAGGREGATION"}},
+    ]
+    failure = MagicMock(status_code=503)
+    failure.raise_for_status.side_effect = requests.HTTPError("503 Service Unavailable")
+    responses = [failure] if endpoint == "info" else [info, failure]
+
+    with patch("xtrek.trueapi.requests.post", side_effect=responses):
+        result = utils.check_reaggregation_removing_report(
+            path, api=HonestSignAPI(token="test-token"), config={},
+        )
+
+    assert result == {"api_error": ["503 Service Unavailable"]}
+    if existing_tag is None:
+        assert not tags_path.exists()
+    else:
+        assert _tags(path) == {"check": existing_tag}
 
 
 def test_reaggregation_removing_missing_aggregate_is_not_finished(tmp_path):
