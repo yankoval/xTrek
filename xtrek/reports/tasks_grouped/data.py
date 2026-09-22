@@ -109,6 +109,8 @@ def _collect(
         if not isinstance(passport, Mapping):
             raise TasksDataError(f"PasportData must be an object in task {ref.key}")
         quantity = _decimal(payload.get("Quantity"), field="Quantity", ref=ref)
+        if quantity == 0:
+            continue
         pack_quantity = _decimal(
             passport.get("Product_PackQty"),
             field="PasportData.Product_PackQty",

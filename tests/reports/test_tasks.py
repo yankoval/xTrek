@@ -50,7 +50,7 @@ def test_collects_only_requested_moscow_calendar_day():
 
     result = collect(source, day="2026-08-25")
 
-    assert result.tasks == 2
+    assert result.tasks == 1
     assert result.labels == Decimal(3)
     assert result.codes == Decimal(12)
     assert source.read_keys == ["Задания/second.json", "Задания/empty.json"]
@@ -117,7 +117,7 @@ def test_build_and_render_approved_tasks_report():
     assert "<table" not in message
     assert "style=" not in message
     assert "<b>Дата:</b> 25.08.2026\n" in message
-    assert "<b>Заданий:</b> 2\n" in message
+    assert "<b>Заданий:</b> 1\n" in message
     assert "<b>Паспортов (ярлыков):</b> 1 640\n" in message
     assert "<b>Кодов:</b> 9 840\n" in message
     assert "<br" not in message
