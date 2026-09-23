@@ -7,6 +7,7 @@ import sys
 
 TEST_MODULES = (
     'token_registry', 'token_purpose_integration', 'token_worker', 'token_regressions',
+    'token_master_resilience',
     'tokens_read_only', 'tokens_new', 'token_logic_fix', 'document_send_idempotency',
     'suz_new_methods', 'aggregate_operations', 'cis_information_change', 'create_emission_task',
     'create_virtual_tasks', 'equipment_set_report_from_report', 'fallback_logic', 'get_kodes',

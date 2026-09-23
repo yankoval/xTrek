@@ -13,4 +13,6 @@ Environment=suz_worker_config=/home/ivankiselev1975/Scripts/Testing/suz_worker_c
 Environment=token_config=/home/ivankiselev1975/Scripts/Testing/suz_worker_config.json
 ExecStart=/usr/bin/flock -n /home/ivankiselev1975/.cache/xtrek/token-worker.lock /home/ivankiselev1975/Scripts/Testing/venv/bin/python -m xtrek.token_worker --once
 TimeoutStartSec=9min
+TimeoutStopSec=45s
+KillMode=control-group
 UMask=0077

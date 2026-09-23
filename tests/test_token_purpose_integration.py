@@ -10,6 +10,7 @@ import pytest
 import requests
 from xtrek import crpt_auth, tokens
 from xtrek.token_registry import TokenRecord, TokenRegistry, TokenValidationError
+from token_lock_store import MemoryLockStore
 
 INN = '1234567890'
 CON = '11111111-1111-4111-8111-111111111111'
@@ -37,8 +38,12 @@ def jwt_record():
 @pytest.fixture
 def processor(monkeypatch, tmp_path):
     config = {'tokens_registry_path': 's3://test/tokens-v2.json', 'tokens_path': 's3://test/tokens.json',
+              'tokens_master_local_lock_dir': str(tmp_path),
               'true_api_token_format': 'UUID'}
     storage = MagicMock()
+    lock_store = MemoryLockStore()
+    storage.read_lock_object.side_effect = lock_store.read_lock_object
+    storage.write_lock_object.side_effect = lock_store.write_lock_object
     data = TokenRegistry([record(), record('suz'), jwt_record()]).to_dict()
     storage.download.side_effect = lambda remote, local: Path(local).write_text(json.dumps(data))
     storage.upload.side_effect = lambda local, remote: data.update(json.loads(Path(local).read_text()))
@@ -251,16 +256,19 @@ def test_failed_publish_does_not_change_active_snapshot(processor):
 def test_lock_contention_and_release_on_failure(processor):
     tp, storage, _ = processor
     tp.tokens_read_only = False
-    storage.acquire_lock.return_value = False
+    storage.write_lock_object.side_effect = lambda *args: None
     with pytest.raises(TokenValidationError, match='already locked'):
         with tp.writer_lock():
             pytest.fail('Busy master must not run')
     storage.release_lock.assert_not_called()
-    storage.acquire_lock.return_value = True
+    lock_store = MemoryLockStore()
+    storage.read_lock_object.side_effect = lock_store.read_lock_object
+    storage.write_lock_object.side_effect = lock_store.write_lock_object
     with pytest.raises(RuntimeError):
         with tp.writer_lock():
             raise RuntimeError('cycle failed')
-    storage.release_lock.assert_called_once_with('s3://test/tokens.json.master.lock')
+    assert not lock_store.locked
+    storage.release_lock.assert_not_called()
 
 
 def test_wrong_true_api_host_rejected_before_use(processor):
