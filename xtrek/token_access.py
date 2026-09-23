@@ -1,26 +1,23 @@
 """Purpose-based access shared by master and consumers during migration."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from uuid import uuid4
 import os
 from urllib.parse import urlsplit
 from .token_registry import TokenRecord, TokenValidationError, jwt_claims
+from .token_master_lock import TokenMasterLock
+from .token_runtime import current_runtime
 
 
 class PurposeTokenAccess:
     @contextmanager
     def writer_lock(self):
-        """One master/CLI issuer at a time. Crashed writers leave a visible lock."""
+        """Serialize master/CLI and recover only locks of proven dead owners."""
         if self.tokens_read_only or not self.storage:
             raise PermissionError('A writable S3 source is required for the master lock')
         path = self.config.get('tokens_master_lock_path') or (
             self.config.get('tokens_path') or self.tokens_path) + '.master.lock'
-        if not self.storage.acquire_lock(path, str(uuid4())):
-            raise TokenValidationError('Token master is already locked; no issuance attempted')
-        try:
+        with TokenMasterLock(self.storage, path, self.config).hold():
             yield
-        finally:
-            self.storage.release_lock(path)
 
     def true_api_format(self, inn):
         policies = self.config.get('true_api_token_formats', {})
@@ -118,6 +115,9 @@ class PurposeTokenAccess:
         return result
 
     def save_record(self, record):
+        runtime = current_runtime()
+        if runtime:
+            runtime.assert_owner()
         if self.tokens_read_only:
             raise PermissionError('Clients cannot publish tokens')
         if not isinstance(record, TokenRecord) or record.remaining_seconds() <= 0:
@@ -151,8 +151,10 @@ class PurposeTokenAccess:
             self._write_tokens_file_atomic()
             if record.remaining_seconds() <= 0:
                 raise TokenValidationError('Token expired before publication')
+            if runtime:
+                runtime.assert_owner()
             self._sync_to_s3()
-        except Exception:
+        except BaseException:
             # A candidate cache is not proof of successful S3 publication.
             self._apply_tokens(previous)
             raise

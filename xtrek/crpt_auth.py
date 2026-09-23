@@ -12,6 +12,8 @@ import requests
 from .config_loader import load_config
 from .storage import get_storage
 from .token_registry import TokenRecord, TokenValidationError, jwt_expiry
+from .token_runtime import (checkpoint, cleanup_budget, current_runtime,
+                            DeadlineExpired, MasterStopped, master_runtime, request_timeout)
 
 logger = logging.getLogger(__name__)
 AUTH_BASES = {
@@ -38,6 +40,7 @@ def sign_data(data, inn, config, *, detached=False):
         storage.write_text(source, data)
         deadline = time.monotonic() + timeout
         while not storage.exists(signed):
+            checkpoint()
             if time.monotonic() >= deadline:
                 raise TokenIssuanceError('Signing timed out')
             time.sleep(min(1, max(0, deadline - time.monotonic())))
@@ -45,24 +48,30 @@ def sign_data(data, inn, config, *, detached=False):
         if not signature:
             raise TokenIssuanceError('Empty signature')
         base64.b64decode(signature, validate=True)
-        return signature
     except TokenIssuanceError:
         raise
     except Exception:
         raise TokenIssuanceError('Signing folder operation failed') from None
     finally:
-        for path in (signed, source):
-            try:
-                if storage.exists(path):
-                    storage.delete(path)
-            except Exception:
-                logger.warning('Could not remove a temporary signing object')
+        try:
+            with cleanup_budget(5):
+                for path in (signed, source):
+                    try:
+                        if storage.exists(path):
+                            storage.delete(path)
+                    except Exception:
+                        logger.warning('Could not remove a temporary signing object')
+        except DeadlineExpired:
+            logger.warning('Temporary signing object cleanup exceeded its budget')
+    checkpoint()
+    return signature
 
 
 def _request(session, method, url, *, attempts=1, **kwargs):
     for attempt in range(attempts):
+        checkpoint()
         try:
-            response = session.request(method, url, timeout=(10, 30), allow_redirects=False, **kwargs)
+            response = session.request(method, url, timeout=request_timeout(), allow_redirects=False, **kwargs)
         except requests.RequestException:
             if attempt + 1 < attempts:
                 time.sleep(attempt + 1)
@@ -134,6 +143,9 @@ def issue_token(inn, *, purpose, token_format='UUID', connection_id=None, oms_id
             suffix += '/' + connection_id
         issued_at = datetime.now(timezone.utc)
         # Never retry issuance: SUZ reissue invalidates the previous connection token.
+        runtime = current_runtime()
+        if runtime:
+            runtime.assert_owner()
         result = _request(session, 'POST', base + suffix, json=payload)
         if not isinstance(result, dict):
             raise TokenIssuanceError('Invalid issuance response')
@@ -177,8 +189,18 @@ def main(argv=None):
     parser.add_argument('--timeout', type=int, default=60)
     args = parser.parse_args(argv)
     try:
+        with master_runtime():
+            return _run_cli(args, TokenProcessor)
+    except (Exception, MasterStopped) as exc:
+        logger.error('Token generation failed (%s)', type(exc).__name__)
+        return 1
+
+
+def _run_cli(args, TokenProcessor):
+    try:
         processor = TokenProcessor(tokens_read_only=False)
         config = dict(processor.config, SIGNING_TIMEOUT=args.timeout)
+        current_runtime().configure(config)
         purpose = 'suz' if args.mode == 'auth' else 'true_api'
         token_format = 'JWT' if args.mode == 'jwt' else 'UUID'
         if purpose == 'true_api' and token_format == 'UUID' and not processor.registry_enabled:

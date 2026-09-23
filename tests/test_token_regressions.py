@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 from xtrek import tokens, token_worker, token_registry, token_access
 from xtrek.token_registry import TokenRecord, TokenRegistry, TokenValidationError
+from token_lock_store import MemoryLockStore
 
 INN = '1234567890'
 OTHER = '0987654321'
@@ -47,11 +48,11 @@ def legacy_jwt():
                        expireDate=datetime.fromtimestamp(exp, timezone.utc).isoformat(), expiry_source='jwt_exp')
 
 
-class MemoryS3:
+class MemoryS3(MemoryLockStore):
     def __init__(self):
+        super().__init__()
         self.data = TokenRegistry().to_dict()
         self.uploads = []
-        self.locked = False
         self.download_hook = None
         self.fail_upload = False
 
@@ -66,22 +67,13 @@ class MemoryS3:
         self.data = json.loads(Path(local).read_text())
         self.uploads.append(remote)
 
-    def acquire_lock(self, path, content):
-        if self.locked:
-            return False
-        self.locked = True
-        return True
-
-    def release_lock(self, path):
-        self.locked = False
-
-
 @pytest.fixture
 def lab(monkeypatch, tmp_path):
     Clock.instant = datetime(2030, 1, 1, tzinfo=timezone.utc)
     for module in (tokens, token_registry, token_access):
         monkeypatch.setattr(module, 'datetime', Clock)
     config = {'tokens_path': 's3://test/tokens.json', 'tokens_registry_path': 's3://test/tokens-v2.json',
+              'tokens_master_local_lock_dir': str(tmp_path),
               'tokens_allowed_inns': [INN], 'true_api_token_format': 'UUID'}
     storage = MemoryS3()
     organization = SimpleNamespace(inn=INN, connection_id=CON, oms_id=OMS, name='Synthetic')

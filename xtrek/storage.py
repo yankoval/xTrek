@@ -7,6 +7,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 import shutil
 from botocore.exceptions import ClientError
+from botocore.config import Config
+from .token_runtime import current_runtime, checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -175,12 +177,17 @@ class LocalStorage(BaseStorage):
 
 class S3Storage(BaseStorage):
     def __init__(self, s3_config):
+        options = {}
+        if current_runtime() is not None:
+            options['config'] = Config(connect_timeout=5, read_timeout=10,
+                                       retries={'mode': 'standard', 'total_max_attempts': 2})
         self.s3 = boto3.client(
             's3',
             endpoint_url=s3_config.get('endpoint_url', 'https://storage.yandexcloud.net'),
             aws_access_key_id=s3_config.get('aws_access_key_id'),
             aws_secret_access_key=s3_config.get('aws_secret_access_key'),
-            region_name=s3_config.get('region_name', 'ru-central1')
+            region_name=s3_config.get('region_name', 'ru-central1'),
+            **options
         )
 
     def _parse_s3_url(self, url):
@@ -222,12 +229,49 @@ class S3Storage(BaseStorage):
     def download(self, remote_path, local_path):
         bucket, key = self._parse_s3_url(remote_path)
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        if current_runtime() is not None:
+            checkpoint()
+            response = self.s3.get_object(Bucket=bucket, Key=key)
+            try:
+                Path(local_path).write_bytes(response['Body'].read())
+            finally:
+                response['Body'].close()
+            return local_path
         self.s3.download_file(bucket, key, str(local_path))
         return local_path
 
     def upload(self, local_path, remote_path):
         bucket, key = self._parse_s3_url(remote_path)
+        if current_runtime() is not None:
+            checkpoint()
+            # No background transfer threads may outlive the writer lock.
+            self.s3.put_object(Bucket=bucket, Key=key, Body=Path(local_path).read_bytes())
+            return
         self.s3.upload_file(str(local_path), bucket, key)
+
+    def read_lock_object(self, path):
+        bucket, key = self._parse_s3_url(path)
+        try:
+            result = self.s3.get_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            if exc.response.get('Error', {}).get('Code') in {'NoSuchKey', '404'}:
+                return None
+            raise
+        try:
+            return result['Body'].read().decode('utf-8'), result['ETag']
+        finally:
+            result['Body'].close()
+
+    def write_lock_object(self, path, content, etag):
+        bucket, key = self._parse_s3_url(path)
+        condition = {'IfNoneMatch': '*'} if etag is None else {'IfMatch': etag}
+        try:
+            return self.s3.put_object(Bucket=bucket, Key=key,
+                                      Body=content.encode('utf-8'), **condition)['ETag']
+        except ClientError as exc:
+            if exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode') == 412:
+                return None
+            raise
 
     def mark_processing(self, path):
         bucket, key = self._parse_s3_url(path)
