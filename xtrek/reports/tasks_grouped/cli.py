@@ -18,13 +18,13 @@ from ..tasks.source import (
     DEFAULT_PREFIX,
     S3TaskSource,
 )
-from .data import collect, collect_range
+from .data import collect, collect_range, normalize_group_by
 from .document import build
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Отчет о заданиях с группировкой по артикулам"
+        description="Отчёт о заданиях с группировкой по артикулам или операторам"
     )
     period = result.add_mutually_exclusive_group(required=True)
     period.add_argument("--date", help="Дата отчёта в формате YYYY-MM-DD")
@@ -40,6 +40,13 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--format", choices=("html", "md", "pdf"), default="html")
     result.add_argument(
+        "--group-by",
+        nargs="*",
+        default=[],
+        metavar="FIELD",
+        help="От 0 до 2 полей через пробел: operator article или article operator; без полей — только итоги",
+    )
+    result.add_argument(
         "--profile",
         choices=("browser", "printer", "messenger"),
         default=None,
@@ -49,7 +56,7 @@ def parser() -> argparse.ArgumentParser:
         "--details",
         choices=("auto", "full", "none"),
         default="auto",
-        help="Расшифровка по файлам: автоматически, полностью или без неё",
+        help="Расшифровка по файлам: автоматически, полностью или без неё; без группировок всегда только итоги",
     )
     result.add_argument("--output", help="Файл результата; HTML/MD без него идут в stdout")
     result.add_argument("--bucket", default=DEFAULT_BUCKET)
@@ -62,6 +69,10 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = parser().parse_args(argv)
+    try:
+        arguments.group_by = normalize_group_by(arguments.group_by)
+    except TasksDataError as exc:
+        parser().error(str(exc))
     if arguments.date_from and not arguments.date_to:
         parser().error("--to обязателен вместе с --from")
     if arguments.date and arguments.date_to:
@@ -84,6 +95,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 source,
                 day=arguments.date,
                 timezone_name=arguments.timezone,
+                group_by=arguments.group_by,
             )
         else:
             data = collect_range(
@@ -91,6 +103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 date_from=arguments.date_from,
                 date_to=arguments.date_to,
                 timezone_name=arguments.timezone,
+                group_by=arguments.group_by,
             )
         include_details = arguments.details == "full" or (
             arguments.details == "auto" and profile != "messenger"

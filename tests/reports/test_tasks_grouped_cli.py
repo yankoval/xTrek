@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from xtrek.reports.tasks import TaskObjectRef
 from xtrek.reports.tasks_grouped import cli
 
@@ -20,7 +22,7 @@ class FakeSource:
         return {
             "Article": "A-100",
             "Quantity": 4,
-            "PasportData": {"Product_PackQty": 6},
+            "PasportData": {"Product_PackQty": 6, "operator": "Иван"},
         }
 
 
@@ -34,6 +36,8 @@ def test_cli_writes_grouped_markdown(monkeypatch, tmp_path, capsys):
             "2026-08-25",
             "--format",
             "md",
+            "--group-by",
+            "article",
             "--output",
             str(output),
         ]
@@ -56,6 +60,8 @@ def test_cli_omits_file_details_from_messenger_by_default(monkeypatch, capsys):
         [
             "--date",
             "2026-08-25",
+            "--group-by",
+            "article",
             "--format",
             "html",
             "--profile",
@@ -70,6 +76,44 @@ def test_cli_omits_file_details_from_messenger_by_default(monkeypatch, capsys):
     assert "task.json" not in content
 
 
+@pytest.mark.parametrize("period", [
+    ["--date", "2026-08-25"],
+    ["--from", "2026-08-25T12:59", "--to", "2026-08-25T13:00"],
+])
+@pytest.mark.parametrize("output_format", ["html", "md"])
+def test_cli_groups_by_operator(monkeypatch, capsys, period, output_format):
+    monkeypatch.setattr(cli, "S3TaskSource", FakeSource)
+    code = cli.main(period + ["--group-by", "operator", "--format", output_format,
+                              "--profile", "messenger"])
+    content = capsys.readouterr().out
+    assert code == 0
+    assert "по операторам" in content
+    assert "Оператор" in content
+    assert "Иван" in content
+    assert "A-100" not in content and "A\\-100" not in content
+    assert "Итого" in content
+    assert "Расшифровка по файлам" not in content
+
+
+def test_cli_operator_pdf_passes_operator_document_to_renderer(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "S3TaskSource", FakeSource)
+
+    def fake_render(document, **options):
+        assert document.metadata["group_by"] == "operator article"
+        assert document.pages[0].blocks[1].rows[0] == ("A-100", 1, 4, 24)
+        assert document.pages[0].blocks[1].rows[-1] == ("Итого по оператору: Иван", 1, 4, 24)
+        assert len(document.pages) == 2
+        assert options["output_format"] == "pdf"
+        assert options["profile"] == "printer"
+        return b"%PDF-test"
+
+    monkeypatch.setattr(cli, "render", fake_render)
+    output = tmp_path / "operators.pdf"
+    assert cli.main(["--date", "2026-08-25", "--group-by", "operator", "article",
+                     "--format", "pdf", "--output", str(output)]) == 0
+    assert output.read_bytes() == b"%PDF-test"
+
+
 def test_cli_supports_grouped_minute_range(monkeypatch, capsys):
     monkeypatch.setattr(cli, "S3TaskSource", FakeSource)
 
@@ -79,6 +123,8 @@ def test_cli_supports_grouped_minute_range(monkeypatch, capsys):
             "2026-08-25T12:59",
             "--to",
             "2026-08-25T13:00",
+            "--group-by",
+            "article",
             "--format",
             "html",
             "--profile",

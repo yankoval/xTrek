@@ -31,12 +31,14 @@ def report(request):
 def collect_report(request, report):
     def collect(payloads):
         source = FakeSource(payloads)
+        grouping = {"group_by": "article"} if report is tasks_grouped else {}
         if request.param == "day":
-            return report.collect(source, day="2026-08-25")
+            return report.collect(source, day="2026-08-25", **grouping)
         return report.collect_range(
             source,
             date_from="2026-08-25T09:00",
             date_to="2026-08-25T11:00",
+            **grouping,
         )
 
     return collect
