@@ -55,6 +55,7 @@ def test_collects_requested_day_and_groups_by_article():
 
     result = collect(
         source,
+        group_by="article",
         day="2026-08-25",
         generated_at=datetime.fromisoformat("2026-08-25T16:30:45+00:00"),
     )
@@ -81,7 +82,7 @@ def test_missing_article_is_grouped_explicitly():
         ]
     )
 
-    result = collect(source, day="2026-08-25")
+    result = collect(source, day="2026-08-25", group_by="article")
 
     assert result.groups[0].article == "Без артикула"
 
@@ -99,6 +100,7 @@ def test_builds_aligned_table_with_totals_and_messenger_cards():
     document = build(
         collect(
             source,
+            group_by="article",
             day="2026-08-25",
             generated_at=datetime.fromisoformat("2026-08-25T16:30:45+00:00"),
         )
@@ -139,7 +141,7 @@ def test_details_can_be_omitted_for_compact_messenger_output():
         ]
     )
 
-    document = build(collect(source, day="2026-08-25"), include_details=False)
+    document = build(collect(source, day="2026-08-25", group_by="article"), include_details=False)
     message = render(document, output_format="html", profile="messenger")
 
     assert len(document.pages) == 1
@@ -163,6 +165,7 @@ def test_grouped_range_shows_dates_in_file_details():
 
     data = collect_range(
         source,
+        group_by="article",
         date_from="2026-08-25T23:59",
         date_to="2026-08-26T00:00",
         generated_at=datetime.fromisoformat("2026-08-26T01:00:00+03:00"),
