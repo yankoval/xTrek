@@ -333,3 +333,147 @@ def test_cli_failure_does_not_output_signature(native, monkeypatch, capsys):
     assert not result.out
     assert "secret" not in result.err
     assert "0x80090006" in result.err
+
+
+LOCAL_INN = '7701234567'
+OTHER_INN = '7707654321'
+
+
+def local_config():
+    return {'sign': 's3://unused/sign', 'signing': {
+        'local_by_inn': {LOCAL_INN: {'thumbprint': THUMB}}}}
+
+
+def test_document_signer_local_never_uses_storage_and_preserves_bytes(native, monkeypatch):
+    storage = MagicMock(side_effect=AssertionError('must not access signing storage'))
+    monkeypatch.setattr(sign, 'get_storage', storage)
+    with sign.DocumentSigner(local_config()).prepare(
+            LOCAL_INN, PAYLOAD, 'document.json', None, 0) as signed:
+        assert signed.body_path.read_bytes() == PAYLOAD
+        assert signed.signature_path.read_text() == signed.signature == 'c2lnbmF0dXJl'
+        directory = signed.body_path.parent
+    assert not directory.exists()
+    assert base64.b64decode(native.calls[0][0]) == PAYLOAD
+    storage.assert_not_called()
+
+
+def test_local_failure_does_not_fall_back_or_yield(native, monkeypatch):
+    native.matches.Count = 0
+    storage = MagicMock()
+    monkeypatch.setattr(sign, 'get_storage', storage)
+    with pytest.raises(sign.SigningError):
+        with sign.DocumentSigner(local_config()).prepare(
+                LOCAL_INN, PAYLOAD, 'document.json', '/unused', 0):
+            pytest.fail('must not submit unsigned document')
+    storage.assert_not_called()
+
+
+def test_self_test_verifies_synthetic_data_only_and_uses_no_storage(native, monkeypatch, caplog):
+    storage = MagicMock()
+    monkeypatch.setattr(sign, 'get_storage', storage)
+    with caplog.at_level('INFO'):
+        result = sign.DocumentSigner(local_config()).self_test()
+    assert result == {LOCAL_INN: True}
+    assert base64.b64decode(native.calls[0][0]).startswith(b'xTrek local signing self-test\x00')
+    assert 'passed' in caplog.text
+    storage.assert_not_called()
+
+
+def test_self_test_failure_is_advisory_and_rechecked_on_document(native, monkeypatch, caplog):
+    signer = sign.DocumentSigner(local_config())
+    native.matches.Count = 0
+    assert signer.self_test() == {LOCAL_INN: False}
+    assert 'failed' in caplog.text
+    native.matches.Count = 1
+    with signer.prepare(LOCAL_INN, b'real document', 'document.json', None, 0):
+        pass
+    assert len(native.calls) == 1
+
+
+def test_self_test_continues_for_other_inns_without_logging_secrets(monkeypatch, caplog):
+    config = local_config()
+    config['signing']['local_by_inn'][OTHER_INN] = {'thumbprint': 'B2' * 20}
+    calls = []
+    def probe(data, **options):
+        calls.append(options['thumbprint'])
+        if options['thumbprint'] == THUMB:
+            raise RuntimeError('secret PIN and private data')
+        return 'c2ln'
+    monkeypatch.setattr(sign, 'sign_document', probe)
+    assert sign.DocumentSigner(config).self_test() == {LOCAL_INN: False, OTHER_INN: True}
+    assert len(calls) == 2
+    assert 'secret' not in caplog.text
+
+
+@pytest.mark.parametrize('section', [None, [], {'local_by_inn': []},
+    {'local_by_in': {}}, {'local_by_inn': {'bad-inn': {'thumbprint': THUMB}}}])
+def test_invalid_routing_is_logged_and_cannot_silently_select_storage(section, monkeypatch):
+    storage = MagicMock()
+    monkeypatch.setattr(sign, 'get_storage', storage)
+    signer = sign.DocumentSigner({'signing': section})
+    assert signer.self_test() == {'configuration': False}
+    with pytest.raises(sign.SigningError):
+        with signer.prepare(LOCAL_INN, b'x', 'document.json', '/unused', 0):
+            pytest.fail('invalid configuration must not sign')
+    storage.assert_not_called()
+
+
+@pytest.mark.parametrize('entry', [None, {}, {'thumbprint': 'invalid'},
+    {'thumbprint': THUMB, 'store_location': 'auto'}, {'thumbprint': THUMB, 'pin': 'secret'}])
+def test_bad_local_entry_is_not_treated_as_absent(entry, monkeypatch):
+    storage = MagicMock()
+    monkeypatch.setattr(sign, 'get_storage', storage)
+    config = local_config()
+    config['signing']['local_by_inn'][LOCAL_INN] = entry
+    signer = sign.DocumentSigner(config)
+    assert signer.self_test() == {LOCAL_INN: False}
+    with pytest.raises(sign.SigningError):
+        with signer.prepare(LOCAL_INN, b'x', 'document.json', '/unused', 0):
+            pytest.fail('bad local entry must not sign')
+    storage.assert_not_called()
+
+
+def test_signing_snapshot_is_independent_of_config_changes_and_other_instances(native):
+    config = local_config()
+    first = sign.DocumentSigner(config)
+    config['signing']['local_by_inn'][LOCAL_INN]['thumbprint'] = 'B2' * 20
+    second = sign.DocumentSigner(config)
+    with first.prepare(LOCAL_INN, b'a', 'same.json', None, 0) as a:
+        with second.prepare(LOCAL_INN, b'b', 'same.json', None, 0) as b:
+            assert a.body_path != b.body_path
+            assert a.body_path.read_bytes() == b'a'
+            assert b.body_path.read_bytes() == b'b'
+    assert [c.args[1] for c in native.store.Certificates.Find.call_args_list] == [THUMB, 'B2' * 20]
+
+
+@pytest.mark.parametrize('config', [{}, {'signing': {'local_by_inn': {}}}, local_config()])
+def test_unlisted_inn_uses_storage_without_native_dependencies(config, tmp_path, monkeypatch):
+    folder = tmp_path / 'exchange'
+    folder.mkdir()
+    config = dict(config, sign=str(folder))
+    (folder / 'document.json.sig').write_text('c2ln\n')
+    native = MagicMock(side_effect=AssertionError('native signer must not load'))
+    monkeypatch.setattr(sign, '_load_pycades', native)
+    monkeypatch.setattr(sign.time, 'sleep', lambda _: None)
+    with sign.DocumentSigner(config).prepare(OTHER_INN, PAYLOAD, 'document.json', '/ignored', 1) as result:
+        assert (folder / 'document.json').read_bytes() == PAYLOAD
+        assert result.body_path.read_bytes() == PAYLOAD
+        assert result.signature == 'c2ln'
+    assert list(folder.iterdir()) == []
+    native.assert_not_called()
+
+
+def test_storage_timeout_cleans_source_without_yielding(tmp_path):
+    signer = sign.DocumentSigner({'sign': str(tmp_path)})
+    with pytest.raises(sign.SigningError, match='timed out'):
+        with signer.prepare(OTHER_INN, b'x', 'document.json', None, 0):
+            pytest.fail('must not submit without signature')
+    assert not (tmp_path / 'document.json').exists()
+
+
+def test_cleanup_failure_does_not_turn_successful_submission_into_retry(native, monkeypatch):
+    real_cleanup = sign.shutil.rmtree
+    monkeypatch.setattr(sign.shutil, 'rmtree', MagicMock(side_effect=OSError('cleanup failure')))
+    with sign.DocumentSigner(local_config()).prepare(LOCAL_INN, b'x', 'document.json', None, 0) as signed:
+        directory = signed.body_path.parent
+    real_cleanup(directory)

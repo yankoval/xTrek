@@ -33,6 +33,7 @@ from .crpt_auth import get_new_token
 from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
+from .sign import DocumentSigner, SigningError
 from .aggregation_builder import (
     AggregationBuildError,
     build_aggregation_report,
@@ -40,6 +41,7 @@ from .aggregation_builder import (
     extract_full_product_codes,
     get_equipment_report_version,
     iter_equipment_report_pallets,
+    iter_equipment_report_boxes,
     normalize_sscc,
 )
 from .SSCC_Utils import get_sscc_from_service
@@ -270,7 +272,7 @@ def create_virtual_tasks_from_equipment_report(production_order_id: str):
         report_data = json.loads(content)
 
         total_qty = 0
-        ready_boxes = report_data.get('readyBox', [])
+        ready_boxes = iter_equipment_report_boxes(report_data)
         for box in ready_boxes:
             codes = box.get('productNumbersFull', [])
             total_qty += len(codes)
@@ -796,22 +798,15 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
         return None
 
 def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: int,
-                  oms_id: str = None, client_token: str = None):
+                  oms_id: str = None, client_token: str = None, *, document_signer=None):
     """
-    Загружает заказ из S3, подписывает его через файловый обмен и отправляет в СУЗ
+    Загружает заказ из S3, подписывает выбранным для ИНН способом и отправляет в СУЗ
     """
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
         emission_orders_path = config.get('emission_orders_path')
         emission_receipts_path = config.get('emission_receipts')
-
-        # Переопределяем параметры подписи из конфига если они есть
-        sign_path = config.get('sign')
-        if sign_path:
-            signing_dir = sign_path
-
-        timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([emission_orders_path, emission_receipts_path]):
             raise RuntimeError("[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emission_receipts)")
@@ -889,86 +884,48 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
             raise RuntimeError(f"[!] Активный токен для ИНН {inn} и Connection ID {final_client_token} не найден.")
 
         # 2. Подготовка к подписи
-        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_order.json"
-        signature_filename = f"{body_filename}.sig"
-
-        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
-        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
-
-        # Локальные пути для API
-        local_dir = Path("temp_signing")
-        local_dir.mkdir(exist_ok=True)
-        local_body_path = local_dir / body_filename
-        local_signature_path = local_dir / signature_filename
-
+        body_bytes = json.dumps(order_data, separators=(',', ':')).encode('utf-8')
+        signer = document_signer if document_signer is not None else DocumentSigner(config)
         try:
-            # СУЗ требует компактный JSON без пробелов между ключами.
-            body_json = json.dumps(order_data, separators=(',', ':'))
-            storage_sign.write_text(remote_body_path, body_json)
+            with signer.prepare(inn, body_bytes, body_filename, signing_dir, timeout) as signed:
+                local_body_path = signed.body_path
+                local_signature_path = signed.signature_path
+                local_dir = local_body_path.parent
+                # 3. Отправка в СУЗ
+                suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
+                logger.info(f"[*] Отправка заказа в СУЗ (omsId: {final_oms_id})...")
+                result = suz_api.order_create(str(local_body_path), str(local_signature_path))
 
-            # Также сохраняем локально для SUZ API
-            with open(local_body_path, "w", encoding="utf-8") as f:
-                f.write(body_json)
+                # 4. Сохранение результата и обновление статуса
+                if isinstance(result, EmissionOrderreceipts):
+                    logger.info("[+++] Заказ успешно создан!")
+                    storage_orders.mark_finished(order_path)
 
-            logger.info(f"[*] Заказ отправлен на подпись в: {remote_body_path}. Ожидание...")
+                    if emission_receipts_path:
+                        storage_receipts = get_storage(emission_receipts_path, s3_config)
+                        remote_receipt_path = f"{emission_receipts_path.rstrip('/')}/{production_order_id}.json"
 
-            start_time = time.time()
-            while not storage_sign.exists(remote_signature_path):
-                if time.time() - start_time > timeout:
+                        temp_receipt = local_dir / f"receipt_{unique_id}.json"
+                        result.productionOrderId = production_order_id
+                        with open(temp_receipt, 'w', encoding='utf-8') as f:
+                            json.dump(result.to_dict(), f, indent=4)
+
+                        logger.info(f"[*] Выгрузка чека в S3: {remote_receipt_path}")
+                        storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                        try: temp_receipt.unlink()
+                        except: pass
+
+                    return result
+                else:
+                    message = f"[!] Ошибка СУЗ: {result}"
+                    logger.error(message)
                     storage_orders.mark_error(order_path)
-                    raise RuntimeError(f"[!] Таймаут ({timeout}с): Файл подписи {signature_filename} не найден.")
-                time.sleep(2)
-
-            time.sleep(0.5)
-            logger.info("[+] Подпись обнаружена в хранилище!")
-
-            # Скачиваем подпись локально для API
-            storage_sign.download(remote_signature_path, str(local_signature_path))
-
-            # 3. Отправка в СУЗ
-            suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
-            logger.info(f"[*] Отправка заказа в СУЗ (omsId: {final_oms_id})...")
-            result = suz_api.order_create(str(local_body_path), str(local_signature_path))
-
-            # 4. Сохранение результата и обновление статуса
-            if isinstance(result, EmissionOrderreceipts):
-                logger.info("[+++] Заказ успешно создан!")
-                storage_orders.mark_finished(order_path)
-
-                if emission_receipts_path:
-                    storage_receipts = get_storage(emission_receipts_path, s3_config)
-                    remote_receipt_path = f"{emission_receipts_path.rstrip('/')}/{production_order_id}.json"
-
-                    temp_receipt = local_dir / f"receipt_{unique_id}.json"
-                    result.productionOrderId = production_order_id
-                    with open(temp_receipt, 'w', encoding='utf-8') as f:
-                        json.dump(result.to_dict(), f, indent=4)
-
-                    logger.info(f"[*] Выгрузка чека в S3: {remote_receipt_path}")
-                    storage_receipts.upload(str(temp_receipt), remote_receipt_path)
-                    try: temp_receipt.unlink()
-                    except: pass
-
-                return result
-            else:
-                message = f"[!] Ошибка СУЗ: {result}"
-                logger.error(message)
-                storage_orders.mark_error(order_path)
-                raise RuntimeError(message)
-
-        finally:
-            if local_body_path.exists(): local_body_path.unlink()
-            if local_signature_path.exists(): local_signature_path.unlink()
-            try:
-                if local_dir.exists() and not any(local_dir.iterdir()):
-                    local_dir.rmdir()
-            except: pass
-            try:
-                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
-                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
-            except: pass
+                    raise RuntimeError(message)
+        except SigningError:
+            storage_orders.mark_error(order_path)
+            raise
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_emission: {e}")
@@ -1839,7 +1796,7 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         return None
 
 def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
-                            oms_id: str = None, client_token: str = None):
+                            oms_id: str = None, client_token: str = None, *, document_signer=None):
     """
     Загружает задачу отчета о нанесении, подписывает и отправляет в СУЗ
     """
@@ -1848,13 +1805,6 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
         s3_config = config.get('s3_config')
         utilisation_tasks_path = config.get('utilisation_tasks_path')
         utilisation_receipts_path = config.get('utilisation_receipts')
-
-        # Переопределяем параметры подписи из конфига если они есть
-        sign_path = config.get('sign')
-        if sign_path:
-            signing_dir = sign_path
-
-        timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([utilisation_tasks_path, utilisation_receipts_path]):
             raise RuntimeError("[!] В конфигурации отсутствуют пути (utilisation_tasks_path, utilisation_receipts)")
@@ -1929,84 +1879,49 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
             raise RuntimeError("[!] Токен не найден.")
 
         # Подпись
-        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_utilisation.json"
-        signature_filename = f"{body_filename}.sig"
-
-        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
-        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
-
-        # Локальные пути для API
-        local_dir = Path("temp_signing")
-        local_dir.mkdir(exist_ok=True)
-        local_body_path = local_dir / body_filename
-        local_signature_path = local_dir / signature_filename
-
+        body_bytes = json.dumps(task_data, separators=(',', ':')).encode('utf-8')
+        signer = document_signer if document_signer is not None else DocumentSigner(config)
         try:
-            # Важно: separators=(',', ':') для компактного JSON
-            body_json = json.dumps(task_data, separators=(',', ':'))
-            storage_sign.write_text(remote_body_path, body_json)
+            with signer.prepare(inn, body_bytes, body_filename, signing_dir, timeout) as signed:
+                local_body_path = signed.body_path
+                local_signature_path = signed.signature_path
+                local_dir = local_body_path.parent
+                # Отправка
+                suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
+                logger.info(f"[*] Отправка отчета в СУЗ (orderId: {order_id})...")
+                report_id = suz_api.utilisation_send(str(local_body_path), str(local_signature_path), orderId=order_id)
 
-            with open(local_body_path, "w", encoding="utf-8") as f:
-                f.write(body_json)
+                if report_id and not report_id.startswith('{') and 'Error' not in report_id:
+                    logger.info(f"[+++] Отчет принят! ID: {report_id}")
+                    storage_tasks.mark_finished(task_path)
 
-            logger.info(f"[*] Отчет отправлен на подпись в: {remote_body_path}. Ожидание...")
-            start_time = time.time()
-            while not storage_sign.exists(remote_signature_path):
-                if time.time() - start_time > timeout:
+                    storage_receipts = get_storage(utilisation_receipts_path, s3_config)
+                    remote_receipt_path = f"{utilisation_receipts_path.rstrip('/')}/{order_id}.json"
+
+                    temp_receipt = local_dir / f"receipt_util_{unique_id}.json"
+                    with open(temp_receipt, 'w', encoding='utf-8') as f:
+                        json.dump({
+                            "reportId": report_id,
+                            "orderId": order_id,
+                            "omsId": final_oms_id,
+                            "productionOrderId": production_order_id
+                        }, f, indent=4)
+
+                    storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                    try: temp_receipt.unlink()
+                    except: pass
+
+                    return report_id
+                else:
+                    message = f"[!] Ошибка СУЗ: {report_id}"
+                    logger.error(message)
                     storage_tasks.mark_error(task_path)
-                    raise RuntimeError("[!] Таймаут ожидания подписи.")
-                time.sleep(2)
-
-            time.sleep(0.5)
-            logger.info("[+] Подпись обнаружена в хранилище!")
-
-            storage_sign.download(remote_signature_path, str(local_signature_path))
-
-            # Отправка
-            suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
-            logger.info(f"[*] Отправка отчета в СУЗ (orderId: {order_id})...")
-            report_id = suz_api.utilisation_send(str(local_body_path), str(local_signature_path), orderId=order_id)
-
-            if report_id and not report_id.startswith('{') and 'Error' not in report_id:
-                logger.info(f"[+++] Отчет принят! ID: {report_id}")
-                storage_tasks.mark_finished(task_path)
-
-                storage_receipts = get_storage(utilisation_receipts_path, s3_config)
-                remote_receipt_path = f"{utilisation_receipts_path.rstrip('/')}/{order_id}.json"
-
-                temp_receipt = local_dir / f"receipt_util_{unique_id}.json"
-                with open(temp_receipt, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        "reportId": report_id,
-                        "orderId": order_id,
-                        "omsId": final_oms_id,
-                        "productionOrderId": production_order_id
-                    }, f, indent=4)
-
-                storage_receipts.upload(str(temp_receipt), remote_receipt_path)
-                try: temp_receipt.unlink()
-                except: pass
-
-                return report_id
-            else:
-                message = f"[!] Ошибка СУЗ: {report_id}"
-                logger.error(message)
-                storage_tasks.mark_error(task_path)
-                raise RuntimeError(message)
-
-        finally:
-            if local_body_path.exists(): local_body_path.unlink()
-            if local_signature_path.exists(): local_signature_path.unlink()
-            try:
-                if local_dir.exists() and not any(local_dir.iterdir()):
-                    local_dir.rmdir()
-            except: pass
-            try:
-                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
-                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
-            except: pass
+                    raise RuntimeError(message)
+        except SigningError:
+            storage_tasks.mark_error(task_path)
+            raise
 
     except Exception as e:
         logger.error(f"[!] Ошибка в sign_and_send_utilisation: {e}")
@@ -2317,7 +2232,7 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
         logger.error(f"[!] Ошибка в create_aggregation_report: {e}")
         return None
 
-def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False):
+def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False, *, document_signer=None):
     """
     Загружает отчет об агрегации, подписывает его и отправляет в ЛК ЧЗ в обертке.
     """
@@ -2330,13 +2245,6 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         s3_config = config.get('s3_config')
         agg_tasks_path = config.get('agg-tasks')
         agg_receipts_path = config.get('agg-receipts')
-
-        # Переопределяем параметры подписи из конфига если они есть
-        sign_path = config.get('sign')
-        if sign_path:
-            signing_dir = sign_path
-
-        timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([agg_tasks_path, agg_receipts_path]):
             raise RuntimeError(
@@ -2384,47 +2292,15 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
         logger.info("[*] Выбран токен True API участника ИНН %s", inn)
 
         # 3. Подготовка к подписи
-        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_agg.json"
-        signature_filename = f"{body_filename}.sig"
-
-        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
-        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
-
-        # Локальные пути
-        local_dir = Path("temp_signing")
-        local_dir.mkdir(exist_ok=True)
-        local_body_path = local_dir / body_filename
-        local_signature_path = local_dir / signature_filename
-
-        try:
-            # ЧЗ крайне чувствителен к изменению тела документа после подписи.
-            # Поэтому мы используем исходные байты, загруженные из S3.
-            storage_sign.write_text(remote_body_path, report_content)
-
-            # Также сохраняем локально, чтобы потом прочитать как байты
-            local_body_bytes = report_content if isinstance(report_content, bytes) else report_content.encode('utf-8')
-            with open(local_body_path, "wb") as f:
-                f.write(local_body_bytes)
-
-            logger.info(f"[*] Ожидание подписи для {remote_body_path}...")
-            start_time = time.time()
-            while not storage_sign.exists(remote_signature_path):
-                if time.time() - start_time > timeout:
-                    raise RuntimeError("[!] Таймаут ожидания подписи.")
-                time.sleep(2)
-
-            time.sleep(0.5)
-            logger.info("[+] Подпись обнаружена в хранилище!")
-
-            # Используем байты напрямую
-            doc_base64 = base64.b64encode(local_body_bytes).decode('utf-8')
-
-            # Скачиваем подпись и читаем её
-            storage_sign.download(remote_signature_path, str(local_signature_path))
-            with open(local_signature_path, "r", encoding="utf-8") as f:
-                sig_base64 = f.read().strip()
+        body_bytes = report_content if isinstance(report_content, bytes) else report_content.encode('utf-8')
+        signer = document_signer if document_signer is not None else DocumentSigner(config)
+        with signer.prepare(inn, body_bytes, body_filename, signing_dir, timeout) as signed:
+            local_body_path = signed.body_path
+            local_dir = local_body_path.parent
+            doc_base64 = base64.b64encode(body_bytes).decode("utf-8")
+            sig_base64 = signed.signature
 
             # Создаем обертку
             wrapper = DocumentWrapper(
@@ -2476,18 +2352,6 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                 message = f"[!] Ошибка отправки отчета в ЛК: {result}"
                 logger.error(message)
                 raise RuntimeError(message)
-
-        finally:
-            if local_body_path.exists(): local_body_path.unlink()
-            if local_signature_path.exists(): local_signature_path.unlink()
-            try:
-                if local_dir.exists() and not any(local_dir.iterdir()):
-                    local_dir.rmdir()
-            except: pass
-            try:
-                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
-                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
-            except: pass
 
     except Exception as e:
         if (
@@ -2810,7 +2674,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         logger.error(f"[!] Ошибка в create_introduce_task: {e}")
         return None
 
-def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False):
+def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False, *, document_signer=None):
     """
     Подписывает и отправляет сообщение о вводе в оборот в ЛК ЧЗ.
     """
@@ -2823,13 +2687,6 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         s3_config = config.get('s3_config')
         introduce_tasks_path = config.get('introduce-tasks')
         introduce_receipts_path = config.get('introduce-receipts')
-
-        # Переопределяем параметры подписи из конфига если они есть
-        sign_path = config.get('sign')
-        if sign_path:
-            signing_dir = sign_path
-
-        timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([introduce_tasks_path, introduce_receipts_path]):
             raise RuntimeError("[!] В конфигурации отсутствуют необходимые пути (introduce-tasks, introduce-receipts)")
@@ -2874,42 +2731,15 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             raise RuntimeError(f"[!] Не удалось получить токен True API для ИНН {inn}")
 
         # Подпись
-        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_introduce.json"
-        signature_filename = f"{body_filename}.sig"
-
-        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
-        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
-
-        # Локальные пути
-        local_dir = Path("temp_signing")
-        local_dir.mkdir(exist_ok=True)
-        local_body_path = local_dir / body_filename
-        local_signature_path = local_dir / signature_filename
-
-        try:
-            storage_sign.write_text(remote_body_path, task_content)
-
-            local_body_bytes = task_content if isinstance(task_content, bytes) else task_content.encode('utf-8')
-            with open(local_body_path, "wb") as f:
-                f.write(local_body_bytes)
-
-            logger.info(f"[*] Ожидание подписи для {remote_body_path}...")
-            start_time = time.time()
-            while not storage_sign.exists(remote_signature_path):
-                if time.time() - start_time > timeout:
-                    raise RuntimeError("[!] Таймаут ожидания подписи.")
-                time.sleep(2)
-
-            time.sleep(0.5)
-            logger.info("[+] Подпись обнаружена в хранилище!")
-
-            doc_base64 = base64.b64encode(local_body_bytes).decode('utf-8')
-
-            storage_sign.download(remote_signature_path, str(local_signature_path))
-            with open(local_signature_path, "r", encoding="utf-8") as f:
-                sig_base64 = f.read().strip()
+        body_bytes = task_content if isinstance(task_content, bytes) else task_content.encode('utf-8')
+        signer = document_signer if document_signer is not None else DocumentSigner(config)
+        with signer.prepare(inn, body_bytes, body_filename, signing_dir, timeout) as signed:
+            local_body_path = signed.body_path
+            local_dir = local_body_path.parent
+            doc_base64 = base64.b64encode(body_bytes).decode("utf-8")
+            sig_base64 = signed.signature
 
             wrapper = DocumentWrapper(
                 document_format="MANUAL",
@@ -2951,18 +2781,6 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                 message = f"[!] Ошибка отправки: {result}"
                 logger.error(message)
                 raise RuntimeError(message)
-
-        finally:
-            if local_body_path.exists(): local_body_path.unlink()
-            if local_signature_path.exists(): local_signature_path.unlink()
-            try:
-                if local_dir.exists() and not any(local_dir.iterdir()):
-                    local_dir.rmdir()
-            except: pass
-            try:
-                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
-                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
-            except: pass
 
     except Exception as e:
         if (
@@ -3223,7 +3041,7 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
         logger.error(f"[!] Ошибка в create_aggregation_set_report: {e}")
         return None
 
-def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False):
+def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, timeout: int, refresh_token: bool = False, *, document_signer=None):
     """
     Загружает отчет об агрегации наборов, подписывает его и отправляет в ЛК ЧЗ.
     """
@@ -3236,13 +3054,6 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
         s3_config = config.get('s3_config')
         agg_set_tasks_path = config.get('agg_set_tasks')
         agg_set_receipts_path = config.get('agg_set_receipts')
-
-        # Переопределяем параметры подписи из конфига если они есть
-        sign_path = config.get('sign')
-        if sign_path:
-            signing_dir = sign_path
-
-        timeout = config.get('SIGNING_TIMEOUT', timeout)
 
         if not all([agg_set_tasks_path, agg_set_receipts_path]):
             raise RuntimeError("[!] В конфигурации отсутствуют пути agg_set_tasks или agg_set_receipts")
@@ -3286,42 +3097,15 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
             raise RuntimeError(f"[!] Не удалось получить токен True API для ИНН {inn}")
 
         # 3. Подготовка к подписи
-        storage_sign = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{inn}_{unique_id}_agg_set.json"
-        signature_filename = f"{body_filename}.sig"
-
-        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
-        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
-
-        # Локальные пути
-        local_dir = Path("temp_signing")
-        local_dir.mkdir(exist_ok=True)
-        local_body_path = local_dir / body_filename
-        local_signature_path = local_dir / signature_filename
-
-        try:
-            storage_sign.write_text(remote_body_path, report_content)
-
-            local_body_bytes = report_content if isinstance(report_content, bytes) else report_content.encode('utf-8')
-            with open(local_body_path, 'wb') as f:
-                f.write(local_body_bytes)
-
-            logger.info(f"[*] Ожидание подписи для {remote_body_path}...")
-            start_time = time.time()
-            while not storage_sign.exists(remote_signature_path):
-                if time.time() - start_time > timeout:
-                    raise RuntimeError("[!] Таймаут ожидания подписи.")
-                time.sleep(2)
-
-            time.sleep(0.5)
-            logger.info("[+] Подпись обнаружена в хранилище!")
-
-            doc_base64 = base64.b64encode(local_body_bytes).decode('utf-8')
-
-            storage_sign.download(remote_signature_path, str(local_signature_path))
-            with open(local_signature_path, 'r', encoding='utf-8') as f:
-                sig_base64 = f.read().strip()
+        body_bytes = report_content if isinstance(report_content, bytes) else report_content.encode('utf-8')
+        signer = document_signer if document_signer is not None else DocumentSigner(config)
+        with signer.prepare(inn, body_bytes, body_filename, signing_dir, timeout) as signed:
+            local_body_path = signed.body_path
+            local_dir = local_body_path.parent
+            doc_base64 = base64.b64encode(body_bytes).decode("utf-8")
+            sig_base64 = signed.signature
 
             # Создаем обертку для SETS_AGGREGATION
             wrapper = DocumentWrapper(
@@ -3365,18 +3149,6 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                 message = f"[!] Ошибка отправки: {result}"
                 logger.error(message)
                 raise RuntimeError(message)
-
-        finally:
-            if local_body_path.exists(): local_body_path.unlink()
-            if local_signature_path.exists(): local_signature_path.unlink()
-            try:
-                if local_dir.exists() and not any(local_dir.iterdir()):
-                    local_dir.rmdir()
-            except: pass
-            try:
-                if storage_sign.exists(remote_body_path): storage_sign.delete(remote_body_path)
-                if storage_sign.exists(remote_signature_path): storage_sign.delete(remote_signature_path)
-            except: pass
 
     except Exception as e:
         if (
@@ -4579,6 +4351,7 @@ def _sign_and_send_aggregate_operation(
     signing_dir,
     timeout,
     refresh_token=False,
+    *, document_signer=None,
 ):
     spec = AGGREGATE_OPERATION_SPECS[operation]
     submission_storage = None
@@ -4589,8 +4362,6 @@ def _sign_and_send_aggregate_operation(
         config = load_config("suz_worker_config")
         s3_config = config.get("s3_config")
         tasks_path, receipts_path, _ = _aggregate_operation_paths(config, operation)
-        signing_dir = config.get("sign") or signing_dir
-        timeout = config.get("SIGNING_TIMEOUT", timeout)
         if not tasks_path or not receipts_path:
             raise RuntimeError(f"[!] Не настроены хранилища задач/чеков {operation}")
 
@@ -4622,39 +4393,21 @@ def _sign_and_send_aggregate_operation(
         if not token:
             raise RuntimeError(f"[!] токен True API для ИНН {participant_inn} не найден")
 
-        signing_storage = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{participant_inn}_{unique_id}_{operation}.json"
-        signature_filename = f"{body_filename}.sig"
-        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
-        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
-        local_dir = Path("temp_signing")
-        local_dir.mkdir(exist_ok=True)
-        local_body_path = local_dir / body_filename
-        local_signature_path = local_dir / signature_filename
-
-        try:
-            signing_storage.write_text(remote_body_path, task_content)
-            body_bytes = task_content.encode("utf-8")
-            with open(local_body_path, "wb") as body_file:
-                body_file.write(body_bytes)
-
-            logger.info("[*] Ожидание подписи для %s...", remote_body_path)
-            started_at = time.time()
-            while not signing_storage.exists(remote_signature_path):
-                if time.time() - started_at > timeout:
-                    raise RuntimeError("[!] Таймаут ожидания подписи")
-                time.sleep(2)
-
-            signing_storage.download(remote_signature_path, str(local_signature_path))
-            with open(local_signature_path, "r", encoding="utf-8") as signature_file:
-                signature_base64 = signature_file.read().strip()
+        body_bytes = task_content.encode("utf-8")
+        signer = document_signer if document_signer is not None else DocumentSigner(config)
+        with signer.prepare(participant_inn, body_bytes, body_filename, signing_dir, timeout) as signed:
+            local_body_path = signed.body_path
+            local_dir = local_body_path.parent
+            doc_base64 = base64.b64encode(body_bytes).decode("utf-8")
+            sig_base64 = signed.signature
 
             wrapper = DocumentWrapper(
                 document_format="MANUAL",
-                product_document=base64.b64encode(body_bytes).decode("utf-8"),
+                product_document=doc_base64,
                 type=spec["document_type"],
-                signature=signature_base64,
+                signature=sig_base64,
             )
             api_host = _resolve_true_api_host(config)
             api = HonestSignAPI(token=token, host=api_host)
@@ -4683,23 +4436,7 @@ def _sign_and_send_aggregate_operation(
             submission_lock_path = None
             logger.info("[+] %s отправлен: %s", spec["document_type"], result)
             return result
-        finally:
-            if local_body_path.exists():
-                local_body_path.unlink()
-            if local_signature_path.exists():
-                local_signature_path.unlink()
-            try:
-                if local_dir.exists() and not any(local_dir.iterdir()):
-                    local_dir.rmdir()
-            except Exception:
-                pass
-            try:
-                if signing_storage.exists(remote_body_path):
-                    signing_storage.delete(remote_body_path)
-                if signing_storage.exists(remote_signature_path):
-                    signing_storage.delete(remote_signature_path)
-            except Exception:
-                pass
+
     except Exception:
         if submission_lock_path and not submission_ambiguous and not accepted_not_persisted:
             _release_document_submission_lock(submission_storage, submission_lock_path)
@@ -4707,15 +4444,17 @@ def _sign_and_send_aggregate_operation(
         raise
 
 
-def sign_and_send_disaggregation(task_id, group, signing_dir, timeout, refresh_token=False):
+def sign_and_send_disaggregation(task_id, group, signing_dir, timeout, refresh_token=False, *, document_signer=None):
     return _sign_and_send_aggregate_operation(
-        "disaggregation", task_id, group, signing_dir, timeout, refresh_token
+        "disaggregation", task_id, group, signing_dir, timeout, refresh_token,
+        document_signer=document_signer,
     )
 
 
-def sign_and_send_reaggregation(task_id, group, signing_dir, timeout, refresh_token=False):
+def sign_and_send_reaggregation(task_id, group, signing_dir, timeout, refresh_token=False, *, document_signer=None):
     return _sign_and_send_aggregate_operation(
-        "reaggregation", task_id, group, signing_dir, timeout, refresh_token
+        "reaggregation", task_id, group, signing_dir, timeout, refresh_token,
+        document_signer=document_signer,
     )
 
 
@@ -5189,6 +4928,7 @@ def sign_and_send_cis_information_change(
     signing_dir: str,
     timeout: int,
     refresh_token: bool = False,
+    *, document_signer=None,
 ):
     """Подписывает и отправляет CIS_INFORMATION_CHANGE через True API."""
     submission_storage = None
@@ -5199,8 +4939,6 @@ def sign_and_send_cis_information_change(
         config = load_config("suz_worker_config")
         s3_config = config.get("s3_config")
         tasks_path, receipts_path, _ = _cis_information_change_paths(config)
-        signing_dir = config.get("sign") or signing_dir
-        timeout = config.get("SIGNING_TIMEOUT", timeout)
         if not tasks_path or not receipts_path:
             raise RuntimeError(
                 "[!] В конфигурации отсутствуют cis-information-change-tasks "
@@ -5243,39 +4981,21 @@ def sign_and_send_cis_information_change(
                 f"[!] Не удалось получить токен True API для ИНН {participant_inn}"
             )
 
-        signing_storage = get_storage(signing_dir, s3_config)
         unique_id = uuid.uuid4()
         body_filename = f"{participant_inn}_{unique_id}_cis_information_change.json"
-        signature_filename = f"{body_filename}.sig"
-        remote_body_path = f"{signing_dir.rstrip('/')}/{body_filename}"
-        remote_signature_path = f"{signing_dir.rstrip('/')}/{signature_filename}"
-        local_dir = Path("temp_signing")
-        local_dir.mkdir(exist_ok=True)
-        local_body_path = local_dir / body_filename
-        local_signature_path = local_dir / signature_filename
-
-        try:
-            signing_storage.write_text(remote_body_path, task_content)
-            body_bytes = task_content.encode("utf-8")
-            with open(local_body_path, "wb") as body_file:
-                body_file.write(body_bytes)
-
-            logger.info("[*] Ожидание подписи для %s...", remote_body_path)
-            started_at = time.time()
-            while not signing_storage.exists(remote_signature_path):
-                if time.time() - started_at > timeout:
-                    raise RuntimeError("[!] Таймаут ожидания подписи")
-                time.sleep(2)
-
-            signing_storage.download(remote_signature_path, str(local_signature_path))
-            with open(local_signature_path, "r", encoding="utf-8") as signature_file:
-                signature_base64 = signature_file.read().strip()
+        body_bytes = task_content.encode("utf-8")
+        signer = document_signer if document_signer is not None else DocumentSigner(config)
+        with signer.prepare(participant_inn, body_bytes, body_filename, signing_dir, timeout) as signed:
+            local_body_path = signed.body_path
+            local_dir = local_body_path.parent
+            doc_base64 = base64.b64encode(body_bytes).decode("utf-8")
+            sig_base64 = signed.signature
 
             wrapper = DocumentWrapper(
                 document_format="MANUAL",
-                product_document=base64.b64encode(body_bytes).decode("utf-8"),
+                product_document=doc_base64,
                 type="CIS_INFORMATION_CHANGE",
-                signature=signature_base64,
+                signature=sig_base64,
             )
             api = HonestSignAPI(token=token)
             submission_ambiguous = True
@@ -5296,23 +5016,7 @@ def sign_and_send_cis_information_change(
             submission_lock_path = None
             logger.info("[+] CIS_INFORMATION_CHANGE отправлен: %s", result)
             return result
-        finally:
-            if local_body_path.exists():
-                local_body_path.unlink()
-            if local_signature_path.exists():
-                local_signature_path.unlink()
-            try:
-                if local_dir.exists() and not any(local_dir.iterdir()):
-                    local_dir.rmdir()
-            except Exception:
-                pass
-            try:
-                if signing_storage.exists(remote_body_path):
-                    signing_storage.delete(remote_body_path)
-                if signing_storage.exists(remote_signature_path):
-                    signing_storage.delete(remote_signature_path)
-            except Exception:
-                pass
+
     except Exception:
         if (
             submission_lock_path

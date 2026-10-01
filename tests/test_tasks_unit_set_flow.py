@@ -55,11 +55,14 @@ def import_tasks(monkeypatch, module_name="tasks"):
     monkeypatch.setenv("YMQ_QUEUE_URL", "https://example.test/queue")
     sys.modules.pop("tasks", None)
     sys.modules.pop("xtrek.tasks", None)
+    # The compatibility entry point also imports the attribute cached on xtrek.
+    monkeypatch.delattr("xtrek.tasks", raising=False)
     monkeypatch.setitem(sys.modules, "celery", types.SimpleNamespace(Celery=_FakeCelery))
     monkeypatch.setitem(
         sys.modules,
         "celery.signals",
-        types.SimpleNamespace(task_prerun=_FakeSignal(), task_postrun=_FakeSignal()),
+        types.SimpleNamespace(task_prerun=_FakeSignal(), task_postrun=_FakeSignal(),
+                              worker_ready=_FakeSignal()),
     )
     config = {
         "input_bucket": "input-bucket",
@@ -721,3 +724,85 @@ def test_order_starts_emission_after_equipment_task_is_ready(monkeypatch):
     monkeypatch.setattr(tasks, 'create_emission_task', emission)
     assert 'emission task started' in tasks.logic_create_order('input-bucket/Задания/order.json')
     emission.assert_called_once_with('T-SSCC', 'chemistry', 'scan')
+
+
+def test_local_signer_is_shared_and_tested_only_on_worker_ready(monkeypatch):
+    probe = MagicMock(return_value={'7701234567': False})
+    monkeypatch.setattr('xtrek.sign.DocumentSigner.self_test', probe)
+    tasks = import_tasks(monkeypatch)
+    probe.assert_not_called()
+    assert tasks._check_local_signing() == {'7701234567': False}
+    probe.assert_called_once()
+    for name in ('emission', 'utilisation', 'introduce', 'aggregation',
+                 'aggregation_set', 'disaggregation', 'reaggregation',
+                 'cis_information_change'):
+        assert getattr(tasks, 'sign_and_send_' + name).keywords['document_signer'] is tasks.document_signer
+
+
+@pytest.mark.parametrize("configured_prefix", ["isolated/run/", "/isolated/run", "isolated/run"])
+@pytest.mark.parametrize("prefix,logic", [
+    ("emissionOrders", "logic_sign_emission"),
+    ("cisInformationChangeTasks", "logic_send_cis_information_change"),
+    ("cisInformationChangeReceipts", "logic_update_cis_information_change"),
+])
+def test_isolated_event_prefix_routes_original_storage_key(monkeypatch, prefix, logic, configured_prefix):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setitem(tasks.config, "event_key_prefix", configured_prefix)
+    handler = MagicMock(return_value=True)
+    monkeypatch.setattr(tasks, logic, handler)
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket", "key": f"isolated/run/{prefix}/test.json",
+    }])
+    assert result.successful()
+    handler.assert_called_once_with(f"internal-bucket/isolated/run/{prefix}/test.json")
+    handler.reset_mock()
+    for key in (f"{prefix}/test.json", f"isolated/run-other/{prefix}/test.json"):
+        assert tasks.process_s3_event({
+            "bucket": "internal-bucket", "key": key,
+        }) == "Skipped: Outside configured prefix"
+        handler.assert_not_called()
+
+
+@pytest.mark.parametrize("prefix,logic", [
+    ("cisInformationChangeTasks", "logic_send_cis_information_change"),
+    ("cisInformationChangeReceipts", "logic_update_cis_information_change"),
+])
+def test_cis_change_routes_without_isolated_prefix(monkeypatch, prefix, logic):
+    tasks = import_tasks(monkeypatch)
+    handler = MagicMock(return_value=True)
+    monkeypatch.setattr(tasks, logic, handler)
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket", "key": f"{prefix}/test.json",
+    }])
+    assert result.successful()
+    handler.assert_called_once_with(f"internal-bucket/{prefix}/test.json")
+
+
+def test_cis_change_failed_send_does_not_ack_as_success(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(
+        tasks, "sign_and_send_cis_information_change", MagicMock(return_value={"error": "failed"}),
+    )
+    with pytest.raises(RuntimeError):
+        tasks.logic_send_cis_information_change("internal-bucket/cisInformationChangeTasks/test.json")
+
+
+@pytest.mark.parametrize("status", ["IN_PROGRESS", "CHECKED_NOT_OK", None])
+def test_cis_change_non_success_status_is_not_accepted(monkeypatch, status):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(
+        tasks, "update_cis_information_change_status", MagicMock(return_value=[{"status": status}]),
+    )
+    with pytest.raises(RuntimeError):
+        tasks.logic_update_cis_information_change("internal-bucket/cisInformationChangeReceipts/test.json")
+
+
+@pytest.mark.parametrize("result", [{"status": "CHECKED_OK"}, [{"status": "CHECKED_OK"}]])
+def test_cis_change_success_stops_status_retries(monkeypatch, result):
+    tasks = import_tasks(monkeypatch)
+    update = MagicMock(return_value=result)
+    monkeypatch.setattr(tasks, "update_cis_information_change_status", update)
+    assert tasks.logic_update_cis_information_change(
+        "internal-bucket/isolated/run/cisInformationChangeReceipts/test.json",
+    ) == result
+    update.assert_called_once_with("test", "chemistry")

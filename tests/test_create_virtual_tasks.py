@@ -75,10 +75,11 @@ def test_create_virtual_production_tasks(mock_nk_class, mock_token_processor_cla
     assert data['PasportData']['Batch_date_expired'] == "2024-01-01"
     assert data['PasportData']['Manufacturer_inn'] == ""
 
+@pytest.mark.parametrize('schema_version', [1, 2])
 @patch('xtrek.create_emission_task_sample.load_config')
 @patch('xtrek.create_emission_task_sample.get_storage')
 @patch('xtrek.create_emission_task_sample.create_virtual_production_tasks')
-def test_create_virtual_tasks_from_equipment_report_two_step(mock_create_virtual, mock_get_storage, mock_load_config):
+def test_create_virtual_tasks_from_equipment_report_two_step(mock_create_virtual, mock_get_storage, mock_load_config, schema_version):
     mock_load_config.return_value = {
         'equipment-tasks': 's3://bucket/tasks/',
         'equipment-reports': 's3://bucket/reports/',
@@ -100,9 +101,9 @@ def test_create_virtual_tasks_from_equipment_report_two_step(mock_create_virtual
     })
 
     mock_storage_reports.exists.return_value = True
-    mock_storage_reports.read_text.return_value = json.dumps({
-        "readyBox": [{"productNumbersFull": ["code1", "code2"]}]
-    })
+    boxes = [{"productNumbersFull": ["code1", "code2"]}]
+    report = {"readyBox": boxes} if schema_version == 1 else {"schemaVersion": 2, "readyPallet": [{"readyBox": boxes}]}
+    mock_storage_reports.read_text.return_value = json.dumps(report)
 
     create_virtual_tasks_from_equipment_report("order_123")
     mock_create_virtual.assert_called_with("order_123", qty=2)
