@@ -7,20 +7,28 @@ use attached CAdES. No token issuance, document submission or queue polling.
 import argparse
 import base64
 import binascii
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass
 import importlib
+import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import sys
 import tempfile
 import threading
+import time
 from urllib.parse import unquote, urlparse
 
 from .storage import get_storage
 
-__all__ = ["SigningError", "sign_bytes", "sign_document", "sign_token_data", "sign_file", "main"]
+__all__ = ["SigningError", "DocumentSigner", "sign_bytes", "sign_document",
+           "sign_token_data", "sign_file", "main"]
 _NATIVE_LOCK = threading.RLock()
+logger = logging.getLogger(__name__)
 
 
 class SigningError(RuntimeError):
@@ -148,6 +156,147 @@ def sign_bytes(data, thumbprint, *, detached=True, pin=None, pin_file=None,
 def sign_document(data, thumbprint, **options):
     """Sign document bytes with detached CAdES-BES; do not serialize JSON again."""
     return sign_bytes(data, thumbprint, detached=True, **options)
+
+
+@dataclass(frozen=True)
+class SignedDocument:
+    body_path: Path
+    signature_path: Path
+    signature: str
+
+
+class DocumentSigner:
+    """Per-worker snapshot of document-signing settings; no native state.
+
+    Startup self_test is advisory. Invalid settings remain invalid for real
+    requests, and local signing failures never select storage as a fallback.
+    Other configuration (including tokens) is not cached here.
+    """
+
+    def __init__(self, config):
+        self._config = deepcopy({key: config[key] for key in
+                                 ("signing", "sign", "SIGNING_TIMEOUT", "s3_config")
+                                 if key in config})
+
+    def _local_entries(self):
+        section = self._config.get("signing", {})
+        if not isinstance(section, dict) or set(section) - {"local_by_inn"}:
+            raise SigningError("signing must be an object containing local_by_inn")
+        entries = section.get("local_by_inn", {})
+        if not isinstance(entries, dict):
+            raise SigningError("signing.local_by_inn must be an object")
+        if any(not isinstance(inn, str) or not re.fullmatch(r"[0-9]{10}|[0-9]{12}", inn)
+               for inn in entries):
+            raise SigningError("Local signing INNs must be strings of 10 or 12 digits")
+        return entries
+
+    def _local_options(self, inn):
+        entries = self._local_entries()
+        if inn not in entries:
+            return None
+        options = entries[inn]
+        if not isinstance(options, dict) or set(options) - {"thumbprint", "store_location", "pin_file"}:
+            raise SigningError("Local signing accepts thumbprint, store_location and pin_file only")
+        try:
+            thumbprint = _thumbprint(options.get("thumbprint"))
+        except ValueError as exc:
+            raise SigningError(str(exc)) from None
+        location = options.get("store_location", "current_user")
+        if location not in ("current_user", "local_machine"):
+            raise SigningError("store_location must be current_user or local_machine")
+        pin_file = options.get("pin_file")
+        if pin_file is not None and (not isinstance(pin_file, str) or not pin_file):
+            raise SigningError("pin_file must be a nonempty path string")
+        return dict(thumbprint=thumbprint, store_location=location, pin_file=pin_file)
+
+    def self_test(self):
+        """Sign and verify synthetic bytes for each INN; log failures, never raise.
+
+        No business documents, storage calls or API requests. Successful probes
+        do not bypass certificate/signature checks on subsequent documents.
+        """
+        try:
+            entries = self._local_entries()
+        except SigningError as exc:
+            logger.error("Local signing self-test: invalid configuration: %s", exc)
+            return {"configuration": False}
+        results = {}
+        for inn in entries:
+            try:
+                options = self._local_options(inn)
+                sign_document(b"xTrek local signing self-test\x00" + os.urandom(32), **options)
+            except Exception as exc:
+                # Native errors are sanitized by sign_bytes. Never log arbitrary
+                # exception text: it may contain paths, PINs or provider details.
+                reason = str(exc) if isinstance(exc, SigningError) else type(exc).__name__
+                logger.error("Local signing self-test failed: inn=%s; %s", inn, reason)
+                results[inn] = False
+            else:
+                logger.info("Local signing self-test passed: inn=%s", inn)
+                results[inn] = True
+        if not entries:
+            logger.info("Local signing self-test: no local INNs configured")
+        return results
+
+    @contextmanager
+    def prepare(self, inn, data, filename, signing_dir, timeout):
+        """Keep exact body/.sig files alive through submission and receipt save."""
+        if not isinstance(data, bytes):
+            raise TypeError("Document signing requires bytes")
+        inn = str(inn)
+        if not re.fullmatch(r"[0-9]{10}|[0-9]{12}", inn):
+            raise SigningError("Document signer INN must contain 10 or 12 digits")
+        if (not isinstance(filename, str) or not filename.endswith(".json")
+                or Path(filename).name != filename or "\\" in filename):
+            raise SigningError("A document .json filename without directories is required")
+        options = self._local_options(inn)
+        temporary = Path(tempfile.mkdtemp(prefix="xtrek-document-"))
+        storage = None
+        remote_paths = ()
+        started = time.monotonic()
+        mode = "local" if options is not None else "storage"
+        try:
+            body_path = temporary / filename
+            signature_path = temporary / (filename + ".sig")
+            body_path.write_bytes(data)
+            logger.info("Document signing: inn=%s mode=%s document=%s", inn, mode, filename)
+            if options is not None:
+                signature = sign_document(data, **options)
+                signature_path.write_text(signature, encoding="ascii")
+            else:
+                signing_dir = self._config.get("sign") or signing_dir
+                timeout = self._config.get("SIGNING_TIMEOUT", timeout)
+                storage = get_storage(signing_dir, self._config.get("s3_config"))
+                remote_body = f"{signing_dir.rstrip('/')}/{filename}"
+                remote_signature = remote_body + ".sig"
+                remote_paths = (remote_body, remote_signature)
+                storage.upload(str(body_path), remote_body)
+                waiting_since = time.monotonic()
+                while not storage.exists(remote_signature):
+                    if time.monotonic() - waiting_since >= timeout:
+                        raise SigningError("Storage signature wait timed out")
+                    time.sleep(2)
+                # Preserve the existing writer-settle delay for filesystem signers.
+                time.sleep(0.5)
+                storage.download(remote_signature, str(signature_path))
+                signature = signature_path.read_text(encoding="utf-8").strip()
+                if not signature:
+                    raise SigningError("Storage returned an empty signature")
+            logger.info("Document signed: inn=%s mode=%s duration=%.3fs", inn, mode,
+                        time.monotonic() - started)
+            yield SignedDocument(body_path, signature_path, signature)
+        finally:
+            for remote in remote_paths:
+                try:
+                    if storage.exists(remote):
+                        storage.delete(remote)
+                except Exception:
+                    logger.warning("Signing storage cleanup failed: inn=%s document=%s", inn, filename)
+            try:
+                shutil.rmtree(temporary)
+            except OSError:
+                # Cleanup must not turn an accepted document into a retry.
+                logger.warning("Local signing cleanup failed: inn=%s document=%s", inn, filename)
 
 
 def sign_token_data(data, thumbprint, *, detached=False, **options):

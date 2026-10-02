@@ -1,12 +1,14 @@
 import os
 import json
 import re
+from functools import partial
 from celery import Celery
-from celery.signals import task_postrun, task_prerun
+from celery.signals import task_postrun, task_prerun, worker_ready
 from urllib.parse import quote
 
 # 1. Импорт вашей бизнес-логики
 from xtrek.config_loader import load_config
+from xtrek.sign import DocumentSigner
 from xtrek.tokens import TokenProcessor
 from xtrek.create_emission_task_sample import (
     process_incoming_task, 
@@ -38,6 +40,8 @@ from xtrek.create_emission_task_sample import (
     create_reaggregation_removing_task_from_report,
     sign_and_send_reaggregation,
     update_reaggregation_status,
+    sign_and_send_cis_information_change,
+    update_cis_information_change_status,
 )
 from xtrek.prn_util import generate_prn_files
 from xtrek.utils import (
@@ -81,6 +85,26 @@ def _finish_token_snapshot(**kwargs):
 
 # Загрузка конфигурации
 config = load_config('suz_worker_config')
+
+# Один снимок настроек подписи для этого экземпляра. Токены остаются динамическими.
+document_signer = DocumentSigner(config)
+sign_and_send_emission = partial(sign_and_send_emission, document_signer=document_signer)
+sign_and_send_utilisation = partial(sign_and_send_utilisation, document_signer=document_signer)
+sign_and_send_introduce = partial(sign_and_send_introduce, document_signer=document_signer)
+sign_and_send_aggregation = partial(sign_and_send_aggregation, document_signer=document_signer)
+sign_and_send_aggregation_set = partial(sign_and_send_aggregation_set, document_signer=document_signer)
+sign_and_send_disaggregation = partial(sign_and_send_disaggregation, document_signer=document_signer)
+sign_and_send_reaggregation = partial(sign_and_send_reaggregation, document_signer=document_signer)
+
+
+sign_and_send_cis_information_change = partial(sign_and_send_cis_information_change, document_signer=document_signer)
+
+
+@worker_ready.connect
+def _check_local_signing(**kwargs):
+    # После создания prefork-пула: не инициализируем CSP при импорте до fork.
+    # Ошибки теста только логируются; реальные документы проверяются заново.
+    return document_signer.self_test()
 
 # Настройки бакетов
 INPUT_BUCKET = config.get('input_bucket', "1bf11148-3595-4a07-a089-d460153b7c7a")
@@ -267,6 +291,23 @@ def trigger_set_aggregation_if_ready(parent_id):
         return f"Set {parent_id} not ready yet"
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 1bf11148... / ПАПКА: Задания ---
+def logic_send_cis_information_change(full_key):
+    task_id = full_key.rsplit("/", 1)[-1].removesuffix(".json")
+    result = sign_and_send_cis_information_change(task_id, PRODUCT_GROUP, signing_dir, 120)
+    if _is_failed_send_result(result):
+        raise RuntimeError(f"CIS_INFORMATION_CHANGE send failed for {task_id}")
+    return result
+
+
+def logic_update_cis_information_change(full_key):
+    task_id = full_key.rsplit("/", 1)[-1].removesuffix(".json")
+    result = update_cis_information_change_status(task_id, PRODUCT_GROUP)
+    target = result[0] if isinstance(result, list) and result else result
+    if not isinstance(target, dict) or target.get("status") != "CHECKED_OK":
+        raise RuntimeError(f"CIS_INFORMATION_CHANGE pending or failed for {task_id}: {result}")
+    return result
+
+
 def logic_create_order(full_key):
     group, contact = PRODUCT_GROUP, CONTACT_PERSON
     print(f"[LOGIC-0] Запуск создания заказа для: {full_key}")
@@ -868,6 +909,12 @@ def process_s3_event(self, data):
         return "Error: Missing bucket or key"
 
     full_key = f"{bucket}/{key}"
+    event_prefix = config.get("event_key_prefix", "")
+    if event_prefix:
+        event_prefix = event_prefix.strip("/") + "/"
+        if not key.startswith(event_prefix):
+            return "Skipped: Outside configured prefix"
+        key = key[len(event_prefix):]
     print(f"\n[ROUTER] Новое событие S3: {full_key}")
 
     try:
@@ -944,6 +991,10 @@ def process_s3_event(self, data):
         elif bucket == INTERNAL_BUCKET and key.startswith("aggReceipts/"):
             result = logic_update_agg(full_key)
             print(f"[OK] {result}")
+        elif bucket == INTERNAL_BUCKET and key.startswith("cisInformationChangeTasks/"):
+            result = logic_send_cis_information_change(full_key)
+        elif bucket == INTERNAL_BUCKET and key.startswith("cisInformationChangeReceipts/"):
+            result = logic_update_cis_information_change(full_key)
         # Условие №93: Обработка чека об агрегации наборов
         elif bucket == INTERNAL_BUCKET and key.startswith("aggSetReceipts/"):
             result = logic_update_agg_set(full_key)

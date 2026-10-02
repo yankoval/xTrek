@@ -103,3 +103,11 @@ def test_cli_stdin_challenge(credentials):
     result = subprocess.run(command, input=CHALLENGE.encode(), capture_output=True, timeout=45)
     assert result.returncode == 0, "CLI signing failed"
     verify_python(result.stdout.decode().strip(), CHALLENGE.encode(), False)
+
+
+def test_configured_signer_self_test_and_local_files(credentials):
+    signer = sign.DocumentSigner({'signing': {'local_by_inn': {'7701234567': credentials}}})
+    assert signer.self_test() == {'7701234567': True}
+    with signer.prepare('7701234567', DOCUMENT, 'document.json', None, 0) as signed:
+        assert signed.body_path.read_bytes() == DOCUMENT
+        verify_python(signed.signature, DOCUMENT, True)
