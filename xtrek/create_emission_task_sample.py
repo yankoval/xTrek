@@ -33,6 +33,7 @@ from .crpt_auth import get_new_token
 from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
+from .utilisation_attributes import build_utilisation_attributes
 from .sign import DocumentSigner, SigningError
 from .aggregation_builder import (
     AggregationBuildError,
@@ -1288,7 +1289,8 @@ def create_virtual_utilisation_task(order_id: str, group: str, production_date: 
         pasport_data_filtered = {k: v for k, v in pasport_raw.items() if k in valid_fields_pasport}
         # Для обязательных полей, которых нет в JSON, подставляем пустую строку, чтобы избежать TypeError
         for field_name in valid_fields_pasport:
-            if field_name not in pasport_data_filtered:
+            if (field_name not in pasport_data_filtered
+                    and sig_pasport.parameters[field_name].default is inspect.Parameter.empty):
                 pasport_data_filtered[field_name] = ""
 
         pasport_obj = PasportData(**pasport_data_filtered)
@@ -1356,7 +1358,8 @@ def create_virtual_introduce_task(order_id: str, group: str, production_date: st
         pasport_data_filtered = {k: v for k, v in pasport_raw.items() if k in valid_fields_pasport}
         # Для обязательных полей, которых нет в JSON, подставляем пустую строку, чтобы избежать TypeError
         for field_name in valid_fields_pasport:
-            if field_name not in pasport_data_filtered:
+            if (field_name not in pasport_data_filtered
+                    and sig_pasport.parameters[field_name].default is inspect.Parameter.empty):
                 pasport_data_filtered[field_name] = ""
 
         pasport_obj = PasportData(**pasport_data_filtered)
@@ -1401,6 +1404,13 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
         if not all([equipment_tasks_path, equipment_reports_path, production_orders_path, utilisation_tasks_path]):
             logger.error("[!] В конфигурации отсутствуют необходимые пути (equipment-tasks, equipment-reports, production_orders_path, utilisation_tasks_path)")
             return None
+
+        storage_util = get_storage(utilisation_tasks_path, s3_config)
+        stem = production_order_id[:-5] if production_order_id.lower().endswith('.json') else production_order_id
+        remote_path = f"{utilisation_tasks_path.rstrip('/')}/{stem}.json"
+        if storage_util.exists(remote_path):
+            logger.info("[*] Существующее задание на нанесение сохранено без изменений: %s", remote_path)
+            return production_order_id
 
         # 1. Находим задание на оборудование
         storage_tasks = get_storage(equipment_tasks_path, s3_config)
@@ -1447,6 +1457,7 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
 
         auto_prod_date = None
         auto_exp_date = None
+        pasport = {}
 
         if storage_prod.exists(prod_path):
             prod_data = json.loads(storage_prod.read_text(prod_path))
@@ -1458,11 +1469,9 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
             logger.warning(f"[!] Файл производственного заказа {prod_path} не найден.")
 
         # 4. Формируем отчет
-        attributes = {}
-        if auto_prod_date:
-            attributes["productionDate"] = auto_prod_date
-        if auto_exp_date:
-            attributes["expirationDate"] = auto_exp_date
+        attributes = build_utilisation_attributes(
+            group, pasport, config, auto_prod_date, auto_exp_date
+        )
 
         report = UtilisationReport(
             productGroup=group,
@@ -1472,10 +1481,6 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
         )
 
         # 5. Сохраняем
-        storage_util = get_storage(utilisation_tasks_path, s3_config)
-        stem = production_order_id[:-5] if production_order_id.lower().endswith('.json') else production_order_id
-        remote_path = f"{utilisation_tasks_path.rstrip('/')}/{stem}.json"
-
         temp_local = Path(f"temp_util_rep_{stem}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
             f.write(report.to_json())
@@ -1712,6 +1717,12 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
             logger.error("[!] В конфигурации отсутствуют пути (kodes, utilisation_tasks_path)")
             return None
 
+        storage_util = get_storage(utilisation_tasks_path, s3_config)
+        remote_path = f"{utilisation_tasks_path.rstrip('/')}/{order_id}.json"
+        if storage_util.exists(remote_path):
+            logger.info("[*] Существующее задание на нанесение сохранено без изменений: %s", remote_path)
+            return order_id
+
         storage_kodes = get_storage(kodes_path, s3_config)
         kodes_file_path = f"{kodes_path.rstrip('/')}/{order_id}.json"
 
@@ -1729,13 +1740,16 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         # 1. Попытка найти даты автоматически
         auto_prod_date = production_date
         auto_exp_date = expiration_date
+        pasport = {}
 
-        if not auto_prod_date or not auto_exp_date:
-            logger.info(f"[*] Поиск дат в исходном заказе для orderId: {order_id}")
+        # Read the passport even when both dates were supplied explicitly:
+        # its alcoholVolume takes precedence over the group default.
+        if group == 'chemistry' or not auto_prod_date or not auto_exp_date:
+            logger.info(f"[*] Поиск паспорта в исходном заказе для orderId: {order_id}")
             if not production_order_id:
                 production_order_id = _find_production_order_id_by_suz_order_id(order_id)
 
-            if production_order_id:
+            if production_order_id and production_orders_path:
                 storage_prod = get_storage(production_orders_path, s3_config)
                 prod_path = f"{production_orders_path.rstrip('/')}/{production_order_id}.json"
                 if storage_prod.exists(prod_path):
@@ -1758,15 +1772,13 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
             return None
 
         # Формируем атрибуты
-        attributes = {}
         # participantId ИСКЛЮЧЕН, так как это вызывает ошибку 400 в СУЗ,
         # но если мы нашли manufacturer_inn, можно попробовать (или оставить исключенным)
         # В примере пользователя participantId отсутствовал в успешно принятом JSON.
 
-        if auto_prod_date:
-            attributes["productionDate"] = auto_prod_date
-        if auto_exp_date:
-            attributes["expirationDate"] = auto_exp_date
+        attributes = build_utilisation_attributes(
+            group, pasport, config, auto_prod_date, auto_exp_date
+        )
 
         report = UtilisationReport(
             productGroup=group,
@@ -1776,9 +1788,6 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         )
 
         # Сохраняем в S3
-        storage_util = get_storage(utilisation_tasks_path, s3_config)
-        remote_path = f"{utilisation_tasks_path.rstrip('/')}/{order_id}.json"
-
         temp_local = Path(f"temp_util_{order_id}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
             f.write(report.to_json())

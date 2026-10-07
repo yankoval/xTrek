@@ -259,6 +259,7 @@ class PasportData(SUZBase):
     Batch_date_packing_descr: str
     Batch_date_expired_descr: str
     client_AdditionalInfo: str
+    alcoholVolume: Optional[str] = None
 
 @dataclass
 class ProductionOrder(SUZBase):
