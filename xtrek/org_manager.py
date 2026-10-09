@@ -57,14 +57,18 @@ class Organization:
 
 class OrganizationManager:
     def __init__(self, storage_dir: str):
-        self.storage_dir = storage_dir
+        self.config = load_config()
+        self.storage_dir = self.config.get('orgs_cache_dir') or storage_dir
+        self.read_only = self.config.get('orgs_read_only', False)
+        if not isinstance(self.read_only, bool):
+            raise ValueError('orgs_read_only must be a boolean')
+        if self.config.get('orgs_cache_dir') and not os.path.isabs(self.storage_dir):
+            raise ValueError('orgs_cache_dir must be an absolute path')
+        self._remote_filenames = set()
         self.organizations: Dict[str, Organization] = {}
         
-        if not os.path.exists(self.storage_dir):
-            os.makedirs(self.storage_dir)
+        os.makedirs(self.storage_dir, exist_ok=True)
             
-        self.config = load_config()
-
         self.s3_config = self.config.get('s3_config')
         self.orgs_path = self.config.get('orgs_path')
 
@@ -78,6 +82,31 @@ class OrganizationManager:
 
         self.sync_from_disk()
 
+    def _download_organizations(self):
+        if getattr(self, 'read_only', False):
+            # Organization cards are reference data, not task status objects.
+            # A failed listing must not silently substitute stale local cards.
+            remote_files = self.storage.list_files(
+                self.orgs_path, '*.json', include_processed=True, required=True)
+        else:
+            remote_files = self.storage.list_files(self.orgs_path, '*.json')
+        filenames = set()
+        for remote_file in remote_files:
+            filename = os.path.basename(remote_file)
+            local_path = Path(self.storage_dir) / filename
+            pending = local_path.with_name(filename + '.' + str(uuid.uuid4()) + '.tmp')
+            try:
+                self.storage.download(remote_file, str(pending))
+                # Never expose a partially downloaded or invalid JSON card to
+                # another Celery process or the token master on this host.
+                json.loads(pending.read_text(encoding='utf-8'))
+                os.replace(pending, local_path)
+            finally:
+                pending.unlink(missing_ok=True)
+            filenames.add(filename)
+        self._remote_filenames = filenames
+        return remote_files
+
     def _sync_on_init(self):
         """Двусторонняя синхронизация при инициализации."""
         if not self.storage or not self.orgs_path:
@@ -87,19 +116,13 @@ class OrganizationManager:
         try:
             # 1. Загружаем то, что есть в S3
             logger.debug(f"Синхронизация организаций из {self.orgs_path}...")
-            remote_files = self.storage.list_files(self.orgs_path, "*.json")
-            remote_filenames = set()
-            for remote_file in remote_files:
-                filename = os.path.basename(remote_file)
-                remote_filenames.add(filename)
-                local_path = os.path.join(self.storage_dir, filename)
-                self.storage.download(remote_file, local_path)
+            remote_files = self._download_organizations()
 
             # 2. Выгружаем то, что есть локально, но нет в S3
             local_files = [f for f in os.listdir(self.storage_dir) if f.endswith('.json')]
             upload_count = 0
             for filename in local_files:
-                if filename not in remote_filenames:
+                if not getattr(self, 'read_only', False) and filename not in self._remote_filenames:
                     local_path = os.path.join(self.storage_dir, filename)
                     remote_path = f"{self.orgs_path.rstrip('/')}/{filename}"
                     self.storage.upload(local_path, remote_path)
@@ -113,23 +136,24 @@ class OrganizationManager:
                 logger.debug(summary)
         except Exception as e:
             logger.error(f"Ошибка при начальной синхронизации организаций: {e}")
+            if getattr(self, 'read_only', False):
+                raise
 
     def _sync_from_s3(self):
         if self.storage and self.orgs_path:
             try:
                 logger.debug(f"Синхронизация организаций из {self.orgs_path}...")
-                remote_files = self.storage.list_files(self.orgs_path, "*.json")
-                for remote_file in remote_files:
-                    filename = os.path.basename(remote_file)
-                    local_path = os.path.join(self.storage_dir, filename)
-                    self.storage.download(remote_file, local_path)
+                remote_files = self._download_organizations()
                 logger.debug(f"Загружено {len(remote_files)} файлов организаций.")
                 # Обновляем в памяти
                 self.sync_from_disk()
             except Exception as e:
                 logger.error(f"Ошибка синхронизации организаций из S3: {e}")
+                if self.read_only:
+                    raise
 
     def _sync_to_s3(self, local_path: str):
+        self._require_writable()
         if self.storage and self.orgs_path:
             try:
                 filename = os.path.basename(local_path)
@@ -145,7 +169,9 @@ class OrganizationManager:
         if not os.path.exists(self.storage_dir):
             return
 
-        for filename in os.listdir(self.storage_dir):
+        filenames = (self._remote_filenames if self.read_only and self.storage
+                     else os.listdir(self.storage_dir))
+        for filename in filenames:
             if filename.endswith(".json"):
                 path = os.path.join(self.storage_dir, filename)
                 try:
@@ -159,6 +185,8 @@ class OrganizationManager:
                             self._add_to_mem(data)
                 except (json.JSONDecodeError, KeyError, Exception) as e:
                     logger.error(f"Ошибка чтения {filename}: {e}")
+                    if self.read_only:
+                        raise
                     continue
 
     def _add_to_mem(self, data: dict):
@@ -180,11 +208,16 @@ class OrganizationManager:
 
     def save_local(self, org: Organization):
         """Сохраняет конкретную организацию в отдельный файл."""
+        self._require_writable()
         self.organizations[org.org_id] = org
         path = os.path.join(self.storage_dir, f"{org.org_id}.json")
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(org.to_dict(), f, ensure_ascii=False, indent=4)
         self._sync_to_s3(path)
+
+    def _require_writable(self):
+        if getattr(self, 'read_only', False):
+            raise PermissionError('Organization reference data is read-only on this worker')
 
     def sync_to_s3(self, bucket_name: str, s3_key: str, 
                    region: str = 'ru-central1',
@@ -193,6 +226,7 @@ class OrganizationManager:
         Сериализует ВСЮ базу в один JSON и отправляет в S3.
         endpoint_url используется, если у вас частное S3-совместимое хранилище (Selectel, VK и т.д.)
         """
+        self._require_writable()
         # Подготовка данных
         full_db = {uid: org.to_dict() for uid, org in self.organizations.items()}
         json_data = json.dumps(full_db, ensure_ascii=False, indent=4)

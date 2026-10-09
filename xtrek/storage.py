@@ -243,7 +243,7 @@ class S3Storage(BaseStorage):
         key = parsed.path.lstrip('/')
         return bucket, key
 
-    def list_files(self, path, pattern):
+    def list_files(self, path, pattern, *, include_processed=False, required=False):
         bucket, prefix = self._parse_s3_url(path)
         if prefix and not prefix.endswith('/'):
             prefix += '/'
@@ -259,10 +259,12 @@ class S3Storage(BaseStorage):
                         filename = os.path.basename(key)
                         if fnmatch.fnmatch(filename, pattern):
                             # Проверяем теги
-                            if not self._is_processed(bucket, key):
+                            if include_processed or not self._is_processed(bucket, key):
                                 files.append(f"s3://{bucket}/{key}")
         except Exception as e:
             logger.error(f"Error listing S3 files: {e}")
+            if required:
+                raise
         return files
 
     def _is_processed(self, bucket, key):
