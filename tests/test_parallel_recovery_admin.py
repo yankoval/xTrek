@@ -79,3 +79,13 @@ def test_lost_sscc_response_never_allocates_replacement_numbers(allocation):
     with pytest.raises(ReconciliationRequired):
         flow._allocate_task_pallets('JOB', data, config)
     api.assert_called_once()
+
+
+def test_equipment_route_does_not_hide_ambiguous_sscc_operation(allocation):
+    config, storage, data, api = allocation
+    config.update({'equipment-tasks': 's3://test/equipment', 'equipment-reports': 's3://test/reports'})
+    api.side_effect = TimeoutError('allocation accepted before response was lost')
+    assert flow.create_equipment_aggregation_task('JOB') is None
+    with pytest.raises(ReconciliationRequired):
+        flow.create_equipment_aggregation_task('JOB')
+    api.assert_called_once()

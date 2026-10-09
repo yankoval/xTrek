@@ -8,7 +8,7 @@ import shutil
 from datetime import datetime, timezone
 
 from .storage import get_storage
-from .operation_state import guarded
+from .operation_state import guarded, OperationBusy, OperationConflict, ReconciliationRequired
 from .config_loader import load_config
 from .create_emission_task_sample import _find_production_order_id_by_suz_order_id
 import amica.amica_generator as amica_generator
@@ -243,6 +243,8 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
 
     except Exception as e:
         # В случае ошибки сбрасываем статус в not-printed, чтобы можно было попробовать снова
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         try:
             storage_kodes.set_tags(json_s3_path, {'print-status': 'not-printed'})
         except:

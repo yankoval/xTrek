@@ -74,7 +74,8 @@ from .aggregate_operation_reports import (
 # ---------------------------------------------------------------------------
 
 from .operation_state import (guarded, before_external_request,
-                              remember_external_result, publish_once, ReconciliationRequired)
+                              remember_external_result, publish_once, ReconciliationRequired,
+                              OperationBusy, OperationConflict)
 
 def _publish_json_result(storage, temporary, destination):
     if load_config('suz_worker_config').get('operation_state_path'):
@@ -813,6 +814,8 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_emission_task: {e}")
         return None
 
@@ -1374,6 +1377,8 @@ def create_virtual_utilisation_task(order_id: str, group: str, production_date: 
         return po_obj
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_virtual_utilisation_task: {e}")
         return None
 
@@ -1443,6 +1448,8 @@ def create_virtual_introduce_task(order_id: str, group: str, production_date: st
         return po_obj
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_virtual_introduce_task: {e}")
         return None
 
@@ -1553,6 +1560,8 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_utilisation_task_from_report: {e}")
         return None
 
@@ -1756,6 +1765,8 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.exception(f"[!] Ошибка в create_introduce_task_from_report: {e}")
         return None
 
@@ -1860,6 +1871,8 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         return order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_utilisation_task: {e}")
         return None
 
@@ -2126,6 +2139,8 @@ def update_emission_order_status(production_order_id: str):
         return status_obj
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в update_emission_order_status: {e}")
         return str(e)
 
@@ -2293,6 +2308,8 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
                 legacy_pallet_sscc=legacy_pallet_sscc,
             )
         except AggregationBuildError as e:
+            if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+                raise
             logger.error(f"[!] Некорректный отчет оборудования {report_uuid}: {e}")
             return None
 
@@ -2313,6 +2330,8 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
         return task_uuid
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_aggregation_report: {e}")
         return None
 
@@ -2757,6 +2776,8 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         return order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_introduce_task: {e}")
         return None
 
@@ -3123,6 +3144,8 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
         try: temp_local.unlink()
         except: pass
 
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         return task_uuid
 
     except Exception as e:
@@ -3828,6 +3851,8 @@ def create_equipment_aggregation_task(production_order_id: str):
                         'Bucket': bucket,
                         'Key': report_key
                     },
+                if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+                    raise
                     ExpiresIn=604800 # 7 days
                 )
             except Exception as e:
@@ -3889,6 +3914,8 @@ def create_equipment_aggregation_task(production_order_id: str):
         try: temp_local.unlink()
         except: pass
 
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         return production_order_id
 
     except Exception as e:
