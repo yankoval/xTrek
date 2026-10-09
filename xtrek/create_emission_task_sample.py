@@ -2308,8 +2308,6 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
                 legacy_pallet_sscc=legacy_pallet_sscc,
             )
         except AggregationBuildError as e:
-            if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
-                raise
             logger.error(f"[!] Некорректный отчет оборудования {report_uuid}: {e}")
             return None
 
@@ -3144,11 +3142,11 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
         try: temp_local.unlink()
         except: pass
 
-        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
-            raise
         return task_uuid
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_aggregation_set_report: {e}")
         return None
 
@@ -3851,8 +3849,6 @@ def create_equipment_aggregation_task(production_order_id: str):
                         'Bucket': bucket,
                         'Key': report_key
                     },
-                if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
-                    raise
                     ExpiresIn=604800 # 7 days
                 )
             except Exception as e:
@@ -3914,11 +3910,11 @@ def create_equipment_aggregation_task(production_order_id: str):
         try: temp_local.unlink()
         except: pass
 
-        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
-            raise
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_equipment_aggregation_task: {e}")
         return None
 
