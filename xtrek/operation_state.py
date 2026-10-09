@@ -254,3 +254,39 @@ def publish_once(storage, path, text, initial_tags=None):
     if fingerprint(stored) != fingerprint(text):
         raise OperationConflict('Existing output conflicts with this operation: ' + path)
     return False
+
+
+def publish_utilisation_status(storage, path, value):
+    """CAS a mutable SUZ snapshot without regressing an accepted SUCCESS.
+
+    Only status polling uses this path. Documents and submission receipts remain
+    immutable. Return the effective snapshot, including a newer competing result.
+    S3 publishes the status tag and body in the same conditional PUT.
+    """
+    from .storage import S3Storage
+    for field in ('omsId', 'reportId', 'reportStatus'):
+        if not value.get(field):
+            raise OperationConflict('Incomplete utilisation status: ' + path)
+    for _ in range(5):
+        stored = storage.read_lock_object(path)
+        previous, etag = (json.loads(stored[0]), stored[1]) if stored else (None, None)
+        if previous is not None:
+            for field in ('omsId', 'reportId', 'productionOrderId'):
+                if previous.get(field) != value.get(field):
+                    raise OperationConflict('Utilisation status identity changed: ' + path)
+            if (previous == value or previous.get('reportStatus') == 'SUCCESS'
+                    or (previous.get('reportStatus') == 'SENT'
+                        and value['reportStatus'] == 'READY_TO_SEND')):
+                return previous
+        tags = storage.get_tags(path) if stored else {}
+        tags['reportStatus'] = value['reportStatus']
+        text = json.dumps(value, ensure_ascii=False)
+        if isinstance(storage, S3Storage):
+            written = storage.write_lock_object(path, text, etag, tags=tags)
+        else:
+            written = storage.write_lock_object(path, text, etag)
+        if written is not None:
+            if not isinstance(storage, S3Storage):
+                storage.set_tags(path, tags)
+            return value
+    raise OperationBusy('Utilisation status changed during CAS: ' + path)

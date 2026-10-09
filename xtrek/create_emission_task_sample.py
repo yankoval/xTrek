@@ -74,7 +74,7 @@ from .aggregate_operation_reports import (
 # ---------------------------------------------------------------------------
 
 from .operation_state import (guarded, before_external_request,
-                              remember_external_result, publish_once, ReconciliationRequired,
+                              remember_external_result, publish_once, publish_utilisation_status, ReconciliationRequired,
                               OperationBusy, OperationConflict)
 
 def _publish_json_result(storage, temporary, destination, initial_tags=None):
@@ -2548,18 +2548,19 @@ def update_utilisation_report_status(order_id: str):
         storage_reports = get_storage(utilisation_reports_path, s3_config)
         output_path = f"{utilisation_reports_path.rstrip('/')}/{order_id}.json"
 
-        temp_local = Path(f"temp_util_status_{order_id}.json")
-        with open(temp_local, 'w', encoding='utf-8') as f:
-            f.write(status_obj.to_json())
-
         logger.info(f"[*] Сохранение статуса отчета в {output_path}")
-        _publish_json_result(storage_reports, temp_local, output_path)
-
-        # Теги для расширения (если локально) или метаданных S3
-        storage_reports.set_tags(output_path, {"reportStatus": status_obj.reportStatus})
-
-        try: temp_local.unlink()
-        except: pass
+        if config.get('operation_state_path'):
+            effective = publish_utilisation_status(
+                storage_reports, output_path, json.loads(status_obj.to_json()))
+            status_obj = UtilisationReportStatus(**effective)
+        else:
+            temp_local = Path(f"temp_util_status_{order_id}.json")
+            try:
+                temp_local.write_text(status_obj.to_json(), encoding='utf-8')
+                storage_reports.upload(str(temp_local), output_path)
+                storage_reports.set_tags(output_path, {"reportStatus": status_obj.reportStatus})
+            finally:
+                temp_local.unlink(missing_ok=True)
 
         return status_obj
 

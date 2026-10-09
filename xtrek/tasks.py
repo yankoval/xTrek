@@ -128,6 +128,10 @@ CONTACT_PERSON = config.get('contact_person', "scan")
 # Директория для подписи
 signing_dir = config.get('sign', r"Y:\BatchPassToPrint\tst")
 
+eta_task_limit = int(config.get('worker_eta_task_limit', 100))
+if eta_task_limit < 1:
+    raise ValueError('worker_eta_task_limit must be positive')
+
 app.conf.update(
     broker_transport_options={
         'region': 'ru-central1',
@@ -144,7 +148,9 @@ app.conf.update(
     task_acks_late=True, # Подтверждаем удаление только после успеха
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
-    worker_eta_task_limit=10,
+    # Status polls retry with countdown. Ten waiting retries blocked intake of
+    # fresh equipment reports even while the execution process was idle.
+    worker_eta_task_limit=eta_task_limit,
 )
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
