@@ -246,6 +246,19 @@ def test_failed_tag_write_cannot_report_success():
         storage.set_tags('s3://test/file.csv', {'print-status': 'printed'})
 
 
+def test_initial_print_tags_are_part_of_the_same_atomic_s3_create():
+    from urllib.parse import parse_qs
+    storage = S3Storage.__new__(S3Storage)
+    storage.s3 = MagicMock()
+    storage.s3.put_object.return_value = {'ETag': 'first'}
+    assert publish_once(storage, 's3://test/codes.json', '{"codes":["one"]}',
+                        {'print-status': 'not-printed', 'productionOrderId': 'PROD'})
+    request = storage.s3.put_object.call_args.kwargs
+    assert request['IfNoneMatch'] == '*'
+    assert parse_qs(request['Tagging']) == {'print-status': ['not-printed'], 'productionOrderId': ['PROD']}
+    storage.s3.put_object_tagging.assert_not_called()
+
+
 def test_explicit_rate_rejection_can_retry_without_ambiguous_send(signing_workflow, tmp_path, monkeypatch):
     ctx = signing_workflow
     _enable(ctx, tmp_path, monkeypatch)

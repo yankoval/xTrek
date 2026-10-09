@@ -90,7 +90,7 @@ EXHAUSTED без локальных кодов восстанавливаетс�
 python -m xtrek.operation_admin prove-dead --owner-file <owner.json>
 Сохранить вывод приватно как proof.json. Доказательство годно 120 секунд.
 На любом доверенном администрируемом узле выполнить:
-python -m xtrek.operation_admin recover --state-path <s3://.../операция/хеш.json>
+python -m xtrek.operation_admin recover --state-path <s3://.../операция/хеш.json> \
     --proof-file <proof.json>
 Изменение held -> ready проходит CAS; новый владелец получает право подготовки.
 

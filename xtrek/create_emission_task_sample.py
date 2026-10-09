@@ -77,9 +77,9 @@ from .operation_state import (guarded, before_external_request,
                               remember_external_result, publish_once, ReconciliationRequired,
                               OperationBusy, OperationConflict)
 
-def _publish_json_result(storage, temporary, destination):
+def _publish_json_result(storage, temporary, destination, initial_tags=None):
     if load_config('suz_worker_config').get('operation_state_path'):
-        publish_once(storage, destination, Path(temporary).read_text(encoding='utf-8'))
+        publish_once(storage, destination, Path(temporary).read_text(encoding='utf-8'), initial_tags)
     else:
         storage.upload(str(temporary), destination)
 
@@ -1146,17 +1146,13 @@ def get_emission_kodes(order_id: str):
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(codes_res, f, indent=4)
 
-        logger.info(f"[*] Выгрузка кодов в: {output_path}")
-        _publish_json_result(storage_kodes, temp_file, output_path)
-
-        # Устанавливаем тег print-status:not-printed
-        logger.info(f"[*] Установка тега print-status:not-printed для {output_path}")
         kodes_tags = {"print-status": "not-printed"}
         if production_order_id:
             kodes_tags["productionOrderId"] = production_order_id
-        if config.get('operation_state_path'):
-            kodes_tags.update(storage_kodes.get_tags(output_path))
-        storage_kodes.set_tags(output_path, kodes_tags)
+        logger.info(f"[*] Выгрузка кодов в: {output_path}")
+        _publish_json_result(storage_kodes, temp_file, output_path, kodes_tags)
+        if not config.get('operation_state_path'):
+            storage_kodes.set_tags(output_path, kodes_tags)
 
         # Пометка как finished
         logger.info(f"[*] Пометка заказа {order_id} как finished")
@@ -5766,16 +5762,13 @@ def _resume_codes(config, key, result):
     root = config['kodes']
     storage = get_storage(root, config.get('s3_config'))
     output = root.rstrip('/') + '/' + str(key) + '.json'
-    publish_once(storage, output, json.dumps(result))
-    tags = storage.get_tags(output)
-    if 'print-status' not in tags:
-        status_root = config['emissions_path']
-        source = status_root.rstrip('/') + '/' + str(key) + '.json'
-        status = json.loads(get_storage(source, config.get('s3_config')).read_text(source))
-        tags = {'print-status': 'not-printed'}
-        if status.get('productionOrderId'):
-            tags['productionOrderId'] = status['productionOrderId']
-        storage.set_tags(output, tags)
+    status_root = config['emissions_path']
+    source = status_root.rstrip('/') + '/' + str(key) + '.json'
+    status = json.loads(get_storage(source, config.get('s3_config')).read_text(source))
+    tags = {'print-status': 'not-printed'}
+    if status.get('productionOrderId'):
+        tags['productionOrderId'] = status['productionOrderId']
+    publish_once(storage, output, json.dumps(result), tags)
     return result
 
 

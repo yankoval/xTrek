@@ -235,14 +235,22 @@ def guarded(operation, *, input_path=None, resume=None, cache_none=False, config
     return decorate
 
 
-def publish_once(storage, path, text):
+def publish_once(storage, path, text, initial_tags=None):
     """Create an immutable result; a conflicting existing object is an error.
 
     Use plain PUT with IfNoneMatch, not upload_file's multipart/background transfer.
     Coordination objects and immutable business results use different prefixes.
     """
-    if storage.write_lock_object(path, text, None) is not None:
-        return
+    from .storage import S3Storage
+    if initial_tags and isinstance(storage, S3Storage):
+        created = storage.write_lock_object(path, text, None, tags=initial_tags) is not None
+    else:
+        created = storage.write_lock_object(path, text, None) is not None
+        if created and initial_tags:
+            storage.set_tags(path, initial_tags)
+    if created:
+        return True
     stored = storage.read_text(path)
     if fingerprint(stored) != fingerprint(text):
         raise OperationConflict('Existing output conflicts with this operation: ' + path)
+    return False

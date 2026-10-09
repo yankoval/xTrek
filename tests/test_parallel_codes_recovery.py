@@ -6,6 +6,7 @@ import pytest
 
 from xtrek import create_emission_task_sample as flow, operation_state
 from xtrek.operation_state import ReconciliationRequired
+from xtrek.operation_state import OperationState
 from parallel_flow_store import SharedStorage
 
 
@@ -38,6 +39,20 @@ def test_codes_duplicate_uses_exact_saved_result_without_second_consuming_get(co
         assert flow.get_emission_kodes('ORDER') == result
     api.codes.assert_called_once()
     assert json.loads(storage.read_text('s3://test/kodes/ORDER.json')) == result
+
+
+def test_late_accepted_replay_does_not_reset_finished_print_status(codes_case):
+    storage, api, result = codes_case
+    assert flow.get_emission_kodes('ORDER') == result
+    output = 's3://test/kodes/ORDER.json'
+    storage.set_tags(output, {'print-status': 'printed'})
+    guard = OperationState(storage, 's3://isolated/state', 'download-codes', 'ORDER')
+    text, etag = storage.read_lock_object(guard.path)
+    value = dict(json.loads(text), phase='accepted', replay_allowed=True)
+    storage.write_lock_object(guard.path, json.dumps(value), etag)
+    assert flow.get_emission_kodes('ORDER') == result
+    assert storage.get_tags(output)['print-status'] == 'printed'
+    api.codes.assert_called_once()
 
 
 def test_codes_restore_confirmed_response_after_output_storage_failure(codes_case):

@@ -140,7 +140,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             except Exception as e:
                 logger.warning(f"Ошибка при проверке виртуальности заказа {production_order_id}: {e}")
 
-        if not ignore_duplicate and print_status not in ({'not-printed', 'processing'} if coordinated else {'not-printed'}):
+        if not ignore_duplicate and print_status not in ({None, 'not-printed', 'processing'} if coordinated else {'not-printed'}):
             logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
             return finish(key)
 

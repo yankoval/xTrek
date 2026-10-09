@@ -4,7 +4,7 @@ import boto3
 import fnmatch
 import logging
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 import shutil
 import hashlib
 import tempfile
@@ -309,9 +309,11 @@ class S3Storage(BaseStorage):
         finally:
             result['Body'].close()
 
-    def write_lock_object(self, path, content, etag):
+    def write_lock_object(self, path, content, etag, *, tags=None):
         bucket, key = self._parse_s3_url(path)
         condition = {'IfNoneMatch': '*'} if etag is None else {'IfMatch': etag}
+        if tags:
+            condition['Tagging'] = urlencode(tags)
         try:
             return self.s3.put_object(Bucket=bucket, Key=key,
                                       Body=content.encode('utf-8'), **condition)['ETag']
