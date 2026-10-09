@@ -78,7 +78,7 @@ class HonestSignAPI:
         url = f"{self.host}/api/v3/true-api/elk/product-groups/balance/all"
         try:
             logger.info("Запрос баланса по всем товарным группам...")
-            response = requests.get(url, headers=self.headers, verify=False)
+            response = requests.get(url, headers=self.headers, verify=False, timeout=(10, 30))
             logger.debug(f"RAW GET | Status: {response.status_code} | Body: {response.text}")
             response.raise_for_status()
             return response.json()
@@ -89,7 +89,7 @@ class HonestSignAPI:
     def get_single_cis_info(self, code: str) -> Dict[str, Any]:
         url = f"{self.host}/api/v3/true-api/cises/info"
         try:
-            response = requests.post(url, json=[code], headers=self.headers, verify=False)
+            response = requests.post(url, json=[code], headers=self.headers, verify=False, timeout=(10, 30))
             logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
             response.raise_for_status()
             return response.json()
@@ -101,7 +101,7 @@ class HonestSignAPI:
         url = f"{self.host}/api/v3/true-api/cises/info"
         try:
             logger.debug(f'get_list_cis_info code:{code}')
-            response = requests.post(url, json=code, headers=self.headers, verify=False)
+            response = requests.post(url, json=code, headers=self.headers, verify=False, timeout=(10, 30))
             logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
 
             if response.status_code == 404:
@@ -124,6 +124,7 @@ class HonestSignAPI:
                 json=codes,
                 headers=self.headers,
                 verify=False,
+                timeout=(10, 30),
             )
             logger.debug(
                 "RAW POST | Status: %s | Body: %s",
@@ -159,9 +160,13 @@ class HonestSignAPI:
                 data=wrapped_document_json.encode('utf-8'),
                 params=params,
                 headers=self.headers,
-                verify=False
+                verify=False,
+                timeout=(10, 30),
             )
             logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
+
+            if response.status_code == 429:
+                response.raise_for_status()
 
             if response.status_code >= 400:
                 logger.error(f"Ошибка API (Status {response.status_code}): {response.text}")
@@ -172,6 +177,10 @@ class HonestSignAPI:
             except json.JSONDecodeError:
                 # Если сервер вернул ID документа просто строкой (бывает в True API)
                 return {"document_id": response.text.strip('"')}
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                raise
+            return {"error": str(e)}
         except Exception as e:
             logger.error(f"Ошибка при отправке документа: {e}")
             return {"error": str(e)}
@@ -190,7 +199,7 @@ class HonestSignAPI:
 
         try:
             logger.info(f"Запрос информации о документе {doc_id}...")
-            response = requests.get(url, params=params, headers=self.headers, verify=False)
+            response = requests.get(url, params=params, headers=self.headers, verify=False, timeout=(10, 30))
             logger.debug(f"RAW GET | Status: {response.status_code} | Body: {response.text}")
 
             if response.status_code >= 400:

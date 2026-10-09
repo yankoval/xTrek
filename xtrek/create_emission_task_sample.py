@@ -73,6 +73,17 @@ from .aggregate_operation_reports import (
 #   ошибкой "ИНН собственника ... не соответствует данным текущего участника".
 # ---------------------------------------------------------------------------
 
+from .operation_state import (guarded, before_external_request,
+                              remember_external_result, publish_once, ReconciliationRequired,
+                              OperationBusy, OperationConflict)
+
+def _publish_json_result(storage, temporary, destination, initial_tags=None):
+    if load_config('suz_worker_config').get('operation_state_path'):
+        publish_once(storage, destination, Path(temporary).read_text(encoding='utf-8'), initial_tags)
+    else:
+        storage.upload(str(temporary), destination)
+
+
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
 DEFAULT_SIGNING_DIR = os.path.join(os.path.expanduser("~"), "tst")
 DEFAULT_SIGNING_TIMEOUT = 60
@@ -134,6 +145,14 @@ def _claim_document_submission(receipts_path, s3_config, operation, task_id):
             existing_receipt["document_id"],
         )
         return existing_receipt, storage, receipt_path, None
+
+    if load_config('suz_worker_config').get('operation_state_path'):
+        # An old anonymous lock may represent an accepted request with a lost
+        # response. Preserve it until reconciliation; a new release is no proof.
+        legacy_path = _document_submission_lock_path(receipts_path, operation, task_id)
+        if storage.exists(legacy_path):
+            raise ReconciliationRequired('Legacy submission requires reconciliation: ' + legacy_path)
+        return None, storage, receipt_path, None
 
     lock_path = _document_submission_lock_path(receipts_path, operation, task_id)
     lock_content = json.dumps(
@@ -459,7 +478,7 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
                 json.dump(virtual_data, f, indent=4, ensure_ascii=False)
 
             logger.info(f"[*] Выгрузка виртуального задания в: {target_path}")
-            storage.upload(str(temp_file), target_path)
+            _publish_json_result(storage, temp_file, target_path)
 
             try: temp_file.unlink()
             except: pass
@@ -636,7 +655,7 @@ def process_incoming_task(s3_full_key: str):
             json.dump(prod_data, f, indent=4, ensure_ascii=False)
 
         logger.info(f"[*] Выгрузка нормализованного задания в: {target_path}")
-        storage_prod.upload(str(temp_file), target_path)
+        _publish_json_result(storage_prod, temp_file, target_path)
 
         try: temp_file.unlink()
         except: pass
@@ -787,7 +806,7 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
             f.write(order.to_json())
 
         logger.info(f"[*] Выгрузка заказа на эмиссию в S3: {remote_path}")
-        storage_emission.upload(str(temp_local), remote_path)
+        _publish_json_result(storage_emission, temp_local, remote_path)
 
         try: temp_local.unlink()
         except: pass
@@ -795,6 +814,8 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_emission_task: {e}")
         return None
 
@@ -811,6 +832,16 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
 
         if not all([emission_orders_path, emission_receipts_path]):
             raise RuntimeError("[!] В конфигурации отсутствуют необходимые пути (emission_orders_path, emission_receipts)")
+
+        if config.get('operation_state_path'):
+            receipt_root = config['emission_receipts']
+            receipt_store = get_storage(receipt_root, s3_config)
+            receipt_file = f"{receipt_root.rstrip('/')}/{production_order_id}.json"
+            if receipt_store.exists(receipt_file):
+                receipt = json.loads(receipt_store.read_text(receipt_file))
+                if not isinstance(receipt, dict) or not receipt.get('orderId'):
+                    raise RuntimeError('Existing receipt is invalid; resend blocked')
+                return EmissionOrderreceipts(**receipt)
 
         storage_orders = get_storage(emission_orders_path, s3_config)
         order_path = f"{emission_orders_path.rstrip('/')}/{production_order_id}.json"
@@ -897,12 +928,12 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
                 # 3. Отправка в СУЗ
                 suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
                 logger.info(f"[*] Отправка заказа в СУЗ (omsId: {final_oms_id})...")
+                before_external_request()
                 result = suz_api.order_create(str(local_body_path), str(local_signature_path))
 
                 # 4. Сохранение результата и обновление статуса
                 if isinstance(result, EmissionOrderreceipts):
                     logger.info("[+++] Заказ успешно создан!")
-                    storage_orders.mark_finished(order_path)
 
                     if emission_receipts_path:
                         storage_receipts = get_storage(emission_receipts_path, s3_config)
@@ -910,14 +941,16 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
 
                         temp_receipt = local_dir / f"receipt_{unique_id}.json"
                         result.productionOrderId = production_order_id
+                        remember_external_result(result)
                         with open(temp_receipt, 'w', encoding='utf-8') as f:
                             json.dump(result.to_dict(), f, indent=4)
 
                         logger.info(f"[*] Выгрузка чека в S3: {remote_receipt_path}")
-                        storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                        _publish_json_result(storage_receipts, temp_receipt, remote_receipt_path)
                         try: temp_receipt.unlink()
                         except: pass
 
+                    storage_orders.mark_finished(order_path)
                     return result
                 else:
                     message = f"[!] Ошибка СУЗ: {result}"
@@ -968,6 +1001,13 @@ def get_emission_kodes(order_id: str):
             logger.error(f"[!] Файл статуса для orderId {order_id} не найден в {emissions_path}")
             return None
 
+        storage_kodes = get_storage(kodes_path, s3_config)
+        output_path = f"{kodes_path.rstrip('/')}/{order_id}.json"
+        if config.get('operation_state_path') and storage_kodes.exists(output_path):
+            saved = json.loads(storage_kodes.read_text(output_path))
+            _validate_codes_result(saved)
+            return saved
+
         # Проверка на status:processing / finished
         is_processing = False
         if isinstance(storage_emissions, S3Storage):
@@ -977,7 +1017,7 @@ def get_emission_kodes(order_id: str):
                 tags = {t['Key']: t['Value'] for t in resp.get('TagSet', [])}
                 if tags.get('status') == 'processing':
                     is_processing = True
-                if tags.get('status') == 'finished':
+                if tags.get('status') == 'finished' and not config.get('operation_state_path'):
                     logger.info(f"[*] Заказ {order_id} уже обработан (status:finished).")
                     return {'bufferStatus': 'EXHAUSTED'}  # Возвращаем статус, как если бы он был скачен, чтобы не пытаться снова
             except Exception as e:
@@ -989,7 +1029,7 @@ def get_emission_kodes(order_id: str):
                 logger.info(f"[*] Заказ {order_id} уже обработан (status:finished).")
                 return None
 
-        if is_processing:
+        if is_processing and not config.get('operation_state_path'):
             logger.info(f"[*] Заказ {order_id} уже в обработке.")
             return None
 
@@ -1049,6 +1089,15 @@ def get_emission_kodes(order_id: str):
         api_status = api_status_res[0]
         if api_status.get('bufferStatus') == 'EXHAUSTED':
             logger.info(f"[*] Заказ {order_id} имеет статус {api_status.get('bufferStatus')}, он уже скачен. Пропуск.")
+            if config.get('operation_state_path'):
+                codes_res = _recover_codes_blocks(suz_api, order_id, gtin, api_status)
+                remember_external_result(codes_res)
+                _resume_codes(config, order_id, codes_res)
+                return codes_res
+            return api_status
+        if api_status.get('bufferStatus') == 'REJECTED':
+            _record_terminal_emission(config, order_id, api_status)
+            logger.error('[TERMINAL] SUZ order rejected: %s', order_id)
             return api_status
         if api_status.get('bufferStatus') != 'ACTIVE':
             logger.info(f"[*] Заказ {order_id} имеет статус {api_status.get('bufferStatus')}, а не ACTIVE. Пропуск.")
@@ -1076,11 +1125,18 @@ def get_emission_kodes(order_id: str):
 
         logger.info(f"[*] Получение {available_codes} кодов из СУЗ...")
         try:
+            before_external_request()
             codes_res = suz_api.codes(order_id, available_codes, gtin)
         except Exception as codes_err:
             logger.error(f"[!] Ошибка при получении кодов: {codes_err}")
             storage_emissions.mark_error(target_path)
+            if config.get('operation_state_path'):
+                raise
             return None
+
+        if config.get('operation_state_path'):
+            _validate_codes_result(codes_res, available_codes)
+        remember_external_result(codes_res)
 
         # Сохранение кодов
         storage_kodes = get_storage(kodes_path, s3_config)
@@ -1090,15 +1146,13 @@ def get_emission_kodes(order_id: str):
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(codes_res, f, indent=4)
 
-        logger.info(f"[*] Выгрузка кодов в: {output_path}")
-        storage_kodes.upload(str(temp_file), output_path)
-
-        # Устанавливаем тег print-status:not-printed
-        logger.info(f"[*] Установка тега print-status:not-printed для {output_path}")
         kodes_tags = {"print-status": "not-printed"}
         if production_order_id:
             kodes_tags["productionOrderId"] = production_order_id
-        storage_kodes.set_tags(output_path, kodes_tags)
+        logger.info(f"[*] Выгрузка кодов в: {output_path}")
+        _publish_json_result(storage_kodes, temp_file, output_path, kodes_tags)
+        if not config.get('operation_state_path'):
+            storage_kodes.set_tags(output_path, kodes_tags)
 
         # Пометка как finished
         logger.info(f"[*] Пометка заказа {order_id} как finished")
@@ -1109,8 +1163,12 @@ def get_emission_kodes(order_id: str):
 
         return codes_res
 
+    except ReconciliationRequired:
+        raise
     except Exception as e:
         logger.error(f"[!] Ошибка в get_emission_kodes: {e}")
+        if locals().get("config", {}).get("operation_state_path"):
+            raise
         return None
 
 def _find_production_order_id_by_suz_order_id(order_id: str):
@@ -1315,6 +1373,8 @@ def create_virtual_utilisation_task(order_id: str, group: str, production_date: 
         return po_obj
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_virtual_utilisation_task: {e}")
         return None
 
@@ -1384,6 +1444,8 @@ def create_virtual_introduce_task(order_id: str, group: str, production_date: st
         return po_obj
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_virtual_introduce_task: {e}")
         return None
 
@@ -1486,7 +1548,7 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
             f.write(report.to_json())
 
         logger.info(f"[*] Выгрузка задачи на отчет о нанесении в S3: {remote_path}")
-        storage_util.upload(str(temp_local), remote_path)
+        _publish_json_result(storage_util, temp_local, remote_path)
 
         try: temp_local.unlink()
         except: pass
@@ -1494,6 +1556,8 @@ def create_utilisation_task_from_report(production_order_id: str, group: str = "
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_utilisation_task_from_report: {e}")
         return None
 
@@ -1689,7 +1753,7 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
             f.write(message.to_json())
 
         logger.info(f"[*] Выгрузка задачи на ввод в оборот в S3: {remote_path}")
-        storage_intro.upload(str(temp_local), remote_path)
+        _publish_json_result(storage_intro, temp_local, remote_path)
 
         try: temp_local.unlink()
         except: pass
@@ -1697,6 +1761,8 @@ def create_introduce_task_from_report(production_order_id: str, group: str = Non
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.exception(f"[!] Ошибка в create_introduce_task_from_report: {e}")
         return None
 
@@ -1793,7 +1859,7 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
             f.write(report.to_json())
 
         logger.info(f"[*] Выгрузка задачи на отчет о нанесении в S3: {remote_path}")
-        storage_util.upload(str(temp_local), remote_path)
+        _publish_json_result(storage_util, temp_local, remote_path)
 
         try: temp_local.unlink()
         except: pass
@@ -1801,6 +1867,8 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         return order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_utilisation_task: {e}")
         return None
 
@@ -1817,6 +1885,16 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
 
         if not all([utilisation_tasks_path, utilisation_receipts_path]):
             raise RuntimeError("[!] В конфигурации отсутствуют пути (utilisation_tasks_path, utilisation_receipts)")
+
+        if config.get('operation_state_path'):
+            receipt_root = config['utilisation_receipts']
+            receipt_store = get_storage(receipt_root, s3_config)
+            receipt_file = f"{receipt_root.rstrip('/')}/{order_id}.json"
+            if receipt_store.exists(receipt_file):
+                receipt = json.loads(receipt_store.read_text(receipt_file))
+                if not isinstance(receipt, dict) or not receipt.get('reportId'):
+                    raise RuntimeError('Existing receipt is invalid; resend blocked')
+                return receipt['reportId']
 
         storage_tasks = get_storage(utilisation_tasks_path, s3_config)
         task_path = f"{utilisation_tasks_path.rstrip('/')}/{order_id}.json"
@@ -1900,11 +1978,11 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
                 # Отправка
                 suz_api = SUZ(token=token, omsId=final_oms_id, clientToken=final_client_token)
                 logger.info(f"[*] Отправка отчета в СУЗ (orderId: {order_id})...")
+                before_external_request()
                 report_id = suz_api.utilisation_send(str(local_body_path), str(local_signature_path), orderId=order_id)
 
                 if report_id and not report_id.startswith('{') and 'Error' not in report_id:
                     logger.info(f"[+++] Отчет принят! ID: {report_id}")
-                    storage_tasks.mark_finished(task_path)
 
                     storage_receipts = get_storage(utilisation_receipts_path, s3_config)
                     remote_receipt_path = f"{utilisation_receipts_path.rstrip('/')}/{order_id}.json"
@@ -1918,7 +1996,9 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
                             "productionOrderId": production_order_id
                         }, f, indent=4)
 
-                    storage_receipts.upload(str(temp_receipt), remote_receipt_path)
+                    remember_external_result(json.loads(temp_receipt.read_text()))
+                    _publish_json_result(storage_receipts, temp_receipt, remote_receipt_path)
+                    storage_tasks.mark_finished(task_path)
                     try: temp_receipt.unlink()
                     except: pass
 
@@ -2020,6 +2100,8 @@ def update_emission_order_status(production_order_id: str):
 
         # Берем первый элемент статуса
         status_data = status_response[0]
+        if status_data.get('bufferStatus') == 'REJECTED':
+            _record_terminal_emission(config, production_order_id, status_data)
 
         # Фильтруем поля для инициализации dataclass, на случай появления новых полей в API
         sig = inspect.signature(EmissionOrderStatus.__init__)
@@ -2040,7 +2122,9 @@ def update_emission_order_status(production_order_id: str):
             f.write(status_obj.to_json())
 
         logger.info(f"[*] Сохранение статуса в {output_path}")
-        storage_emissions.upload(str(temp_local), output_path)
+        if (not config.get('operation_state_path') or not storage_emissions.exists(output_path)
+                or json.loads(storage_emissions.read_text(output_path)) != json.loads(temp_local.read_text())):
+            storage_emissions.upload(str(temp_local), output_path)
 
         # Установка тегов/расширения
         storage_emissions.set_tags(output_path, {"bufferStatus": status_obj.bufferStatus})
@@ -2051,6 +2135,8 @@ def update_emission_order_status(production_order_id: str):
         return status_obj
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в update_emission_order_status: {e}")
         return str(e)
 
@@ -2230,7 +2316,7 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
             f.write(final_report.to_json())
 
         logger.info(f"[*] Выгрузка отчета об агрегации в S3: {output_path}")
-        storage_agg.upload(str(temp_local), output_path)
+        _publish_json_result(storage_agg, temp_local, output_path)
 
         try: temp_local.unlink()
         except: pass
@@ -2238,6 +2324,8 @@ def create_aggregation_report(task_uuid: str, inn_override: str = None):
         return task_uuid
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_aggregation_report: {e}")
         return None
 
@@ -2325,6 +2413,7 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"[*] Текст запроса агрегации: {wrapped_json}")
 
+            before_external_request()
             submission_ambiguous = True
             result = api.documents_create(wrapped_json, pg=group)
             submission_ambiguous = False
@@ -2344,7 +2433,8 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
                     json.dump(result, f, indent=4, ensure_ascii=False)
 
                 logger.info(f"[*] Выгрузка чека агрегации в S3: {remote_receipt_path}")
-                submission_storage.upload(str(temp_receipt), remote_receipt_path)
+                remember_external_result(json.loads(temp_receipt.read_text()))
+                _publish_json_result(submission_storage, temp_receipt, remote_receipt_path)
                 accepted_not_persisted = False
                 _release_document_submission_lock(
                     submission_storage,
@@ -2463,7 +2553,7 @@ def update_utilisation_report_status(order_id: str):
             f.write(status_obj.to_json())
 
         logger.info(f"[*] Сохранение статуса отчета в {output_path}")
-        storage_reports.upload(str(temp_local), output_path)
+        _publish_json_result(storage_reports, temp_local, output_path)
 
         # Теги для расширения (если локально) или метаданных S3
         storage_reports.set_tags(output_path, {"reportStatus": status_obj.reportStatus})
@@ -2672,7 +2762,7 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             f.write(message.to_json())
 
         logger.info(f"[*] Выгрузка задачи на ввод в оборот в S3: {remote_path}")
-        storage_intro.upload(str(temp_local), remote_path)
+        _publish_json_result(storage_intro, temp_local, remote_path)
 
         try: temp_local.unlink()
         except: pass
@@ -2680,6 +2770,8 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         return order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_introduce_task: {e}")
         return None
 
@@ -2758,6 +2850,7 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
             )
 
             api = HonestSignAPI(token=token)
+            before_external_request()
             submission_ambiguous = True
             result = api.documents_create(wrapper.to_json(), pg=group)
             submission_ambiguous = False
@@ -2775,7 +2868,8 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                     json.dump(result, f, indent=4, ensure_ascii=False)
 
                 logger.info(f"[*] Выгрузка чека ввода в оборот в S3: {remote_receipt_path}")
-                submission_storage.upload(str(temp_receipt), remote_receipt_path)
+                remember_external_result(json.loads(temp_receipt.read_text()))
+                _publish_json_result(submission_storage, temp_receipt, remote_receipt_path)
                 accepted_not_persisted = False
                 _release_document_submission_lock(
                     submission_storage,
@@ -3039,7 +3133,7 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
             f.write(final_report.to_json())
 
         logger.info(f"[*] Выгрузка отчета об агрегации наборов в S3: {output_path}")
-        storage_agg.upload(str(temp_local), output_path)
+        _publish_json_result(storage_agg, temp_local, output_path)
 
         try: temp_local.unlink()
         except: pass
@@ -3047,6 +3141,8 @@ def create_aggregation_set_report(task_uuid: str, group: str, inn_override: str 
         return task_uuid
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_aggregation_set_report: {e}")
         return None
 
@@ -3126,6 +3222,7 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
 
             # Отправка через TrueAPI
             api = HonestSignAPI(token=token)
+            before_external_request()
             submission_ambiguous = True
             result = api.documents_create(wrapper.to_json(), pg=group)
             submission_ambiguous = False
@@ -3143,7 +3240,8 @@ def sign_and_send_aggregation_set(task_uuid: str, group: str, signing_dir: str, 
                     json.dump(result, f, indent=4, ensure_ascii=False)
 
                 logger.info(f"[*] Выгрузка чека агрегации наборов в S3: {remote_receipt_path}")
-                submission_storage.upload(str(temp_receipt), remote_receipt_path)
+                remember_external_result(json.loads(temp_receipt.read_text()))
+                _publish_json_result(submission_storage, temp_receipt, remote_receipt_path)
                 accepted_not_persisted = False
                 _release_document_submission_lock(
                     submission_storage,
@@ -3331,7 +3429,7 @@ def create_equipment_set_report(production_order_id: str):
         target_path = f"{equipment_set_reports_path.rstrip('/')}/{production_order_id}.json"
 
         logger.info(f"[*] Выгрузка отчета оборудования в: {target_path}")
-        storage_reports.upload(report_local_name, target_path)
+        _publish_json_result(storage_reports, report_local_name, target_path)
 
         try: os.remove(report_local_name)
         except: pass
@@ -3531,7 +3629,7 @@ def create_equipment_set_report_from_report(production_order_id: str):
         storage_reports = get_storage(equipment_set_reports_path, s3_config)
         target_report_path = f"{equipment_set_reports_path.rstrip('/')}/{production_order_id}.json"
         logger.info(f"[*] Загрузка отчета агрегации наборов в: {target_report_path}")
-        storage_reports.upload(report_local_name, target_report_path)
+        _publish_json_result(storage_reports, report_local_name, target_report_path)
 
         try: os.unlink(report_local_name)
         except: pass
@@ -3612,6 +3710,7 @@ def _create_pallet_assignment(prod_data, config):
     sscc_request_kwargs = {}
     if config.get('sscc_auth_mode'):
         sscc_request_kwargs['auth_mode'] = config['sscc_auth_mode']
+    before_external_request()
     raw_codes = get_sscc_from_service(
         sscc_service_url,
         sscc_prefix,
@@ -3647,7 +3746,12 @@ def _create_pallet_assignment(prod_data, config):
     }
     if boxes_per_pallet is not None:
         assignment["numBoxesInPallet"] = boxes_per_pallet
+    remember_external_result(assignment)
     return assignment
+
+
+def _allocate_task_pallets(production_order_id, prod_data, config):
+    return _create_pallet_assignment(prod_data, config)
 
 
 def create_equipment_aggregation_task(production_order_id: str):
@@ -3693,7 +3797,7 @@ def create_equipment_aggregation_task(production_order_id: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         pasport = prod_data.get('PasportData', {})
-        pallet_assignment = _create_pallet_assignment(prod_data, config)
+        pallet_assignment = _allocate_task_pallets(production_order_id, prod_data, config)
 
         # Поле id теперь совпадает с production_order_id (без расширения .json)
         task_uuid = production_order_id
@@ -3797,7 +3901,7 @@ def create_equipment_aggregation_task(production_order_id: str):
             json.dump(task_data, f, indent=3, ensure_ascii=False)
 
         logger.info(f"[*] Выгрузка задания для оборудования в: {target_path}")
-        storage_tasks.upload(str(temp_local), target_path)
+        _publish_json_result(storage_tasks, temp_local, target_path)
 
         try: temp_local.unlink()
         except: pass
@@ -3805,6 +3909,8 @@ def create_equipment_aggregation_task(production_order_id: str):
         return production_order_id
 
     except Exception as e:
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         logger.error(f"[!] Ошибка в create_equipment_aggregation_task: {e}")
         return None
 
@@ -4214,6 +4320,9 @@ def _write_aggregate_operation_task(operation, task_id, payload):
     task_id = _validate_aggregate_operation_task_id(task_id)
     storage = get_storage(tasks_path, s3_config)
     task_path = f"{tasks_path.rstrip('/')}/{task_id}.json"
+    if config.get('operation_state_path'):
+        publish_once(storage, task_path, json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+        return task_id
     if storage.exists(task_path):
         existing = json.loads(storage.read_text(task_path))
         if existing == payload:
@@ -4420,6 +4529,7 @@ def _sign_and_send_aggregate_operation(
             )
             api_host = _resolve_true_api_host(config)
             api = HonestSignAPI(token=token, host=api_host)
+            before_external_request()
             submission_ambiguous = True
             result = api.documents_create(wrapper.to_json(), pg=group)
             submission_ambiguous = False
@@ -4436,10 +4546,12 @@ def _sign_and_send_aggregate_operation(
             result["taskId"] = task_id
             result["productGroup"] = group
             result["apiHost"] = api_host
-            submission_storage.write_text(
-                receipt_path,
-                json.dumps(result, ensure_ascii=False, indent=4),
-            )
+            remember_external_result(result)
+            receipt_json = json.dumps(result, ensure_ascii=False, indent=4)
+            if config.get('operation_state_path'):
+                publish_once(submission_storage, receipt_path, receipt_json)
+            else:
+                submission_storage.write_text(receipt_path, receipt_json)
             accepted_not_persisted = False
             _release_document_submission_lock(submission_storage, submission_lock_path)
             submission_lock_path = None
@@ -5007,6 +5119,7 @@ def sign_and_send_cis_information_change(
                 signature=sig_base64,
             )
             api = HonestSignAPI(token=token)
+            before_external_request()
             submission_ambiguous = True
             result = api.documents_create(wrapper.to_json(), pg=group)
             submission_ambiguous = False
@@ -5019,7 +5132,11 @@ def sign_and_send_cis_information_change(
             result["taskId"] = task_id
             result["productGroup"] = group
             receipt_json = json.dumps(result, ensure_ascii=False, indent=4)
-            submission_storage.write_text(receipt_path, receipt_json)
+            remember_external_result(result)
+            if config.get("operation_state_path"):
+                publish_once(submission_storage, receipt_path, receipt_json)
+            else:
+                submission_storage.write_text(receipt_path, receipt_json)
             accepted_not_persisted = False
             _release_document_submission_lock(submission_storage, submission_lock_path)
             submission_lock_path = None
@@ -5571,6 +5688,127 @@ def main():
         return
 
     parser.print_help()
+
+
+
+def _record_terminal_emission(config, key, status):
+    if config.get('operation_state_path'):
+        import hashlib
+        root = config['operation_state_path']
+        path = root.rstrip('/') + '/terminal-emission/' + hashlib.sha256(str(key).encode()).hexdigest() + '.json'
+        publish_once(get_storage(root, config.get('s3_config')), path,
+                     json.dumps({'business_key': key, 'status': status}))
+
+def _task_input(config_key):
+    def source(config, key):
+        filename = str(key) if str(key).endswith('.json') else str(key) + '.json'
+        return config[config_key].rstrip('/') + '/' + filename
+    return source
+
+
+def _incoming_input(config, key):
+    return str(key) if str(key).startswith('s3://') or str(key).startswith('/') else 's3://' + str(key)
+
+
+def _receipt_resume(config_key, id_field):
+    def resume(config, key, result):
+        receipt = result.to_dict() if hasattr(result, 'to_dict') else result
+        if not isinstance(receipt, dict) or not receipt.get(id_field):
+            raise ReconciliationRequired('Saved external receipt is malformed')
+        root = config[config_key]
+        storage = get_storage(root, config.get('s3_config'))
+        publish_once(storage, root.rstrip('/') + '/' + str(key) + '.json', json.dumps(receipt))
+        if id_field == 'reportId':
+            return receipt['reportId']
+        if id_field == 'orderId' and not isinstance(result, EmissionOrderreceipts):
+            return EmissionOrderreceipts(**receipt)
+        return result
+    return resume
+
+
+def _validate_codes_result(result, expected=None):
+    codes = result.get('codes') if isinstance(result, dict) else None
+    if (not isinstance(codes, list) or not codes or any(not isinstance(x, str) or not x for x in codes)
+            or len(codes) != len(set(codes)) or (expected is not None and len(codes) != expected)):
+        raise ReconciliationRequired('Downloaded codes missing/duplicated/incomplete; never issue another order')
+
+
+def _recover_codes_blocks(api, order_id, gtin, status):
+    # Read-only replay: NEVER call the consuming /codes endpoint on this path.
+    blocks = api.order_codes_blocks(order_id, gtin)
+    if isinstance(blocks, dict):
+        if blocks.get('orderId') != order_id or blocks.get('gtin') != gtin:
+            raise ReconciliationRequired('SUZ blocks belong to a different order/product')
+        blocks = blocks.get('blocks')
+    if not isinstance(blocks, list) or not blocks:
+        raise ReconciliationRequired('SUZ blocks unavailable or unknown schema; manual reconciliation required')
+    identifiers = [block.get('blockId') for block in blocks if isinstance(block, dict)]
+    if len(identifiers) != len(blocks) or not all(identifiers) or len(set(identifiers)) != len(identifiers):
+        raise ReconciliationRequired('SUZ blocks have invalid/duplicate identifiers')
+    result = {'orderId': order_id, 'codes': []}
+    for identifier in identifiers:
+        block = api.order_codes_retry(identifier)
+        _validate_codes_result(block)
+        result['codes'].extend(block['codes'])
+    expected = status.get('totalCodes')
+    if not isinstance(expected, int) or expected <= 0:
+        raise ReconciliationRequired('SUZ does not provide expected code count; manual reconciliation required')
+    _validate_codes_result(result, expected)
+    return result
+
+
+def _resume_codes(config, key, result):
+    _validate_codes_result(result)
+    root = config['kodes']
+    storage = get_storage(root, config.get('s3_config'))
+    output = root.rstrip('/') + '/' + str(key) + '.json'
+    status_root = config['emissions_path']
+    source = status_root.rstrip('/') + '/' + str(key) + '.json'
+    status = json.loads(get_storage(source, config.get('s3_config')).read_text(source))
+    tags = {'print-status': 'not-printed'}
+    if status.get('productionOrderId'):
+        tags['productionOrderId'] = status['productionOrderId']
+    publish_once(storage, output, json.dumps(result), tags)
+    return result
+
+
+# The config loader is looked up at invocation time (including process tests).
+_GUARDED_WORKFLOWS = {
+    'process_incoming_task': ('normalize-task', _incoming_input, None),
+    'create_virtual_production_tasks': ('prepare-components', _task_input('production_orders_path'), None),
+    'create_virtual_utilisation_task': ('prepare-virtual-utilisation', _task_input('kodes'), None),
+    'create_utilisation_task': ('prepare-utilisation', _task_input('kodes'), None),
+    'create_utilisation_task_from_report': ('prepare-equipment-utilisation', _task_input('equipment-reports'), None),
+    'create_introduce_task': ('prepare-introduce', _task_input('kodes'), None),
+    'create_introduce_task_from_report': ('prepare-equipment-introduce', _task_input('equipment-reports'), None),
+    'create_virtual_introduce_task': ('prepare-virtual-introduce', _task_input('kodes'), None),
+    'create_aggregation_report': ('prepare-aggregation', _task_input('equipment-reports'), None),
+    'create_aggregation_set_report': ('prepare-aggregation-set', _task_input('equipment_set_reports'), None),
+    'create_equipment_set_report': ('prepare-virtual-set-report', _task_input('production_orders_path'), None),
+    'create_equipment_set_report_from_report': ('prepare-equipment-set-report', _task_input('equipment-reports'), None),
+
+    'create_equipment_aggregation_task': ('equipment-sscc', _task_input('production_orders_path'), None),
+    '_allocate_task_pallets': ('allocate-pallet-sscc', _task_input('production_orders_path'), None),
+    'create_emission_task': ('prepare-emission', _task_input('production_orders_path'), None),
+    'sign_and_send_emission': ('send-emission', _task_input('emission_orders_path'), _receipt_resume('emission_receipts', 'orderId')),
+    'sign_and_send_utilisation': ('send-utilisation', _task_input('utilisation_tasks_path'), _receipt_resume('utilisation_receipts', 'reportId')),
+    'get_emission_kodes': ('download-codes', None, _resume_codes),
+    'sign_and_send_introduce': ('send-introduce', _task_input('introduce-tasks'), _receipt_resume('introduce-receipts', 'document_id')),
+    'sign_and_send_aggregation': ('send-aggregation', _task_input('agg-tasks'), _receipt_resume('agg-receipts', 'document_id')),
+    'sign_and_send_aggregation_set': ('send-aggregation-set', _task_input('agg_set_tasks'), _receipt_resume('agg_set_receipts', 'document_id')),
+    'sign_and_send_disaggregation': ('send-disaggregation', _task_input('disaggregation-tasks'), _receipt_resume('disaggregation-receipts', 'document_id')),
+    'sign_and_send_reaggregation': ('send-reaggregation', _task_input('reaggregation-tasks'), _receipt_resume('reaggregation-receipts', 'document_id')),
+    'sign_and_send_cis_information_change': ('send-cis-information-change', _task_input('cis-information-change-tasks'), _receipt_resume('cis-information-change-receipts', 'document_id')),
+}
+update_emission_order_status = guarded('poll-emission-status',
+    input_path=_task_input('emission_receipts'),
+    success=lambda result: isinstance(result, EmissionOrderStatus) and result.bufferStatus in {'ACTIVE', 'EXHAUSTED', 'REJECTED'},
+    config_loader=lambda name: load_config(name))(update_emission_order_status)
+
+for _name, (_operation, _input, _resume) in _GUARDED_WORKFLOWS.items():
+    globals()[_name] = guarded(_operation, input_path=_input, resume=_resume,
+                              cache_none=_name == 'create_virtual_production_tasks',
+                              config_loader=lambda name: load_config(name))(globals()[_name])
 
 if __name__ == "__main__":
     main()

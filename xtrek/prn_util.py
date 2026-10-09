@@ -8,6 +8,7 @@ import shutil
 from datetime import datetime, timezone
 
 from .storage import get_storage
+from .operation_state import guarded, OperationBusy, OperationConflict, ReconciliationRequired
 from .config_loader import load_config
 from .create_emission_task_sample import _find_production_order_id_by_suz_order_id
 import amica.amica_generator as amica_generator
@@ -86,14 +87,16 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             "created_at": datetime.now(timezone.utc).isoformat(),
         }, ensure_ascii=False)
 
-        lock_acquired = storage_tasks.acquire_lock(lock_path, lock_content)
+        coordinated = bool(config.get('operation_state_path'))
+        lock_acquired = True if coordinated else storage_tasks.acquire_lock(lock_path, lock_content)
         if not lock_acquired:
             logger.info(f"[*] Задание печати {key} уже заблокировано другим обработчиком. Пропуск.")
             return None
 
         def finish(value):
             try:
-                storage_tasks.release_lock(lock_path)
+                if not coordinated:
+                    storage_tasks.release_lock(lock_path)
             except Exception as release_err:
                 logger.warning(f"[!] Не удалось снять lock печати {lock_path}: {release_err}")
             return value
@@ -106,7 +109,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
         if not production_order_id:
              production_order_id = _find_production_order_id_by_suz_order_id(key)
 
-        if print_status == 'processing':
+        if print_status == 'processing' and not coordinated:
             logger.info(f"[*] Файл {key} уже в обработке (print-status:processing). Пропуск.")
             return finish(None)
 
@@ -137,7 +140,7 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             except Exception as e:
                 logger.warning(f"Ошибка при проверке виртуальности заказа {production_order_id}: {e}")
 
-        if not ignore_duplicate and print_status != 'not-printed':
+        if not ignore_duplicate and print_status not in ({None, 'not-printed', 'processing'} if coordinated else {'not-printed'}):
             logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
             return finish(key)
 
@@ -220,10 +223,16 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
             dest_vdf_s3 = f"{prn_tasks_path.rstrip('/')}/{local_vdf.name}"
 
             logger.info(f"[*] Загрузка CSV в {dest_csv_s3}...")
-            storage_tasks.upload(str(local_csv), dest_csv_s3)
+            if coordinated:
+                storage_tasks.upload_once(str(local_csv), dest_csv_s3)
+            else:
+                storage_tasks.upload(str(local_csv), dest_csv_s3)
 
             logger.info(f"[*] Загрузка VDF в {dest_vdf_s3}...")
-            storage_tasks.upload(str(local_vdf), dest_vdf_s3)
+            if coordinated:
+                storage_tasks.upload_once(str(local_vdf), dest_vdf_s3)
+            else:
+                storage_tasks.upload(str(local_vdf), dest_vdf_s3)
 
             # 6. Устанавливаем статус printed
             logger.info(f"[*] Установка статуса print-status:printed для {key}")
@@ -234,19 +243,27 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
 
     except Exception as e:
         # В случае ошибки сбрасываем статус в not-printed, чтобы можно было попробовать снова
+        if isinstance(e, (OperationBusy, OperationConflict, ReconciliationRequired)):
+            raise
         try:
             storage_kodes.set_tags(json_s3_path, {'print-status': 'not-printed'})
         except:
             pass
         if lock_acquired and lock_path:
             try:
-                storage_tasks.release_lock(lock_path)
+                if not coordinated:
+                    storage_tasks.release_lock(lock_path)
             except:
                 pass
         logger.error(f"[!] Ошибка в generate_prn_files: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return None
+
+
+generate_prn_files = guarded('prepare-code-print',
+    input_path=lambda config, key: config['kodes'].rstrip('/') + '/' + key + '.json',
+    config_loader=lambda name: load_config(name))(generate_prn_files)
 
 def main():
     parser = argparse.ArgumentParser(description="Генерация файлов задания на печать (PRN) на основе кодов эмиссии")
