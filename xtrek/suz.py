@@ -59,11 +59,11 @@ class SUZ:
 
     def _get(self, url, params=None):
         try:
-            response = requests.get(url, params=params, headers=self.headers, verify=False)
+            response = requests.get(url, params=params, headers=self.headers, verify=False, timeout=(10, 30))
             if response.status_code in (401, 403) and self.token_refresher:
                 self.token = self.token_refresher()
                 self.headers["clientToken"] = self.token
-                response = requests.get(url, params=params, headers=self.headers, verify=False)
+                response = requests.get(url, params=params, headers=self.headers, verify=False, timeout=(10, 30))
             if response.status_code != 200:
                 logger.debug(f"GET {url} failed with {response.status_code}: {response.text}")
             response.raise_for_status()
@@ -134,31 +134,13 @@ class SUZ:
         logger.info(f"URL: {url}")
         logger.info(f"Тело запроса (бинарное, длина): {len(body_bytes)} байт")
 
-        # Попытки с повторением при ошибке 503 или сетевых ошибках
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Попытка {attempt + 1}/{max_retries}")
-                response = requests.post(url, headers=headers, data=body_bytes, verify=False, timeout=30)
-                logger.info(f"Ответ: {response.status_code}")
-
-                if response.status_code == 200:
-                    return response
-
-                response.raise_for_status()
-            except HTTPError as e:
-                if e.response.status_code == 503 and attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5
-                    logger.warning(f"Сервис недоступен (503). Повтор через {wait_time} секунд...")
-                    time.sleep(wait_time)
-                    continue
-                raise
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Ошибка сети: {str(e)}. Повтор через 5 секунд...")
-                    time.sleep(5)
-                    continue
-                raise
-        return None
+        # Mutating requests have no proven server-side idempotency key. A 503
+        # or a transport failure may happen AFTER acceptance: reserve/reconcile
+        # at workflow level instead of issuing a second POST here.
+        response = requests.post(url, headers=headers, data=body_bytes,
+                                 verify=False, timeout=(10, 30))
+        response.raise_for_status()
+        return response
 
     def utilisation_send(self, body_file: str, signature_file: str, max_retries: int = 3, orderId: str = None) -> str:
         """
@@ -174,11 +156,9 @@ class SUZ:
                 data = response.json()
                 return data.get('reportId', '')
             return ""
-        except Exception as e:
-            logger.error(f"Ошибка при отправке отчета о нанесении: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                return e.response.text
-            return str(e)
+        except Exception:
+            logger.exception("Ошибка отправки нанесения; исход требует сверки")
+            raise
 
     def report_info(self, reportId: str):
         """
@@ -266,6 +246,8 @@ class SUZ:
             return ""
 
         except HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                raise
             logger.error(f"HTTP Error {e.response.status_code}")
             logger.error(f"Ответ сервера: {e.response.text[:500]}...")
             try:
@@ -275,9 +257,9 @@ class SUZ:
                 pass
             return str(e.response.text)
 
-        except Exception as e:
-            logger.error(f"Ошибка: {str(e)}")
-            return ""
+        except Exception:
+            logger.exception("Ошибка отправки эмиссии; исход требует сверки")
+            raise
 
 # Использование
 def main():

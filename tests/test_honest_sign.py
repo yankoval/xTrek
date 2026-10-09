@@ -73,6 +73,7 @@ class TestHonestSignAPI(unittest.TestCase):
             json=["00AGGREGATE"],
             headers=self.api.headers,
             verify=False,
+            timeout=(10, 30),
         )
 
     @patch('pyperclip.paste')

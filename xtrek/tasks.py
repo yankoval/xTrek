@@ -60,6 +60,8 @@ from xtrek.suz_api_models import (
     AggregationReport, AggregationUnit, EquipmentAggTask, EquipmentAggTaskReport,
     EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
 )
+from .operation_state import guarded, OperationConflict, ReconciliationRequired
+
 # 2. Настройки доступа
 ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
 SECRET_KEY = os.environ.get('YMQ_SECRET_KEY')
@@ -85,6 +87,15 @@ def _finish_token_snapshot(**kwargs):
 
 # Загрузка конфигурации
 config = load_config('suz_worker_config')
+if os.environ.get('XTREK_PARALLEL_REQUIRED') == '1':
+    state_path = config.get('operation_state_path', '')
+    if not state_path.startswith('s3://'):
+        raise RuntimeError('Parallel workers require a shared S3 operation_state_path')
+    state_bucket = state_path[5:].split('/', 1)[0]
+    business_buckets = {config.get('input_bucket', '1bf11148-3595-4a07-a089-d460153b7c7a'),
+                        config.get('internal_bucket', '20ab2a0c-2726-4ba1-9c7c-7deae82941ff')}
+    if state_bucket in business_buckets:
+        raise RuntimeError('Parallel worker state must use a separate bucket without business triggers')
 
 # Один снимок настроек подписи для этого экземпляра. Токены остаются динамическими.
 document_signer = DocumentSigner(config)
@@ -131,6 +142,9 @@ app.conf.update(
     broker_connection_retry_on_startup=True,
     worker_enable_remote_control=False,
     task_acks_late=True, # Подтверждаем удаление только после успеха
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
+    worker_eta_task_limit=10,
 )
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -358,6 +372,9 @@ def logic_update_emission(full_key):
             return f"Emission for {production_order_id} ready for download (ACTIVE)"
         elif result.bufferStatus == "EXHAUSTED":
             return f"Emission for {production_order_id} has been downloaded (EXHAUSTED)"
+        elif result.bufferStatus == "REJECTED":
+            print(f"[TERMINAL] Emission rejected for {production_order_id}; preserved for investigation")
+            return f"Emission for {production_order_id} rejected"
         else:
             raise RuntimeError(f"Unexpected bufferStatus '{result.bufferStatus}' for {production_order_id}")
     else:
@@ -375,6 +392,8 @@ def logic_get_emission_kodes(full_key):
     result = get_emission_kodes(emission_order_id)
     if not result:
         raise RuntimeError(f"get_emission_kodes failed for {emission_order_id}")
+    if result.get('bufferStatus') == 'REJECTED':
+        return f"Emission {emission_order_id} rejected; no codes will be requested"
     if 'codes' in result.keys():
         total_codes = len(result['codes'])
     else: 
@@ -393,8 +412,8 @@ def logic_kodes(full_key):
         result = generate_prn_files(kodes_order_id)
         if not result:
             raise RuntimeError(f"generate_prn_files failed for {kodes_order_id}")
-    except Exception as e:
-        print(e)
+    except Exception:
+        raise
     # Создаем отчет о нанесении
     result = create_virtual_utilisation_task(kodes_order_id, PRODUCT_GROUP)
     if not result:
@@ -891,11 +910,18 @@ def logic_update_agg(full_key):
 
 # --- ГЛАВНЫЙ ВОРКЕР (РОУТЕР) ---
 #@app.task(name='tasks.process_s3_event', bind=True)
+# A route completes only after all its downstream stages succeeded. External
+# mutations have separate durable guards, so a route may safely resume halfway.
+for _route_name in tuple(name for name in globals() if name.startswith('logic_')):
+    globals()[_route_name] = guarded('route-' + _route_name, cache_none=True,
+                                     config_loader=lambda name: config)(globals()[_route_name])
+
 @app.task(
     name='tasks.process_s3_event',
     bind=True,
     acks_late=True,
     autoretry_for=(Exception,),
+    dont_autoretry_for=(OperationConflict, ReconciliationRequired),
     retry_kwargs={'max_retries': 200}, # Увеличено до 200 для ожидания до 12+ часов
     retry_backoff=60,                 # 60, 120, 240, 300...
     retry_backoff_max=300,

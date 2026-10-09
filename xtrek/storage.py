@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 import shutil
+import hashlib
+import tempfile
 from botocore.exceptions import ClientError
 from botocore.config import Config
 from .token_runtime import current_runtime, checkpoint
@@ -43,6 +45,37 @@ class BaseStorage:
         pass
 
 class LocalStorage(BaseStorage):
+    def read_lock_object(self, path):
+        try:
+            text = Path(path).read_text(encoding='utf-8')
+        except FileNotFoundError:
+            return None
+        return text, hashlib.sha256(text.encode()).hexdigest()
+
+    def write_lock_object(self, path, content, etag):
+        # Linux/macOS local test stores: serialize CAS, then publish by rename.
+        # Never use this local store to coordinate independent production hosts.
+        import fcntl
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(target) + '.cas', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            old = self.read_lock_object(path)
+            if (old[1] if old else None) != etag:
+                return None
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=target.parent, delete=False) as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+                temporary = output.name
+            try:
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            return hashlib.sha256(content.encode()).hexdigest()
+
     def list_files(self, path, pattern):
         p = Path(path)
         if not p.exists():
@@ -176,11 +209,25 @@ class LocalStorage(BaseStorage):
         return path
 
 class S3Storage(BaseStorage):
+    def upload_once(self, local_path, remote_path):
+        from .operation_state import OperationConflict
+        bucket, key = self._parse_s3_url(remote_path)
+        content = Path(local_path).read_bytes()
+        try:
+            self.s3.put_object(Bucket=bucket, Key=key, Body=content, IfNoneMatch='*')
+        except ClientError as exc:
+            if exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode') != 412:
+                raise
+            response = self.s3.get_object(Bucket=bucket, Key=key)
+            try:
+                if response['Body'].read() != content:
+                    raise OperationConflict('Existing immutable file differs: ' + remote_path)
+            finally:
+                response['Body'].close()
+
     def __init__(self, s3_config):
-        options = {}
-        if current_runtime() is not None:
-            options['config'] = Config(connect_timeout=5, read_timeout=10,
-                                       retries={'mode': 'standard', 'total_max_attempts': 2})
+        options = {'config': Config(connect_timeout=5, read_timeout=10,
+                                   retries={'mode': 'standard', 'total_max_attempts': 2})}
         self.s3 = boto3.client(
             's3',
             endpoint_url=s3_config.get('endpoint_url', 'https://storage.yandexcloud.net'),
@@ -309,8 +356,10 @@ class S3Storage(BaseStorage):
         try:
             self.s3.head_object(Bucket=bucket, Key=key)
             return True
-        except Exception:
-            return False
+        except ClientError as exc:
+            if exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode') == 404:
+                return False
+            raise
 
     def read_text(self, path):
         bucket, key = self._parse_s3_url(path)
