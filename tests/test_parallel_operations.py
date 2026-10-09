@@ -228,6 +228,24 @@ def test_new_release_preserves_unresolved_legacy_document_lock(monkeypatch):
     assert storage.acquired == storage.released == []
 
 
+def test_failed_tag_read_cannot_overwrite_existing_downloaded_tag():
+    storage = S3Storage.__new__(S3Storage)
+    storage.s3 = MagicMock()
+    storage.s3.get_object_tagging.side_effect = TimeoutError('tag read failed')
+    with pytest.raises(TimeoutError):
+        storage.set_tags('s3://test/file.csv', {'print-status': 'printed'})
+    storage.s3.put_object_tagging.assert_not_called()
+
+
+def test_failed_tag_write_cannot_report_success():
+    storage = S3Storage.__new__(S3Storage)
+    storage.s3 = MagicMock()
+    storage.s3.get_object_tagging.return_value = {'TagSet': [{'Key': 'Downloaded', 'Value': 'true'}]}
+    storage.s3.put_object_tagging.side_effect = TimeoutError('tag write failed')
+    with pytest.raises(TimeoutError):
+        storage.set_tags('s3://test/file.csv', {'print-status': 'printed'})
+
+
 def test_explicit_rate_rejection_can_retry_without_ambiguous_send(signing_workflow, tmp_path, monkeypatch):
     ctx = signing_workflow
     _enable(ctx, tmp_path, monkeypatch)

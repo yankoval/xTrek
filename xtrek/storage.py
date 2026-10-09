@@ -390,6 +390,7 @@ class S3Storage(BaseStorage):
             )
         except Exception as e:
             logger.error(f"Error setting S3 tags: {e}")
+            raise
         return path
 
     def get_tags(self, path):
@@ -399,7 +400,7 @@ class S3Storage(BaseStorage):
             return {t['Key']: t['Value'] for t in response.get('TagSet', [])}
         except Exception as e:
             logger.error(f"Error getting S3 tags: {e}")
-            return {}
+            raise
 
     def acquire_lock(self, path, content=''):
         bucket, key = self._parse_s3_url(path)
