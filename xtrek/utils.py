@@ -12,6 +12,7 @@ from .nkapi import NK
 from .tokens import TokenProcessor
 from .gs1_processor import get_inn_by_gtin
 from .config_loader import load_config
+from .operation_state import ReconciliationRequired
 from .aggregation_builder import (
     AggregationBuildError,
     iter_equipment_report_boxes,
@@ -114,7 +115,8 @@ class AggregationAnalyzer:
                 return {"error": str(e)}
         return results
 
-    def check_report(self, path: str, s3_config: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
+    def check_report(self, path: str, s3_config: Optional[Dict] = None,
+                     *, strict_prerequisites=False) -> Optional[Dict[str, List[str]]]:
         """Проверяет один отчет об агрегации и устанавливает тег check."""
         errors = defaultdict(list)
         storage = get_storage(path, s3_config or self.config.get('s3_config'))
@@ -123,8 +125,18 @@ class AggregationAnalyzer:
             content = storage.read_text(path)
             data = json.loads(content)
         except Exception as e:
+            if strict_prerequisites:
+                if isinstance(e, json.JSONDecodeError):
+                    raise EquipmentReportValidationError("Equipment report is not valid JSON") from e
+                raise EquipmentReportResourceError("Equipment report read failed") from e
             logger.error(f"Ошибка чтения файла {path}: {e}")
             return {'filereaderror': [str(e)]}
+
+        if strict_prerequisites:
+            # Recheck the exact snapshot used below if the report changed since
+            # resource selection. No API status request or business POST follows
+            # an empty or malformed replacement snapshot.
+            _validate_equipment_report_input(data)
 
         try:
             ready_boxes = iter_equipment_report_boxes(data)
@@ -240,6 +252,8 @@ class AggregationAnalyzer:
         try:
             storage.set_tags(path, {'check': tag_value})
         except Exception as e:
+            if strict_prerequisites:
+                raise EquipmentReportResourceError("Equipment report check tag not saved") from e
             logger.error(f"Не удалось установить тег check для {path}: {e}")
 
         return result
@@ -524,7 +538,33 @@ _RESOURCES_CACHE = {
     'config': None,
 }
 
-def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None, config: Optional[Dict] = None):
+class EquipmentReportValidationError(ReconciliationRequired):
+    """Invalid report input requires correction, not a business POST or retry."""
+
+
+class EquipmentReportResourceError(RuntimeError):
+    """An unverified prerequisite must remain retryable, never a successful skip."""
+
+
+def _validate_equipment_report_input(data):
+    try:
+        pallets = iter_equipment_report_pallets(data)
+        boxes = iter_equipment_report_boxes(data)
+    except AggregationBuildError:
+        raise EquipmentReportValidationError("Invalid equipment report structure") from None
+    if not boxes:
+        raise EquipmentReportValidationError("Equipment report has no ready boxes")
+    if any(not pallet.get("readyBox") for pallet in pallets):
+        raise EquipmentReportValidationError("Equipment report has an empty pallet")
+    for box in boxes:
+        codes = box.get("productNumbersFull")
+        if (not isinstance(codes, list) or not codes
+                or any(not isinstance(code, str) or not code.strip() for code in codes)):
+            raise EquipmentReportValidationError("Equipment report has empty or invalid full codes")
+
+
+def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None,
+                      config: Optional[Dict] = None, *, validate_report=False):
     """Обеспечивает наличие API, NK и конфига, выполняя автодетекцию если нужно."""
     if config is None:
         if _RESOURCES_CACHE['config'] is None:
@@ -532,6 +572,18 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
         config = _RESOURCES_CACHE['config']
 
     resolved_path = resolve_file_path(path, config)
+    data = None
+    if validate_report:
+        # Validate source structure before selecting a token or constructing
+        # external clients, including when callers supply their own clients.
+        storage = get_storage(resolved_path, config.get('s3_config'))
+        if not storage.exists(resolved_path):
+            raise EquipmentReportResourceError("Equipment report is not available")
+        try:
+            data = json.loads(storage.read_text(resolved_path))
+        except json.JSONDecodeError as exc:
+            raise EquipmentReportValidationError("Equipment report is not valid JSON") from exc
+        _validate_equipment_report_input(data)
 
     # Если переданы и API и NK, просто возвращаем их
     if api and nk:
@@ -556,8 +608,9 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
             if not storage.exists(resolved_path):
                  logger.warning(f"Файл {resolved_path} не найден для автодетекции ИНН")
             else:
-                content = storage.read_text(resolved_path)
-                data = json.loads(content)
+                if data is None:
+                    content = storage.read_text(resolved_path)
+                    data = json.loads(content)
                 ready_boxes = iter_equipment_report_boxes(data)
                 detected_inn = None
                 for box in ready_boxes:
@@ -863,12 +916,19 @@ def check_aggregation_reports(paths: List[str], api: Optional[HonestSignAPI] = N
     results = {}
     for path in paths:
         try:
-            resolved_path, current_api, current_nk, current_config = _ensure_resources(path, api, nk, config)
+            resolved_path, current_api, current_nk, current_config = _ensure_resources(
+                path, api, nk, config, validate_report=True)
             analyzer = AggregationAnalyzer(current_api, current_nk, current_config)
-            results[resolved_path] = analyzer.check_report(resolved_path)
-        except Exception as e:
-            logger.error(f"Ошибка при проверке {path}: {e}")
-            results[path] = {'error': [str(e)]}
+            results[resolved_path] = analyzer.check_report(resolved_path, strict_prerequisites=True)
+        except EquipmentReportValidationError:
+            raise
+        except Exception as exc:
+            # A missing token, registry/S3 outage or failed precheck is not a
+            # verified business result. Propagate failure so Celery retries;
+            # do not cache a successful skip in the route guard.
+            raise EquipmentReportResourceError(
+                f"Equipment report prerequisites not verified: {type(exc).__name__}"
+            ) from exc
     return results
 
 
