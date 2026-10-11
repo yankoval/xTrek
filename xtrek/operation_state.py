@@ -60,12 +60,14 @@ def decode_result(result):
 
 
 class OperationState:
-    def __init__(self, storage, root, operation, business_key, input_hash=None):
+    def __init__(self, storage, root, operation, business_key, input_hash=None,
+                 retry_mode=None):
         self.storage = storage
         digest = hashlib.sha256(str(business_key).encode()).hexdigest()
         self.path = '{}/{}/{}.json'.format(root.rstrip('/'), operation, digest)
         self.operation, self.business_key = operation, str(business_key)
         self.input_hash = input_hash
+        self.retry_mode = retry_mode
         self.owner = owner_identity()
         self.owner_id = str(uuid4())
         self.value = self.etag = None
@@ -86,7 +88,7 @@ class OperationState:
                 pass
             raise
 
-    def acquire(self):
+    def acquire(self, *, retry_idempotent_external=False):
         stored = self.storage.read_lock_object(self.path)
         previous, etag = (json.loads(stored[0]), stored[1]) if stored else (None, None)
         if previous:
@@ -112,8 +114,14 @@ class OperationState:
                     # A duplicate can arrive while the first request is still
                     # in flight. Retry later; this does not grant ownership.
                     raise OperationBusy('External request still in progress: ' + self.path)
-                raise ReconciliationRequired('External outcome requires reconciliation: ' + self.path)
-            if phase not in {'ready', 'held'}:
+                can_retry = (retry_idempotent_external
+                             and previous.get('retry_mode') == 'local-sscc-v1')
+                if not can_retry:
+                    raise ReconciliationRequired('External outcome requires reconciliation: ' + self.path)
+            if (phase not in {'ready', 'held'}
+                    and not (retry_idempotent_external
+                             and previous.get('retry_mode') == 'local-sscc-v1'
+                             and phase in {'external', 'uncertain'})):
                 raise OperationConflict('Unknown operation state: ' + self.path)
             if phase == 'held' and not owner_is_dead(previous.get('owner'), self.owner):
                 raise OperationBusy('Operation owned by a live/unknown worker: ' + self.path)
@@ -121,6 +129,8 @@ class OperationState:
                       'business_key': self.business_key, 'input_hash': self.input_hash,
                       'owner_id': self.owner_id, 'owner': self.owner,
                       'phase': 'held', 'updated_at': time.time()}
+        if self.retry_mode:
+            self.value['retry_mode'] = self.retry_mode
         self.etag = self._persist(self.value, etag)
         if self.etag is None:
             raise OperationBusy('Another worker won operation CAS: ' + self.path)
@@ -182,8 +192,17 @@ def remember_external_result(result):
         guard.accepted(result)
 
 
+def stable_request_id():
+    """Return an idempotency key tied to the guarded business operation."""
+    guard = _current.get()
+    if guard is None or not guard.input_hash:
+        raise RuntimeError('Stable request id requires a guarded input fingerprint')
+    identity = '\0'.join((guard.operation, guard.business_key, guard.input_hash))
+    return hashlib.sha256(identity.encode('utf-8')).hexdigest()
+
+
 def guarded(operation, *, input_path=None, resume=None, cache_none=False, config_loader=None,
-            success=None):
+            success=None, retry_idempotent_external=False):
     """Guard a function by its first business argument; optional safe result replay.
 
     resume receives a confirmed saved result, never sends it to the external API.
@@ -211,9 +230,16 @@ def guarded(operation, *, input_path=None, resume=None, cache_none=False, config
                           if name in bound.arguments}
             if parameters:
                 input_hash = fingerprint(json.dumps({'source': input_hash, 'parameters': parameters}))
+            # Only a local SSCC request that wrote this marker before the
+            # external call may be retried. Older Cloud uncertain records have
+            # no marker and remain reconciliation-only.
+            safe_local_retry = (retry_idempotent_external
+                                and operation == 'allocate-pallet-sscc'
+                                and config.get('sscc_auth_mode') == 'mtls')
             guard = OperationState(get_storage(root, config.get('s3_config')), root,
-                                   operation, business_key, input_hash)
-            result = guard.acquire()
+                                   operation, business_key, input_hash,
+                                   retry_mode='local-sscc-v1' if safe_local_retry else None)
+            result = guard.acquire(retry_idempotent_external=safe_local_retry)
             if guard.cached:
                 if resume and guard.value['phase'] == 'accepted':
                     result = resume(config, business_key, result)

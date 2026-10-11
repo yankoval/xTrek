@@ -14,7 +14,8 @@ import pytest
 import requests
 
 from xtrek.operation_state import (OperationState, OperationBusy, OperationConflict,
-                                   ReconciliationRequired, fingerprint, publish_once)
+                                   ReconciliationRequired, fingerprint, publish_once,
+                                   stable_request_id, _current)
 from xtrek.storage import LocalStorage, S3Storage
 from xtrek.suz import SUZ
 from test_document_send_idempotency import signing_workflow, _DOCUMENT_CASES, _SIGN_INN, _SIGN_THUMB
@@ -154,6 +155,56 @@ def test_successful_conditional_put_with_lost_reply_is_adopted_by_exact_readback
     operation.accepted({'orderId': 'ONE'})
     operation.finish({'orderId': 'ONE'})
     assert guard(store).acquire() == {'orderId': 'ONE'}
+
+
+def test_local_sscc_retry_has_stable_key_and_preserves_cloud_uncertain_record(tmp_path):
+    store = LocalStorage()
+    source = fingerprint('{"Quantity":17}')
+    cloud = OperationState(store, str(tmp_path), 'allocate-pallet-sscc', 'JOB', source)
+    cloud.acquire()
+    cloud.external()
+    cloud.update('uncertain')
+    with pytest.raises(ReconciliationRequired):
+        OperationState(store, str(tmp_path), 'allocate-pallet-sscc', 'JOB', source,
+                       retry_mode='local-sscc-v1').acquire(retry_idempotent_external=True)
+
+    local_store = LocalStorage()
+    local_root = str(tmp_path / 'local')
+    local = OperationState(local_store, local_root, 'allocate-pallet-sscc', 'JOB', source,
+                           retry_mode='local-sscc-v1')
+    local.acquire()
+    local.external()
+    local.update('uncertain')
+    token = _current.set(local)
+    try:
+        request_id_before_restart = stable_request_id()
+    finally:
+        _current.reset(token)
+    resumed = OperationState(local_store, local_root, 'allocate-pallet-sscc', 'JOB', source,
+                             retry_mode='local-sscc-v1')
+    resumed.acquire(retry_idempotent_external=True)
+    token = _current.set(resumed)
+    try:
+        assert stable_request_id() == request_id_before_restart
+    finally:
+        _current.reset(token)
+    with pytest.raises(OperationConflict):
+        OperationState(local_store, local_root, 'allocate-pallet-sscc', 'JOB',
+                       fingerprint('{"Quantity":18}'),
+                       retry_mode='local-sscc-v1').acquire(retry_idempotent_external=True)
+
+
+def test_completed_historical_sscc_guard_replays_old_result_without_reallocation(tmp_path):
+    store = LocalStorage()
+    source = fingerprint('{"Quantity":17}')
+    prior_codes = {'palletNumbers': ['046070517921585754']}
+    completed = OperationState(store, str(tmp_path), 'allocate-pallet-sscc', 'JOB', source)
+    completed.acquire()
+    completed.finish(prior_codes)
+    replay = OperationState(store, str(tmp_path), 'allocate-pallet-sscc', 'JOB', source,
+                            retry_mode='local-sscc-v1')
+    assert replay.acquire(retry_idempotent_external=True) == prior_codes
+    assert replay.cached
 
 
 def test_immutable_output_is_never_overwritten(tmp_path):
