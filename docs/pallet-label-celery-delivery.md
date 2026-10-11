@@ -1,0 +1,38 @@
+# Pallet PNG delivery on VPS Celery
+
+`tasks.deliver_pallet_report` runs report/task validation, local GS1-128 rendering,
+and MAX attachment delivery inside the released Celery worker. It is disabled
+unless `XTREK_PALLET_DELIVERY_CONFIG` names an explicitly provisioned configuration
+with `enabled: true`. The existing business report flow remains separate.
+
+`python -m xtrek.pallet_label_report_poller` discovers S3 reports and publishes
+persistent tasks to the existing local RabbitMQ queue. It has a SQLite outbox and
+single-instance lock. It never uploads files or sends MAX messages. A crash after
+broker acceptance may redeliver the same event; the delivery ledger reconciles
+GET history and holds ambiguous POSTs. There is no automatic retry of a failed
+Celery send task.
+
+Provision configuration with task/report buckets, three explicitly allowed INNs,
+exact `backlog_report_ids`/`backlog_source_uuids`, a UTC source cutoff, and the two
+`previously_delivered_report_ids`. Blank/nonpositive Quantity and the protected
+uncertain UUID are excluded. Report/task schema and assigned SSCCs must agree;
+each pallet retains its existing assigned Fito extension-3 SSCC, without allocating
+another number. S3 reads use HEAD ETag + conditional GET.
+
+The configuration must also contain `max_environment_file`, `ledger_path`,
+`png_root`, `poller_ledger_path`, `history_start_ms`, `chat_id` and `bot_user_id`.
+Recipient identity is fixed to the human-approved MAX chat `-72448994566325` and
+bot `259171708`, with `/me` verification. The existing MAX environment provides
+the token and certificate bundle; secrets are never put in broker payloads.
+
+Initialize `DeliveryLedger` explicitly before starting delivery. Preserve prior
+ledger and PNG files during release and rollback. Previously sent reports require
+exact history GET confirmation and never issue another message POST. Ambiguous
+POSTs require GET reconciliation, never clearing or resetting the ledger.
+
+Install `requirements-pallet-labels.txt` in the released VPS environment. Add the
+configuration path to the Celery and discovery-service environment, then deploy
+full main and warm-restart only after active work is complete. Start discovery
+after verifying the new Celery task is registered. Rollback stops discovery first,
+keeps durable ledgers, and restores the previous complete release and settings.
+No printer or hot-folder route is invoked by this pipeline.
