@@ -45,6 +45,18 @@ and `https://<94-tailscale-address>:9443/v1/allocate`; `XTREK_SSCC_CA`,
 `XTREK_SSCC_CLIENT_CERT`, and `XTREK_SSCC_CLIENT_KEY` point to its trust and
 client identity files.
 
+The repository includes `deploy/systemd/xtrek-sscc-local.service`. Install the
+unit and run `systemctl daemon-reload` after the complete source release is
+present. The unit has path guards for both the root-owned environment file and
+the initialized database, and runs as the `xtrek` service account. Do not
+enable or start it until the release checks below pass.
+
+The repository includes `deploy/systemd/xtrek-sscc-local.service`. Install the
+unit and run `systemctl daemon-reload` after the complete source release is
+present. The unit has path guards for both the root-owned environment file and
+the initialized database, and runs as the `xtrek` service account. Do not
+enable or start it until the release checks below pass.
+
 Before activation, verify the certificate identity from each intended worker,
 the source and effective systemd unit, service binding, database backup and
 restore procedure, the Cloud production deployment and its 409 response for

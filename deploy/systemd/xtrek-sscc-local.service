@@ -1,0 +1,34 @@
+[Unit]
+Description=xTrek local SSCC allocator (mTLS)
+Documentation=file:/srv/xtrek/current/docs/local-sscc-allocator.md
+Wants=network-online.target
+After=network-online.target tailscaled.service
+Requires=tailscaled.service
+ConditionPathExists=/etc/xtrek/sscc-service.env
+ConditionPathExists=/var/lib/xtrek-sscc/ledger.sqlite3
+
+[Service]
+Type=simple
+User=xtrek
+Group=xtrek
+EnvironmentFile=/etc/xtrek/sscc-service.env
+WorkingDirectory=/srv/xtrek/current
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.sscc_service
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/xtrek-sscc
+RestrictAddressFamilies=AF_INET AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
