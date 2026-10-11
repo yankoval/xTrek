@@ -73,6 +73,7 @@ def test_token_challenge_is_literal_attached_data(native, data):
 
 @pytest.mark.parametrize('subject', [
     'CN="Company, INNLE=0000000000", INNLE=7733154124, INN=123456789012',
+    'ИНН ЮЛ=7733154124, ИНН=123456789012',
     'OID.1.2.643.100.4="7733154124", O="Company ""quoted"""',
     '1.2.643.100.4=7733154124+CN=Company',
 ])
@@ -92,6 +93,7 @@ def test_auth_requires_corporate_identity_and_valid_chain(native, subject):
     'CN="Company, INNLE=7733154124"',
     'CN=Company\\, INNLE=7733154124',
     'INNLE=7733154124, INNLE=7733154124',
+    'ИНН ЮЛ=7733154124, INNLE=7733154124',
     'INNLE="7733154124',
 ])
 def test_wrong_or_ambiguous_certificate_identity_prevents_signing(native, subject):

@@ -112,7 +112,7 @@ def _certificate_inn(subject, inn):
     if quoted or escaped:
         return False
     fields.append("".join(field))
-    aliases = ({"INNLE", "ИННЮЛ", "1.2.643.100.4", "OID.1.2.643.100.4"}
+    aliases = ({"INNLE", "ИННЮЛ", "ИНН ЮЛ", "1.2.643.100.4", "OID.1.2.643.100.4"}
                if len(inn) == 10 else
                {"INN", "ИНН", "1.2.643.3.131.1.1", "OID.1.2.643.3.131.1.1"})
     values = []
