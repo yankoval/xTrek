@@ -1,0 +1,2 @@
+# Optional local generator; install explicitly when activating the route.
+prnsrv @ git+https://github.com/yankoval/prnsrv.git@698600cd571f5f9adf8b21e86f6582e210d9b3ce

@@ -115,6 +115,25 @@ def test_process_s3_event_routes_equipment_report_through_celery(monkeypatch):
     mock_logic.assert_called_once_with("internal-bucket/equipment-reports/T-UNIT.json")
 
 
+def test_local_prnsrv_function_is_a_configured_source_event_fanout(monkeypatch, capsys):
+    tasks = import_tasks(monkeypatch)
+    tasks.config['prnsrv_local_generator_enabled'] = True
+    process_generator = MagicMock(return_value={'uuid': '11111111-1111-4111-8111-111111111111',
+                                                'result': 'GENERATED'})
+    monkeypatch.setitem(sys.modules, 'xtrek.prnsrv_local_runtime',
+                        types.SimpleNamespace(process_local_prnsrv_s3_event=process_generator))
+    order = MagicMock(return_value='Order created')
+    monkeypatch.setattr(tasks, 'logic_create_order', order)
+    result = tasks.process_s3_event.apply(args=[{
+        'bucket': 'input-bucket',
+        'key': 'Задания/11111111-1111-4111-8111-111111111111.json',
+    }])
+    assert result.successful()
+    process_generator.assert_called_once()
+    order.assert_called_once_with('input-bucket/Задания/11111111-1111-4111-8111-111111111111.json')
+    assert 'local PRNSRV: GENERATED' in capsys.readouterr().out
+
+
 def test_unit_equipment_report_creates_utilisation_and_skips_virtual_tasks(monkeypatch):
     tasks = import_tasks(monkeypatch)
     monkeypatch.setattr(tasks, "check_aggregation_reports", MagicMock(return_value={"report": None}))

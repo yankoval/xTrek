@@ -993,7 +993,18 @@ def process_s3_event(self, data):
     try:
         # Условие №1: Создание заказа
         if bucket == INPUT_BUCKET and key.startswith("Задания/"):
+            prnsrv_result = None
+            if config.get('prnsrv_local_generator_enabled') is True:
+                from xtrek.prnsrv_local_runtime import process_local_prnsrv_s3_event
+                prnsrv_result = process_local_prnsrv_s3_event(
+                    bucket=bucket,
+                    key=key,
+                    runtime_config=config,
+                    event_id=str(getattr(getattr(self, 'request', None), 'id', '') or ''),
+                )
             result = logic_create_order(full_key)
+            if prnsrv_result is not None:
+                result = f"{result}; local PRNSRV: {prnsrv_result.get('result', prnsrv_result.get('state'))}"
             print(f"[OK] {result}")
 
         # Условие №2: Подписание эмиссии
