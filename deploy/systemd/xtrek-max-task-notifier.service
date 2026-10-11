@@ -1,0 +1,32 @@
+[Unit]
+Description=xTrek local equipment-task MAX notifier
+After=network-online.target celery.service
+Wants=network-online.target
+Requires=celery.service
+ConditionPathExists=/etc/xtrek/local-s3-mode.env
+
+[Service]
+Type=simple
+User=xtrek
+Group=xtrek
+EnvironmentFile=/etc/xtrek/worker.env
+EnvironmentFile=/etc/xtrek/local-s3-mode.env
+WorkingDirectory=/srv/xtrek/current
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.task_notifier
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/xtrek/task-notifier
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
