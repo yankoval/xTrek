@@ -15,6 +15,7 @@ YC_METADATA_TOKEN_URL = (
 )
 YC_FUNCTION_HOST = "functions.yandexcloud.net"
 YC_IAM_AUTH_MODE = "yandex_iam"
+MTLS_AUTH_MODE = "mtls"
 _IAM_TOKEN_REFRESH_MARGIN_SECONDS = 60
 _iam_token_cache = {"access_token": None, "expires_at": 0.0}
 
@@ -70,6 +71,13 @@ def _get_yandex_iam_token(force_refresh=False):
 def _get_sscc_request_headers(function_url, auth_mode, force_refresh=False):
     if auth_mode in (None, "", "none"):
         return None
+    if auth_mode == MTLS_AUTH_MODE:
+        if (urlparse(function_url).scheme != 'https'
+                or not os.environ.get('XTREK_SSCC_CA')
+                or not os.environ.get('XTREK_SSCC_CLIENT_CERT')
+                or not os.environ.get('XTREK_SSCC_CLIENT_KEY')):
+            raise ValueError('mTLS SSCC requires HTTPS and client certificate settings')
+        return {}
     if auth_mode != YC_IAM_AUTH_MODE:
         raise ValueError(f"Unsupported SSCC auth mode: {auth_mode}")
 
@@ -97,6 +105,7 @@ def get_sscc_from_service(
     count,
     extension=None,
     auth_mode=None,
+    request_id=None,
 ):
     """Запрашивает SSCC коды у внешнего сервиса с замером времени отклика."""
     count = int(count)
@@ -104,15 +113,25 @@ def get_sscc_from_service(
     payload = {"prefix": prefix, "count": count}
     if extension is not None:
         payload["extension"] = extension
+    if request_id is not None:
+        payload['request_id'] = str(request_id)
 
     start_time = time.perf_counter()
     try:
         headers = _get_sscc_request_headers(function_url, auth_mode)
+        tls_options = {}
+        if auth_mode == MTLS_AUTH_MODE:
+            tls_options = {
+                'verify': os.environ['XTREK_SSCC_CA'],
+                'cert': (os.environ['XTREK_SSCC_CLIENT_CERT'],
+                         os.environ['XTREK_SSCC_CLIENT_KEY']),
+            }
         response = requests.post(
             function_url,
             json=payload,
             headers=headers,
             timeout=15,
+            **tls_options,
         )
         if auth_mode == YC_IAM_AUTH_MODE and response.status_code == 401:
             _clear_iam_token_cache()
@@ -126,6 +145,7 @@ def get_sscc_from_service(
                 json=payload,
                 headers=headers,
                 timeout=15,
+                **tls_options,
             )
         response.raise_for_status()
 

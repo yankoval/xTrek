@@ -75,7 +75,7 @@ from .aggregate_operation_reports import (
 
 from .operation_state import (guarded, before_external_request,
                               remember_external_result, publish_once, publish_utilisation_status, ReconciliationRequired,
-                              OperationBusy, OperationConflict)
+                              OperationBusy, OperationConflict, stable_request_id)
 
 def _publish_json_result(storage, temporary, destination, initial_tags=None):
     if load_config('suz_worker_config').get('operation_state_path'):
@@ -3711,6 +3711,8 @@ def _create_pallet_assignment(prod_data, config):
     sscc_request_kwargs = {}
     if config.get('sscc_auth_mode'):
         sscc_request_kwargs['auth_mode'] = config['sscc_auth_mode']
+    if config.get('sscc_auth_mode') == 'mtls':
+        sscc_request_kwargs['request_id'] = stable_request_id()
     before_external_request()
     raw_codes = get_sscc_from_service(
         sscc_service_url,

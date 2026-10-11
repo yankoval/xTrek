@@ -167,3 +167,22 @@ def test_metadata_failure_does_not_send_unauthenticated_sscc_request(post, get):
     get.side_effect = requests.Timeout('metadata timeout')
     assert SSCC_Utils.get_sscc_from_service(FUNCTION_URL, '460705179', 1, auth_mode='yandex_iam') == []
     post.assert_not_called()
+
+
+@patch('xtrek.SSCC_Utils.requests.post')
+def test_mtls_uses_verified_transport_and_stable_request_id(post, monkeypatch):
+    post.return_value = _response(payload={'ssccs': ['046070517921585754']})
+    monkeypatch.setenv('XTREK_SSCC_CA', '/etc/xtrek/sscc-ca.pem')
+    monkeypatch.setenv('XTREK_SSCC_CLIENT_CERT', '/etc/xtrek/sscc-client.pem')
+    monkeypatch.setenv('XTREK_SSCC_CLIENT_KEY', '/etc/xtrek/sscc-client-key.pem')
+    result = SSCC_Utils.get_sscc_from_service(
+        'https://100.75.120.77:9443/v1/allocate', '460705179', 1, '3',
+        auth_mode='mtls', request_id='stable-operation-fingerprint',
+    )
+    assert result == ['046070517921585754']
+    _, kwargs = post.call_args
+    assert kwargs['json']['request_id'] == 'stable-operation-fingerprint'
+    assert kwargs['verify'] == '/etc/xtrek/sscc-ca.pem'
+    assert kwargs['cert'] == (
+        '/etc/xtrek/sscc-client.pem', '/etc/xtrek/sscc-client-key.pem')
+    assert 'Authorization' not in kwargs['headers']
