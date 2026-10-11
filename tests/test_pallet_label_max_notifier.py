@@ -220,3 +220,14 @@ def test_history_checkpoint_resumes_and_stops_only_at_real_end(tmp_path):
     assert not first['complete'] and len(first['messages'])==100
     second=scan_history_batch(Pager(),path,page_budget=1)
     assert second['complete'] and len(second['messages'])==101 and second['pages']==2
+
+
+def test_explicit_approved_bounded_history_accepts_page_limit(tmp_path):
+    class Pages(FakeSession):
+        def get(self,url,params=None,**kw):
+            if url.endswith('/me'):return Response(value={'user_id':BOT})
+            stamp=10000 if 'from' not in params else params['from']
+            return Response(value={'messages':[{'timestamp':stamp-i}for i in range(100)]})
+    notifier,ledger=make_notifier(tmp_path,Pages())
+    notifier.history_start_ms=0;notifier.max_history_pages=2;notifier.allow_truncated_history=True
+    assert len(notifier._history())==200

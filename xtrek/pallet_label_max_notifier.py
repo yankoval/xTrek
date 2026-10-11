@@ -128,7 +128,7 @@ class DeliveryLedger:
 class MaxPalletLabelNotifier:
     def __init__(self, *, token: str, chat_id: str, expected_bot_user_id: str,
                  ledger: DeliveryLedger, session: Any, history_start_ms: int,
-                 sleep=time.sleep, history_seed=None, max_history_pages: int = 100):
+                 sleep=time.sleep, history_seed=None, max_history_pages: int = 100, allow_truncated_history: bool = False):
         self.token = token
         self.chat_id = str(chat_id)
         self.expected_bot_user_id = str(expected_bot_user_id)
@@ -138,6 +138,7 @@ class MaxPalletLabelNotifier:
         self.sleep = sleep
         self.history_seed = list(history_seed or [])
         self.max_history_pages = int(max_history_pages)
+        self.allow_truncated_history = allow_truncated_history is True
         if not 1 <= self.max_history_pages <= 10000:
             raise ValueError("Invalid MAX history page limit")
 
@@ -167,6 +168,8 @@ class MaxPalletLabelNotifier:
             if not stamps or min(stamps) == cursor:
                 raise HistoryIncomplete('MAX history pagination cursor did not advance')
             cursor = min(stamps)
+        if self.allow_truncated_history:
+            return messages
         raise HistoryIncomplete('MAX history page limit exceeded; delivery is held')
 
     @staticmethod

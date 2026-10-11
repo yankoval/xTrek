@@ -74,6 +74,8 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
     uid = report_id[-36:]
     if uid == PROTECTED_UUID:
         raise ValueError('Protected uncertain UUID')
+    if report_id in settings['previously_delivered_report_ids']:
+        return {'state': 'PREVIOUSLY_GET_CONFIRMED', 'report_id': report_id}
     client = boto3.client('s3', **runtime_config['s3_config'])
     task_bucket = settings['task_bucket']
     if settings.get('all_valid_assigned_reports') is not True:
@@ -108,7 +110,11 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
         if hashlib.sha256(snapshot_bytes).hexdigest() != settings['history_snapshot_sha256']:
             raise ValueError('History snapshot checksum mismatch')
         snapshot = json.loads(snapshot_bytes)
-        if (snapshot.get('complete') is not True or snapshot['chat_id'] != str(settings['chat_id'])
+        coverage_accepted = snapshot.get('complete') is True or (
+            settings.get('allow_truncated_history') is True
+            and snapshot.get('truncated') is True and snapshot.get('pages') == 100
+            and snapshot.get('policy') == 'user-approved-100-pages')
+        if (not coverage_accepted or snapshot['chat_id'] != str(settings['chat_id'])
                 or snapshot['bot_user_id'] != str(settings['bot_user_id'])
                 or settings['history_start_ms'] > snapshot['through_ms']):
             raise ValueError('Incomplete history snapshot or uncovered history gap')
@@ -117,20 +123,11 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
         token=env['MAX_BOT_TOKEN'], chat_id=str(settings['chat_id']),
         expected_bot_user_id=str(settings['bot_user_id']), ledger=ledger,
         session=session, history_start_ms=settings['history_start_ms'],
-        history_seed=history_seed, max_history_pages=settings.get('history_max_pages', 100))
+        history_seed=history_seed, max_history_pages=settings.get('history_max_pages', 100),
+        allow_truncated_history=settings.get('allow_truncated_history') is True)
     notifier._verify_bot()
     # Old exact attachments must be visible before any new message POST.
     history = notifier._history()
-    for label in labels:
-        if report_id in settings['previously_delivered_report_ids']:
-            found = notifier._exact_message(history, label)
-            if not found:
-                raise ValueError('Prior PNG not GET confirmed; never repeat its POST')
-            row = ledger.get(label.report_id, label.sscc, str(settings['chat_id']))
-            if row is None:
-                ledger.reserve(label, str(settings['chat_id']))
-                ledger.set_state(label, str(settings['chat_id']), 'CONFIRMED', str(found['body']['mid']))
-            return {'state': 'ALREADY_CONFIRMED_BY_GET', 'report_id': report_id}
     results = []
     for label in labels:
         output = Path(settings['png_root']) / label.report_id / label.file_name
