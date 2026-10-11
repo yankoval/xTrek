@@ -102,10 +102,22 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
     session = requests.Session()
     session.verify = env['MAX_CA_FILE']
     ledger = DeliveryLedger(settings['ledger_path'])
+    history_seed = []
+    if settings.get('history_snapshot_path'):
+        snapshot_bytes = Path(settings['history_snapshot_path']).read_bytes()
+        if hashlib.sha256(snapshot_bytes).hexdigest() != settings['history_snapshot_sha256']:
+            raise ValueError('History snapshot checksum mismatch')
+        snapshot = json.loads(snapshot_bytes)
+        if (snapshot.get('complete') is not True or snapshot['chat_id'] != str(settings['chat_id'])
+                or snapshot['bot_user_id'] != str(settings['bot_user_id'])
+                or settings['history_start_ms'] > snapshot['through_ms']):
+            raise ValueError('Incomplete history snapshot or uncovered history gap')
+        history_seed = snapshot['messages']
     notifier = MaxPalletLabelNotifier(
         token=env['MAX_BOT_TOKEN'], chat_id=str(settings['chat_id']),
         expected_bot_user_id=str(settings['bot_user_id']), ledger=ledger,
-        session=session, history_start_ms=settings['history_start_ms'])
+        session=session, history_start_ms=settings['history_start_ms'],
+        history_seed=history_seed, max_history_pages=settings.get('history_max_pages', 100))
     notifier._verify_bot()
     # Old exact attachments must be visible before any new message POST.
     history = notifier._history()

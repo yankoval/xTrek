@@ -185,3 +185,38 @@ def test_pagination_limit_fails_closed_before_any_post(tmp_path):
     with pytest.raises(HistoryIncomplete):
         notifier.deliver(make_item())
     assert session.posts == []
+
+
+def test_seeded_exact_old_attachment_prevents_new_post(tmp_path):
+    session=FakeSession()
+    notifier,ledger=make_notifier(tmp_path,session)
+    notifier.history_seed=[{'timestamp':1,'sender':{'user_id':BOT},'recipient':{'chat_id':int(CHAT)},
+       'body':{'mid':'old-seed','text':REPORT+' '+SSCC+' '+FILENAME,'attachments':[{'type':'file','payload':{'name':FILENAME}}]}}]
+    assert notifier.deliver(make_item())['state']=='ALREADY_CONFIRMED_BY_GET'
+    assert not session.posts
+
+
+def test_prior_unnamed_attachment_is_held(tmp_path):
+    session=FakeSession(history=[{'timestamp':NOW_MS,'sender':{'user_id':BOT},'recipient':{'chat_id':int(CHAT)},
+        'body':{'mid':'unknown','text':REPORT+' '+SSCC,'attachments':[{'type':'image','payload':{}}]}}])
+    notifier,ledger=make_notifier(tmp_path,session)
+    with pytest.raises(DeliveryUncertain,match='filename proof'):
+        notifier.deliver(make_item())
+    assert not session.posts
+    assert ledger.get(REPORT,SSCC,CHAT)['state']=='POST_UNCERTAIN'
+
+
+def test_history_checkpoint_resumes_and_stops_only_at_real_end(tmp_path):
+    from xtrek.max_pallet_history import scan_history_batch
+    class Pager:
+        chat_id=CHAT;expected_bot_user_id=BOT
+        def _verify_bot(self):pass
+        def _get(self,path,params):
+            if 'from' not in params:return {'messages':[{'timestamp':1000-i}for i in range(100)]}
+            assert params['from']==900
+            return {'messages':[{'timestamp':899}]}
+    path=tmp_path/'history.json'
+    first=scan_history_batch(Pager(),path,page_budget=1)
+    assert not first['complete'] and len(first['messages'])==100
+    second=scan_history_batch(Pager(),path,page_budget=1)
+    assert second['complete'] and len(second['messages'])==101 and second['pages']==2

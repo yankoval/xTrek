@@ -43,3 +43,12 @@ every valid report/task join in `backlog_report_ids`, then set
 and preserves existing pallet assignments; it never creates equipment or print
 jobs from blank Quantity sources. Future sources keep the explicit cutoff/positive
 Quantity guard. Invalid joins and uncertain POSTs remain held.
+
+For a large available MAX history, `scan_history_batch` saves a durable VPS-only
+checkpoint after every page and resumes in bounded batches until the server's
+actual end. A partial scan cannot authorize a historical missing attachment.
+The completed snapshot is bound to bot/chat, a SHA256 in root-owned config, and
+`through_ms`. Celery merges its old attachment records with fresh overlapping
+GET history (`history_start_ms <= through_ms`), so messages received while the
+snapshot was being built are covered. Filename-ambiguous attachment candidates
+are held for reconciliation. No raw history or historical SSCC export is needed.
