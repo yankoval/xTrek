@@ -78,6 +78,74 @@ class TokenMasterLock:
         directory = Path(config.get('tokens_master_local_lock_dir') or Path.home() / '.cache' / 'xtrek')
         self.local_path = directory / ('issuer-' + digest + '.lock')
 
+    def _suz_state(self, environment, inn, connection_id, oms_id):
+        """Durable POST fence, shared by master/CLI and surviving process death."""
+        from .crpt_auth import TokenIssuanceError
+        scope = [environment, inn, connection_id.lower(), oms_id.lower()]
+        digest = hashlib.sha256(json.dumps(scope).encode()).hexdigest()
+        path = self.path + '.suz-' + digest + '.json'
+        self.assert_owned()
+        try:
+            result = self.storage.read_lock_object(path)
+            if result is None:
+                return path, scope, None, None
+            text, etag = result
+            state = json.loads(text)
+            if (not isinstance(etag, str) or not etag or not isinstance(state, dict)
+                    or state.get('version') != 1 or state.get('scope') != scope
+                    or state.get('state') not in {'attempted', 'published'}
+                    or not isinstance(state.get('auth_uuid'), str)):
+                raise ValueError()
+            return path, scope, state, etag
+        except Exception:
+            raise TokenIssuanceError('SUZ issuance state could not be read', stage='issuance',
+                                     reason='reconciliation_required') from None
+
+    def check_suz(self, environment, inn, connection_id, oms_id):
+        from .crpt_auth import TokenIssuanceError
+        _, _, state, _ = self._suz_state(environment, inn, connection_id, oms_id)
+        if state is not None and state['state'] == 'attempted':
+            raise TokenIssuanceError('Previous SUZ issuance requires reconciliation', stage='issuance',
+                                     reason='reconciliation_required', outcome_unknown=True)
+
+    def begin_suz(self, environment, inn, connection_id, oms_id, auth_uuid):
+        from .crpt_auth import TokenIssuanceError
+        self.check_suz(environment, inn, connection_id, oms_id)
+        path, scope, _, etag = self._suz_state(environment, inn, connection_id, oms_id)
+        state = dict(version=1, scope=scope, state='attempted', auth_uuid=auth_uuid,
+                     attempted_at=time.time())
+        try:
+            written = self.storage.write_lock_object(path, json.dumps(state), etag)
+            if not written:
+                raise ValueError()
+            _, _, actual, actual_etag = self._suz_state(environment, inn, connection_id, oms_id)
+            if actual != state or actual_etag != written:
+                raise ValueError()
+            self.assert_owned()
+        except Exception:
+            raise TokenIssuanceError('SUZ issuance fence could not be confirmed', stage='issuance',
+                                     reason='reconciliation_required') from None
+
+    def complete_suz(self, record):
+        """Release only after the verified token has been published successfully."""
+        from .crpt_auth import TokenIssuanceError
+        path, _, state, etag = self._suz_state(record.environment, record.inn,
+                                              record.connection_id, record.oms_id)
+        if state is None or state['state'] == 'published':
+            return
+        if state['auth_uuid'] != record.auth_uuid:
+            raise TokenIssuanceError('Published SUZ token differs from the fenced attempt',
+                                     stage='issuance', reason='reconciliation_required', outcome_unknown=True)
+        state.update(state='published', published_at=time.time())
+        try:
+            self.assert_owned()
+            if not self.storage.write_lock_object(path, json.dumps(state), etag):
+                raise ValueError()
+            self.assert_owned()
+        except Exception:
+            raise TokenIssuanceError('SUZ publication fence could not be released', stage='issuance',
+                                     reason='reconciliation_required', outcome_unknown=True) from None
+
     def read(self):
         result = self.storage.read_lock_object(self.path)
         if result is None:

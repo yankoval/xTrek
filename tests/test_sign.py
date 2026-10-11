@@ -71,6 +71,56 @@ def test_token_challenge_is_literal_attached_data(native, data):
     assert native.calls[0][3] is False
 
 
+@pytest.mark.parametrize('subject', [
+    'CN="Company, INNLE=0000000000", INNLE=7733154124, INN=123456789012',
+    'ИНН ЮЛ=7733154124, ИНН=123456789012',
+    'OID.1.2.643.100.4="7733154124", O="Company ""quoted"""',
+    '1.2.643.100.4=7733154124+CN=Company',
+])
+def test_auth_requires_corporate_identity_and_valid_chain(native, subject):
+    native.cert.SubjectName = subject
+    native.cert.IsValid.return_value.Result = True
+    sign.sign_token_data('literal YQ==\r\n', THUMB, expected_inn='7733154124')
+    native.cert.IsValid.assert_called_once()
+    assert native.calls[0][3] is False
+    assert base64.b64decode(native.calls[0][0]) == b'literal YQ==\r\n'
+    assert native.calls[0][4].CheckCertificate is True
+
+
+@pytest.mark.parametrize('subject', [
+    'INN=007733154124, CN=Personal',  # personal/padded INN cannot select a company
+    'INNLE=9723161905, CN=Other company',
+    'CN="Company, INNLE=7733154124"',
+    'CN=Company\\, INNLE=7733154124',
+    'INNLE=7733154124, INNLE=7733154124',
+    'ИНН ЮЛ=7733154124, INNLE=7733154124',
+    'INNLE="7733154124',
+])
+def test_wrong_or_ambiguous_certificate_identity_prevents_signing(native, subject):
+    native.cert.SubjectName = subject
+    with pytest.raises(sign.SigningError) as error:
+        sign.sign_token_data('SECRET challenge', THUMB, expected_inn='7733154124')
+    assert error.value.reason == 'certificate_inn_mismatch'
+    assert not native.calls
+    native.cert.IsValid.assert_not_called()
+    native.store.Close.assert_called_once()
+
+
+@pytest.mark.parametrize('failure', [False, RuntimeError('SECRET revoked or CRL unavailable 0x80092013')])
+def test_invalid_or_unavailable_revocation_status_prevents_signing(native, failure):
+    native.cert.SubjectName = 'INNLE=7733154124'
+    if isinstance(failure, Exception):
+        native.cert.IsValid.side_effect = failure
+    else:
+        native.cert.IsValid.return_value.Result = failure
+    with pytest.raises(sign.SigningError) as error:
+        sign.sign_token_data('SECRET challenge', THUMB, expected_inn='7733154124')
+    assert error.value.reason == 'certificate_validation_failed'
+    assert 'SECRET' not in str(error.value)
+    assert not native.calls
+    native.store.Close.assert_called_once()
+
+
 def test_suz_ping_signs_exact_path_detached(native):
     value = "/api/v3/ping?omsId=example&value=%2F+"
     sign.sign_token_data(value, THUMB, detached=True)

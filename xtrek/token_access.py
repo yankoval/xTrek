@@ -159,3 +159,5 @@ class PurposeTokenAccess:
             self._apply_tokens(previous)
             raise
         self.process_tokens()
+        if record.purpose == 'suz' and runtime is not None and runtime.guard is not None:
+            runtime.guard.complete_suz(record)

@@ -146,6 +146,10 @@ def issuer(monkeypatch):
     signing = MagicMock(return_value='c2lnbmF0dXJl')
     monkeypatch.setattr(crpt_auth, 'sign_data', signing)
     monkeypatch.setattr(crpt_auth.time, 'sleep', lambda _: None)
+    # Issuance requires a held master lock; durable fencing is exercised with
+    # the real lock and a conditional store in test_auth_local_signing.
+    monkeypatch.setattr(crpt_auth, 'current_runtime', lambda: SimpleNamespace(
+        guard=MagicMock(), assert_owner=MagicMock()))
     config = {'sign': 's3://test/sign', 'suz_ping_sign': True}
     return session, signing, config
 

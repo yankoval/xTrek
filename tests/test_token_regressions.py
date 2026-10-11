@@ -281,6 +281,62 @@ def test_master_generator_probe_publish_chain(lab, monkeypatch, probe_status):
     assert not lab.storage.locked
 
 
+@pytest.mark.parametrize('failure', ['none', 'post_timeout', 'probe', 'publication', 'publication_lost_response'])
+def test_local_suz_master_chain_fences_until_verified_publication(lab, monkeypatch, failure, caplog):
+    import requests
+    from xtrek import crpt_auth
+    lab.config['tokens_signing'] = {'by_inn': {INN: {'mode': 'local', 'thumbprint': 'A1' * 20}}}
+    lab.storage.data = TokenRegistry([make_record('true_api'), make_record('suz', 10)]).to_dict()
+    session = MagicMock()
+    session.__enter__.return_value = session
+    def reply(body, status=200):
+        response = MagicMock(status_code=status)
+        response.json.return_value = body
+        return response
+    session.request.side_effect = [reply({'uuid': CON, 'data': 'SECRET challenge'}),
+        requests.Timeout('SECRET token') if failure == 'post_timeout' else
+        reply({'token': NEW, 'expireDate': make_record('suz').expireDate}),
+        reply({'omsId': OMS, 'apiVersion': '3', 'omsVersion': '5'}, 401 if failure == 'probe' else 200)]
+    monkeypatch.setattr(crpt_auth.requests, 'Session', lambda: session)
+    backend = MagicMock(return_value='c2ln')
+    monkeypatch.setattr(crpt_auth, 'sign_token_data', backend)
+    monkeypatch.setattr(crpt_auth, 'datetime', Clock)
+    monkeypatch.setattr(token_worker, 'issue_token', crpt_auth.issue_token)
+    if failure == 'publication':
+        lab.storage.fail_upload = True
+    elif failure == 'publication_lost_response':
+        upload = lab.storage.upload
+        def lost_response(local, remote):
+            upload(local, remote)
+            raise OSError('SECRET token in storage response')
+        monkeypatch.setattr(lab.storage, 'upload', lost_response)
+    assert token_worker.TokenRefreshWorker().check_and_refresh() is (failure == 'none')
+    assert backend.call_args_list[0].args == ('SECRET challenge',)
+    assert backend.call_args_list[0].kwargs['detached'] is False
+    assert backend.call_args_list[0].kwargs['expected_inn'] == INN
+    post_count = sum(c.args[0] == 'POST' for c in session.request.call_args_list)
+    assert post_count == 1
+    states = [json.loads(body) for body, _ in lab.storage.objects.values()]
+    assert len(states) == 1
+    assert states[0]['state'] == ('published' if failure == 'none' else 'attempted')
+    assert NEW not in json.dumps(states) and 'SECRET' not in json.dumps(states)
+    if failure != 'none':
+        # Force a due scope even if S3 accepted publication but lost the reply.
+        lab.storage.data = TokenRegistry([make_record('true_api'), make_record('suz', 10)]).to_dict()
+        lab.storage.fail_upload = False
+        assert not token_worker.TokenRefreshWorker().check_and_refresh()
+        assert sum(c.args[0] == 'POST' for c in session.request.call_args_list) == 1
+        assert 'stage=issuance reason=reconciliation_required' in caplog.text
+    else:
+        # Fresh records are used by consumers without another issuance.
+        assert token_worker.TokenRefreshWorker().check_and_refresh()
+        client = tokens.TokenProcessor(org_manager=lab.manager)
+        assert client.get_token_value_for(INN, 'suz', CON, OMS) == NEW
+        assert client.get_token_value_for(INN, 'true_api') == OLD
+    assert 'SECRET' not in caplog.text
+    assert not lab.storage.locked
+
+
 def test_true_api_only_pilot_never_reissues_suz_even_with_large_threshold(lab):
     lab.config.update(tokens_purposes=['true_api'], tokens_refresh_before_expiry_seconds=40000)
     original_suz = make_record('suz', 1)

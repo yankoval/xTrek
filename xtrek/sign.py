@@ -34,11 +34,16 @@ logger = logging.getLogger(__name__)
 class SigningError(RuntimeError):
     """Signing failed; messages exclude key PINs, payloads and native error text."""
 
+    def __init__(self, message, *, reason="signing_failed"):
+        super().__init__(message)
+        self.reason = reason
+
 
 def _native_error(stage, exc):
     codes = sorted(set(re.findall(r"0x[0-9a-fA-F]{8}", str(exc))))
     suffix = " (" + ", ".join(codes) + ")" if codes else ""
-    return SigningError("CAdES " + stage + " failed" + suffix)
+    return SigningError("CAdES " + stage + " failed" + suffix,
+                        reason="certificate_validation_failed" if stage == "certificate validation" else "signing_failed")
 
 
 def _thumbprint(value):
@@ -58,12 +63,12 @@ def _pin_value(pin, pin_file):
             with open(pin_file, "r", encoding="utf-8", newline="") as stream:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
-                    raise SigningError("PIN file must be a regular file accessible only to its owner")
+                    raise SigningError("PIN file must be a regular file accessible only to its owner", reason="pin_unavailable")
                 pin = stream.read(4097)
         except OSError:
-            raise SigningError("Cannot read PIN file") from None
+            raise SigningError("Cannot read PIN file", reason="pin_unavailable") from None
         except UnicodeError:
-            raise SigningError("PIN file must contain UTF-8 text") from None
+            raise SigningError("PIN file must contain UTF-8 text", reason="pin_unavailable") from None
         # Permit a text file's terminal newline; preserve spaces in the PIN.
         pin = pin.removesuffix("\n").removesuffix("\r")
     if pin is None:
@@ -75,15 +80,51 @@ def _pin_value(pin, pin_file):
 
 def _load_pycades():
     if sys.platform != "linux":
-        raise SigningError("Signing is supported only on Linux")
+        raise SigningError("Signing is supported only on Linux", reason="native_unavailable")
     try:
         return importlib.import_module("pycades")
     except (ImportError, OSError):
-        raise SigningError("Install CryptoPro CSP, CAdES and official pycades for this Python") from None
+        raise SigningError("Install CryptoPro CSP, CAdES and official pycades for this Python", reason="native_unavailable") from None
+
+
+def _certificate_inn(subject, inn):
+    """Read a complete DN attribute, never a substring in CN/O or a personal INN.
+
+    CryptoPro renders quoted values with doubled quotes; escaped separators
+    and multi-valued RDNs are also supported. Ambiguous DNs fail closed.
+    """
+    if not isinstance(subject, str):
+        return False
+    fields, field, quoted, escaped = [], [], False, False
+    for char in subject:
+        if escaped:
+            field.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char in ",;+\r\n" and not quoted:
+            fields.append("".join(field))
+            field = []
+        else:
+            field.append(char)
+    if quoted or escaped:
+        return False
+    fields.append("".join(field))
+    aliases = ({"INNLE", "ИННЮЛ", "ИНН ЮЛ", "1.2.643.100.4", "OID.1.2.643.100.4"}
+               if len(inn) == 10 else
+               {"INN", "ИНН", "1.2.643.3.131.1.1", "OID.1.2.643.3.131.1.1"})
+    values = []
+    for field in fields:
+        key, sep, value = field.partition("=")
+        if sep and key.strip().upper() in aliases:
+            values.append(value.strip())
+    return values == [inn]
 
 
 def sign_bytes(data, thumbprint, *, detached=True, pin=None, pin_file=None,
-               store_location="current_user"):
+               store_location="current_user", expected_inn=None):
     """Sign and verify exact bytes; return CAdES-BES as whitespace-free Base64.
 
     Select exactly one certificate by SHA-1 fingerprint in the My store.
@@ -91,6 +132,8 @@ def sign_bytes(data, thumbprint, *, detached=True, pin=None, pin_file=None,
     Certificate validation is enabled. Supply a PIN or a private UTF-8 PIN file
     for a protected key; omitted PIN means an empty PIN, never a CLI prompt.
     Native objects are created per call and calls are serialized within a process.
+    ``expected_inn`` additionally requires an exact certificate subject INN and
+    a successful native chain/CRL check before signing authentication data.
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes; encode text explicitly")
@@ -99,6 +142,9 @@ def sign_bytes(data, thumbprint, *, detached=True, pin=None, pin_file=None,
     thumbprint = _thumbprint(thumbprint)
     if store_location not in ("current_user", "local_machine"):
         raise ValueError("store_location must be current_user or local_machine")
+    if expected_inn is not None and (not isinstance(expected_inn, str)
+                                    or not re.fullmatch(r"[0-9]{10}|[0-9]{12}", expected_inn)):
+        raise ValueError("expected_inn must contain 10 or 12 digits")
     module = _load_pycades()
     key_pin = _pin_value(pin, pin_file)
     content = base64.b64encode(data).decode("ascii")
@@ -115,10 +161,21 @@ def sign_bytes(data, thumbprint, *, detached=True, pin=None, pin_file=None,
             stage = "select certificate"
             matches = store.Certificates.Find(module.CAPICOM_CERTIFICATE_FIND_SHA1_HASH, thumbprint)
             if matches.Count != 1:
-                raise SigningError("Expected exactly one certificate matching thumbprint")
+                raise SigningError("Expected exactly one certificate matching thumbprint", reason="certificate_not_found")
             certificate = matches.Item(1)
             if not certificate.HasPrivateKey():
-                raise SigningError("Selected certificate has no private key")
+                raise SigningError("Selected certificate has no private key", reason="private_key_missing")
+            if expected_inn is not None:
+                stage = "certificate identity"
+                if not _certificate_inn(certificate.SubjectName, expected_inn):
+                    raise SigningError("Certificate INN does not match the requested organization",
+                                       reason="certificate_inn_mismatch")
+                stage = "certificate validation"
+                # Native chain validation includes CRL status. Do not ignore
+                # unavailable/expired CRLs or disable CheckCertificate below.
+                if certificate.IsValid().Result != True:
+                    raise SigningError("Certificate chain or revocation status could not be validated",
+                                       reason="certificate_validation_failed")
             signer = module.Signer()
             signer.Certificate = certificate
             signer.CheckCertificate = True
