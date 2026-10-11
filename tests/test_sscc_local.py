@@ -1,6 +1,8 @@
 import concurrent.futures
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -130,7 +132,7 @@ def test_failure_before_commit_rolls_back_counter_and_response(tmp_path):
     db.close()
 
 
-def test_committed_response_replays_after_simulated_lost_reply_and_backup(tmp_path):
+def test_committed_request_replays_and_backup_preserves_counter(tmp_path):
     path = os.path.join(tmp_path, 'ledger.sqlite3')
     ledger = Ledger.initialize(path, '460705179')
     expected = ledger.allocate('response-lost', '460705179', 2, 3)
@@ -146,42 +148,33 @@ def test_committed_response_replays_after_simulated_lost_reply_and_backup(tmp_pa
     assert restored.allocate('after-backup', '460705179', 1, 3)['ssccs'][0] not in expected['ssccs']
 
 
-def test_failure_before_commit_rolls_back_counter_and_response(tmp_path):
+@pytest.mark.parametrize('stage,expected_next', [('before', 2), ('after', 2)])
+def test_process_death_around_commit_recovers_one_allocation(tmp_path, stage, expected_next):
     path = os.path.join(tmp_path, 'ledger.sqlite3')
-    ledger = Ledger.initialize(path, '460705179')
-    connect = ledger._connect
-
-    class FailBeforeCommit:
-        def __init__(self, db):
-            self.db = db
-        def __getattr__(self, name):
-            return getattr(self.db, name)
-        def execute(self, sql, *args):
-            if sql == 'COMMIT':
-                raise OSError('simulated disk failure before commit')
-            return self.db.execute(sql, *args)
-
-    ledger._connect = lambda: FailBeforeCommit(connect())
-    with pytest.raises(OSError, match='disk failure'):
-        ledger.allocate('not-committed', '460705179', 2, 3)
-    ledger._connect = connect
-    db = connect()
-    assert db.execute('SELECT next_serial FROM counters').fetchone()[0] == 0
-    assert db.execute('SELECT COUNT(*) FROM allocations').fetchone()[0] == 0
+    Ledger.initialize(path, '460705179')
+    child_code = r'''import os, sys
+from xtrek.sscc_local import Ledger
+path, stage = sys.argv[1:]
+ledger = Ledger(path, '460705179')
+connect = ledger._connect
+class AbruptExit:
+    def __init__(self, db): self.db = db
+    def __getattr__(self, name): return getattr(self.db, name)
+    def execute(self, sql, *args):
+        if sql == 'COMMIT' and stage == 'before': os._exit(91)
+        result = self.db.execute(sql, *args)
+        if sql == 'COMMIT' and stage == 'after': os._exit(92)
+        return result
+ledger._connect = lambda: AbruptExit(connect())
+ledger.allocate('crash-boundary', '460705179', 2, 3)
+'''
+    child = subprocess.run([sys.executable, '-c', child_code, path, stage],
+                           capture_output=True, timeout=15)
+    assert child.returncode == (91 if stage == 'before' else 92)
+    recovered = Ledger(path, '460705179')
+    replay = recovered.allocate('crash-boundary', '460705179', 2, 3)
+    assert len(replay['ssccs']) == 2
+    db = recovered._connect()
+    assert db.execute('SELECT next_serial FROM counters').fetchone()[0] == expected_next
+    assert db.execute('SELECT COUNT(*) FROM allocations').fetchone()[0] == 1
     db.close()
-
-
-def test_committed_response_replays_after_simulated_lost_reply_and_backup(tmp_path):
-    path = os.path.join(tmp_path, 'ledger.sqlite3')
-    ledger = Ledger.initialize(path, '460705179')
-    expected = ledger.allocate('response-lost', '460705179', 2, 3)
-    assert ledger.allocate('response-lost', '460705179', 2, 3) == expected
-    backup_path = os.path.join(tmp_path, 'backup.sqlite3')
-    source = sqlite3.connect(path)
-    backup = sqlite3.connect(backup_path)
-    source.backup(backup)
-    backup.close()
-    source.close()
-    restored = Ledger(backup_path, '460705179')
-    assert restored.allocate('response-lost', '460705179', 2, 3) == expected
-    assert restored.allocate('after-backup', '460705179', 1, 3)['ssccs'][0] not in expected['ssccs']
