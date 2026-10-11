@@ -177,9 +177,10 @@ service was changed here.
    storage instances and notifier credentials/configuration.
 5. Targeted verification in this checkout: 74 tests passed across
    `test_prnsrv_local.py`, `test_pallet_label_max_notifier.py`,
-   `test_pallet_label_pipeline.py`, and `test_tasks_unit_set_flow.py`.
-   Run the full project regression suite and inspect the release diff and
-   runtime configuration before release.
+   `test_pallet_label_pipeline.py`, and `test_tasks_unit_set_flow.py`. Full
+   project suite: 925 passed, 10 skipped, 14 subtests passed. The release
+   owner must still inspect the release diff and runtime configuration before
+   activation.
 
 ## Current 11 October recovery state
 
