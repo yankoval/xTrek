@@ -36,7 +36,11 @@ write, or print ran while preparing this patch.
 ## Immutable output and state contract
 
 The engine is the pinned `prnsrv` package at
-`698600cd571f5f9adf8b21e86f6582e210d9b3ce` (see `requirements.txt`).
+`698600cd571f5f9adf8b21e86f6582e210d9b3ce` (see `requirements-prnsrv.txt`).
+Install this optional dependency explicitly when activating the generator;
+the disabled route and ordinary xTrek installation do not require access to
+the private engine repository. A release may use a wheel built from this exact
+commit, recording its SHA-256 and provenance alongside the release manifest.
 `PrnsrvFunction` owns lifecycle and persistence:
 
 | Purpose | S3 key |
