@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from xtrek.prnsrv_generator_runtime.storage import ObjectAlreadyExists, ObjectInfo
+from xtrek.prnsrv_generator_runtime.storage import ObjectAlreadyExists, ObjectInfo, S3Storage
 from xtrek.prnsrv_local_allocator import LocalAllocatorError, LocalPrnsrvAllocator
 from xtrek.prnsrv_staging import PrnsrvStagingReceiver, StagingConflict
 
@@ -155,6 +155,23 @@ def test_local_allocator_rejects_cloud_signer_token_and_invalid_response():
         allocator.allocate(job_uuid=UUID, source_hash='b' * 64, count=1)
 
 
+def test_local_allocator_rejects_duplicate_range():
+    code = '346070517900000057'
+    allocator = LocalPrnsrvAllocator(url='https://worker94.local', prefix=PREFIX,
+                                    session=FakeSession({'ssccs': [code, code]}))
+    with pytest.raises(LocalAllocatorError, match='duplicate SSCCs'):
+        allocator.allocate(job_uuid=UUID, source_hash='b' * 64, count=2)
+
+
+def test_s3_checksum_reads_body_instead_of_trusting_metadata():
+    from io import BytesIO
+    client = SimpleNamespace(
+        head_object=lambda **kwargs: {'Metadata': {'sha256': hashlib.sha256(b'expected').hexdigest()}},
+        get_object=lambda **kwargs: {'Body': BytesIO(b'corrupt')},
+    )
+    assert S3Storage(client).actual_sha256(BUCKET, 'printer-tasks/job.csv') == hashlib.sha256(b'corrupt').hexdigest()
+
+
 def make_local_function(monkeypatch, *, history=True, count=2):
     runtime = install_fake_prnsrv(monkeypatch)
     from xtrek.prnsrv_generator_runtime.config import Settings
@@ -189,6 +206,28 @@ def test_existing_prnsrv_function_generates_immutable_outputs_and_local_marker(m
     duplicate = function.process_object(bucket=BUCKET, key=key)
     assert duplicate['duplicate'] is True
     assert len(allocator.calls) == 1
+
+
+def test_generated_marker_requires_matching_local_allocation_request(monkeypatch):
+    function, storage, allocator, key, _ = make_local_function(monkeypatch)
+    function.process_object(bucket=BUCKET, key=key)
+    marker = storage.get_json(BUCKET, f'_prnsrv/done/{UUID}.done')
+    marker['allocation']['request_id'] = 'unrelated-request'
+    storage.objects[(BUCKET, f'_prnsrv/done/{UUID}.done')] = json.dumps(marker).encode()
+    with pytest.raises(Exception, match='not proven local extension-3'):
+        function.process_object(bucket=BUCKET, key=key)
+    assert len(allocator.calls) == 1
+
+
+@pytest.mark.parametrize('inn', ['7733154124', '9718180660', '9723161905'])
+def test_runtime_requires_shared_prefix_for_every_inn(monkeypatch, inn):
+    runtime = install_fake_prnsrv(monkeypatch)
+    monkeypatch.setenv('XTREK_LOCAL_ALLOWED_INNS', inn)
+    monkeypatch.setattr(runtime, '_load_source', lambda *_: {'PasportData': {'Manufacturer_inn': inn}})
+    config = {'prnsrv_local_generator_enabled': True, 's3_config': {}, 'sscc_prefix': PREFIX,
+              'prnsrv_local_allocator_by_inn': {inn: {'prefix': '123456789'}}}
+    with pytest.raises(Exception, match='shared SSCC prefix'):
+        runtime.process_local_prnsrv_s3_event(bucket=BUCKET, key=f'Задания/{UUID}.json', runtime_config=config)
 
 
 def test_local_function_blocks_unreconciled_and_protected_uuid(monkeypatch):

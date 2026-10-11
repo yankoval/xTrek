@@ -40,7 +40,10 @@ class LocalPrnsrvFunction(PrnsrvFunction):
             if existing.get('result') == 'GENERATED':
                 allocation = existing.get('allocation')
                 expected = f'{self.local_prefix}/extension-3'
-                if not isinstance(allocation, Mapping) or allocation.get('namespace') != expected:
+                expected_request = LocalPrnsrvAllocator.request_id(job_uuid, source_hash)
+                if (not isinstance(allocation, Mapping)
+                        or allocation.get('namespace') != expected
+                        or allocation.get('request_id') != expected_request):
                     raise ReconciliationRequired('Existing generated marker is not proven local extension-3')
             return super().process_object(bucket=bucket, key=key, event_id=event_id)
         if not self.history_reconciled(job_uuid, source_hash):
@@ -97,6 +100,9 @@ def process_local_prnsrv_s3_event(*, bucket: str, key: str,
         raise ReconciliationRequired(f'No local extension-3 allocator route for INN {manufacturer_inn}')
     url = str(route.get('url') or '')
     prefix = str(route.get('prefix') or '')
+    shared_prefix = str(runtime_config.get('sscc_prefix') or '')
+    if shared_prefix and prefix != shared_prefix:
+        raise ReconciliationRequired('PRNSRV route must use the shared SSCC prefix for every INN')
     cert = str(route.get('client_cert') or '')
     private_key = str(route.get('client_key') or '')
     if not all((url, prefix, cert, private_key)):

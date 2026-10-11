@@ -94,8 +94,6 @@ class S3Storage:
         info = self.head_optional(bucket, key)
         if info is None:
             return None
-        if info.sha256:
-            return info.sha256
         return sha256_hex(self.get_bytes(bucket, key))
 
     def put_immutable(

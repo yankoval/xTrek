@@ -52,6 +52,12 @@ existing generated marker. Duplicate events reuse the marker. Conflicting
 outputs or old generated markers without local extension-3 proof are held for
 reconciliation.
 
+Checksum verification reads the S3 GET body; uploaded `sha256` metadata is
+not proof of stored bytes. Existing generated markers must contain the
+matching UUID/source-hash allocation request ID as well as the local namespace.
+The allocator rejects duplicate SSCCs. All INN routes use the shared Fito
+prefix `460705179`; a route that differs from runtime `sscc_prefix` is blocked.
+
 The `prnsrv-generator` source contract targets `printer-tasks/` and
 `_prnsrv/done/`; it does not target `solmarkTasks/`, `equipment-tasks/`,
 `equipment-reports/`, or the equipment task's pallet assignment.
@@ -175,19 +181,21 @@ service was changed here.
    notifier)`; it joins and validates report/task payloads, renders pallet PNGs,
    then calls the idempotent sender. The caller supplies the two bucket-specific
    storage instances and notifier credentials/configuration.
-5. Targeted verification in this checkout: 74 tests passed across
+5. Targeted verification in the integrated checkout: 80 tests passed across
    `test_prnsrv_local.py`, `test_pallet_label_max_notifier.py`,
    `test_pallet_label_pipeline.py`, and `test_tasks_unit_set_flow.py`. Full
-   project suite: 925 passed, 10 skipped, 14 subtests passed. The release
+   project suite: 931 passed, 10 skipped, 14 subtests passed. The release
    owner must still inspect the release diff and runtime configuration before
    activation.
 
 ## Current 11 October recovery state
 
 - 65/65 positive-Quantity source tasks have no PRNSRV done marker or CSV/VDF.
-- Existing local extension-3 allocator and complete-main source are on worker94;
-  verified release snapshot lists 56 Fito equipment allocations and a
-  next-serial watermark of 56. This does not mean the PRNSRV allocations are
-  present.
+- Existing local extension-3 allocator and complete-main source are on worker94.
+  The nine remaining GlobalBio equipment tasks were created and their MAX
+  links confirmed by GET on 11 October at 13:05 UTC. All 65 positive-Quantity
+  equipment tasks now exist; their equipment pallet allocations remain
+  separate from the missing PRNSRV CSV/VDF allocations. Read the current
+  allocator watermark before generation; the earlier value of 56 is stale.
 - This patch has not allocated numbers, written S3, delivered to 94 staging,
   or printed. The generation hook remains disabled by default.

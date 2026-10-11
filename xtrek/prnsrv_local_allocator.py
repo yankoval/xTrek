@@ -64,6 +64,8 @@ class LocalPrnsrvAllocator:
                 raise LocalAllocatorError('Local allocator returned a malformed SSCC')
             if not sscc.startswith(expected_start) or sscc[-1] != _check_digit(sscc[:-1]):
                 raise LocalAllocatorError('Local allocator returned a wrong-prefix/invalid SSCC')
+        if len(set(ssccs)) != count:
+            raise LocalAllocatorError('Local allocator returned duplicate SSCCs')
         # PrnsrvFunction consumes these two attributes only; no Cloud allocator
         # client or SUZ identity is imported on this route.
         from types import SimpleNamespace
