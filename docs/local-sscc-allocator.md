@@ -6,6 +6,10 @@ client CA; the certificate subject must also appear in the allowlist. The
 worker client verifies the server CA and presents its certificate. There is no
 HTTP or Yandex IAM fallback when `sscc_auth_mode` is `mtls`.
 
+The Cloud allocator remains configured for extension 0. Extension 3 is selected
+manually in the local worker configuration for this service; do not change the
+Cloud allocator's extension or counter as part of this rollout.
+
 The ledger uses SQLite rollback journaling (`DELETE`) and `synchronous=EXTRA`.
 Counter advancement and the exact response are committed in one immediate
 transaction. Repeating a request ID with identical parameters returns the
@@ -19,8 +23,8 @@ only this ledger's own pre-request marker permits an idempotent local retry.
 
 Install the complete `main` release first. Provision the database directory
 with owner-only permissions and initialize exactly once, after checking that
-the prefix/extension namespace is historically unused and the Cloud allocator
-has a deployed server-side block for extension 3:
+the prefix/extension-3 namespace is historically unused. Confirm the Cloud
+allocator remains configured for extension 0 before enabling the local service:
 
 ```sh
 python -m xtrek.sscc_local --init-ledger /var/lib/xtrek-sscc/ledger.sqlite3 PREFIX
@@ -45,8 +49,14 @@ and `https://<94-tailscale-address>:9443/v1/allocate`; `XTREK_SSCC_CA`,
 `XTREK_SSCC_CLIENT_CERT`, and `XTREK_SSCC_CLIENT_KEY` point to its trust and
 client identity files.
 
+The repository includes `deploy/systemd/xtrek-sscc-local.service`. Install the
+unit and run `systemctl daemon-reload` after the complete source release is
+present. The unit has path guards for both the root-owned environment file and
+the initialized database, and runs as the `xtrek` service account. Do not
+enable or start it until the release checks below pass.
+
 Before activation, verify the certificate identity from each intended worker,
 the source and effective systemd unit, service binding, database backup and
-restore procedure, the Cloud production deployment and its 409 response for
-extension 3. Do not resume historical uncertain operation records or enable a
+restore procedure, and that the Cloud allocator remains configured for
+extension 0. Do not resume historical uncertain operation records or enable a
 second allocator during rollback.
