@@ -4,7 +4,8 @@ import re
 from functools import partial
 from celery import Celery
 from celery.signals import task_postrun, task_prerun, worker_ready
-from urllib.parse import quote
+from kombu import Queue
+from urllib.parse import quote, urlparse
 
 # 1. Импорт вашей бизнес-логики
 from xtrek.config_loader import load_config
@@ -66,10 +67,26 @@ from .operation_state import guarded, OperationConflict, ReconciliationRequired
 ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
 SECRET_KEY = os.environ.get('YMQ_SECRET_KEY')
 QUEUE_URL = os.environ.get('YMQ_QUEUE_URL')
-REAL_QUEUE_NAME = os.environ.get('YMQ_QUEUE_NAME', 'queue_task_create_1C')
+LOCAL_POLLING = os.environ.get('XTREK_LOCAL_S3_POLLING') == '1'
+REAL_QUEUE_NAME = (os.environ.get('XTREK_LOCAL_QUEUE_NAME', 'xtrek_s3_events') if LOCAL_POLLING
+                   else os.environ.get('YMQ_QUEUE_NAME', 'queue_task_create_1C'))
 
-safe_secret = quote(SECRET_KEY, safe='')
-BROKER_URL = f'sqs://{ACCESS_KEY}:{safe_secret}@'
+safe_secret = quote(SECRET_KEY or '', safe='')
+if LOCAL_POLLING:
+    # Temporary single-host mode: persistent messages go to a local RabbitMQ
+    # durable queue. Filesystem and SQLAlchemy transports do not reclaim a
+    # message reliably after a worker dies while handling it.
+    BROKER_URL = os.environ.get('XTREK_LOCAL_BROKER_URL')
+    if not BROKER_URL:
+        raise RuntimeError('XTREK_LOCAL_BROKER_URL must configure a dedicated local RabbitMQ vhost and user')
+    _broker_parsed = urlparse(BROKER_URL)
+    if (_broker_parsed.scheme not in {'amqp', 'amqps'}
+            or _broker_parsed.hostname not in {'localhost', '127.0.0.1', '::1'}
+            or not _broker_parsed.username or _broker_parsed.username == 'guest'
+            or not _broker_parsed.password or not _broker_parsed.path.strip('/')):
+        raise RuntimeError('Local RabbitMQ must use a dedicated credential and non-default vhost on loopback')
+else:
+    BROKER_URL = f'sqs://{ACCESS_KEY}:{safe_secret}@'
 
 app = Celery('tasks', broker=BROKER_URL)
 
@@ -78,12 +95,34 @@ app = Celery('tasks', broker=BROKER_URL)
 def _start_token_snapshot(**kwargs):
     """Каждая Celery-задача должна получить актуальный снимок tokens.json из S3."""
     TokenProcessor.clear_command_snapshots()
+    _record_local_event_state(kwargs.get('task_id'), 'started')
 
 
 @task_postrun.connect
 def _finish_token_snapshot(**kwargs):
     """Не переносим снимок токенов в следующую задачу долгоживущего worker."""
     TokenProcessor.clear_command_snapshots()
+    state = kwargs.get('state')
+    if state == 'SUCCESS':
+        _record_local_event_state(kwargs.get('task_id'), 'succeeded')
+    elif state == 'RETRY':
+        _record_local_event_state(kwargs.get('task_id'), 'retry_scheduled')
+    elif state == 'FAILURE':
+        _record_local_event_state(kwargs.get('task_id'), 'failed')
+
+
+def _record_local_event_state(task_id, state, detail=None):
+    if not LOCAL_POLLING or not task_id:
+        return
+    try:
+        from xtrek.s3_poller import EventLedger
+        ledger = EventLedger(os.environ.get('XTREK_S3_POLL_LEDGER', '/var/lib/xtrek/s3-poller/outbox.sqlite3'))
+        ledger.task_state(task_id, state, detail)
+        ledger.close()
+    except Exception as exc:
+        # RabbitMQ redelivery is authoritative; this ledger is for lifecycle evidence.
+        print(f'Could not record local event state: {type(exc).__name__}')
+
 
 # Загрузка конфигурации
 config = load_config('suz_worker_config')
@@ -132,14 +171,16 @@ eta_task_limit = int(config.get('worker_eta_task_limit', 100))
 if eta_task_limit < 1:
     raise ValueError('worker_eta_task_limit must be positive')
 
+_broker_options = ({'confirm_publish': True} if LOCAL_POLLING else {
+    'region': 'ru-central1',
+    'predefined_queues': {REAL_QUEUE_NAME: {'url': QUEUE_URL}},
+})
+
 app.conf.update(
-    broker_transport_options={
-        'region': 'ru-central1',
-        'predefined_queues': {
-            REAL_QUEUE_NAME: {'url': QUEUE_URL}
-        }
-    },
+    broker_transport_options=_broker_options,
     task_default_queue=REAL_QUEUE_NAME,
+    task_queues=(Queue(REAL_QUEUE_NAME, durable=True),),
+    task_default_delivery_mode='persistent',
     accept_content=['json'],
     task_serializer='json',
     result_serializer='json',

@@ -1,0 +1,32 @@
+[Unit]
+Description=xTrek temporary S3 event poller and durable Celery outbox
+After=network-online.target rabbitmq-server.service celery.service
+Wants=network-online.target
+Requires=rabbitmq-server.service celery.service
+ConditionPathExists=/etc/xtrek/local-s3-mode.env
+
+[Service]
+Type=simple
+User=xtrek
+Group=xtrek
+EnvironmentFile=/etc/xtrek/worker.env
+EnvironmentFile=/etc/xtrek/local-s3-mode.env
+WorkingDirectory=/srv/xtrek/current
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.s3_poller
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/xtrek/s3-poller
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
