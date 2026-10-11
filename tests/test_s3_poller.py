@@ -27,6 +27,20 @@ def test_ledger_recovers_expired_publish_lease(tmp_path):
     ledger.close()
 
 
+def test_terminal_task_failure_does_not_republish_or_mark_event_completed(tmp_path):
+    ledger = EventLedger(str(tmp_path / "outbox.sqlite3"))
+    assert ledger.enqueue("existing-event", "b", "cisInformationChangeReceipts/existing.json")
+    assert ledger.claim()[0] == "existing-event"
+    ledger.published("existing-event")
+    ledger.task_state("existing-event", "failed")
+
+    assert not ledger.enqueue("existing-event", "b", "cisInformationChangeReceipts/existing.json")
+    assert ledger.claim() is None
+    assert ledger.db.execute("SELECT state FROM s3_outbox").fetchone()[0] == "published"
+    assert ledger.db.execute("SELECT state FROM task_attempts").fetchone()[0] == "failed"
+    ledger.close()
+
+
 class FakePaginator:
     def __init__(self, pages):
         self.pages = pages
