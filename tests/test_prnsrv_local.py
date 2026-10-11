@@ -1,215 +1,288 @@
+import hashlib
+import importlib
 import json
-from dataclasses import dataclass
+import sys
+import types
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
-from xtrek.operation_state import OperationConflict, ReconciliationRequired
-from xtrek.prnsrv_local import PrnsrvLocalAdapter
+from xtrek.prnsrv_generator_runtime.storage import ObjectAlreadyExists, ObjectInfo
+from xtrek.prnsrv_local_allocator import LocalAllocatorError, LocalPrnsrvAllocator
+from xtrek.prnsrv_staging import PrnsrvStagingReceiver, StagingConflict
 
 
 UUID = '8d7a2808-a64f-4a23-84eb-0404f31a03f4'
-SOURCE_KEY = f'Задания/{UUID}.json'
-ROOT = 's3://bucket'
-STATE_ROOT = 's3://bucket/_operation_state'
-SOURCE = {'Quantity': '2', 'Article': 'fixture', 'PasportData': {'Format': '32x32'}}
+BUCKET = 'fixture-bucket'
+PREFIX = '460705179'
 
 
-class FakeStorage:
+def check_digit(payload):
+    return str((-sum(int(d) * (3 if i % 2 == 0 else 1)
+                     for i, d in enumerate(reversed(payload)))) % 10)
+
+
+class FakePrnsrvS3:
     def __init__(self):
         self.objects = {}
-        self.states = {}
 
-    def exists(self, path):
-        return path in self.objects or path in self.states
+    def get_bytes(self, bucket, key):
+        return self.objects[(bucket, key)]
 
-    def read_text(self, path):
-        if path in self.objects:
-            return self.objects[path].decode('utf-8')
-        return self.states[path][0]
+    def get_json(self, bucket, key):
+        return json.loads(self.get_bytes(bucket, key))
 
-    def read_bytes(self, path):
-        return self.objects[path]
-
-    def upload_once(self, local_path, remote_path):
-        from pathlib import Path
-        body = Path(local_path).read_bytes()
-        prior = self.objects.get(remote_path)
-        if prior is not None and prior != body:
-            raise OperationConflict(f'Existing immutable file differs: {remote_path}')
-        self.objects[remote_path] = body
-
-    def read_lock_object(self, path):
-        return self.states.get(path)
-
-    def write_lock_object(self, path, content, etag, *, tags=None):
-        old = self.states.get(path)
-        old_etag = old[1] if old else None
-        if old_etag != etag:
+    def get_json_optional(self, bucket, key):
+        if (bucket, key) not in self.objects:
             return None
-        new_etag = str(int(old_etag or '0') + 1)
-        self.states[path] = (content, new_etag)
-        self.objects[path] = content.encode('utf-8')
-        return new_etag
+        return self.get_json(bucket, key)
+
+    def head_optional(self, bucket, key):
+        value = self.objects.get((bucket, key))
+        if value is None:
+            return None
+        return ObjectInfo(key, None, hashlib.sha256(value).hexdigest(), len(value), datetime.now(timezone.utc))
+
+    def actual_sha256(self, bucket, key):
+        info = self.head_optional(bucket, key)
+        return info.sha256 if info else None
+
+    def put_immutable(self, bucket, key, body, *, content_type, extra_metadata=None):
+        old = self.objects.get((bucket, key))
+        if old is not None and old != body:
+            raise RuntimeError('immutable conflict')
+        self.objects[(bucket, key)] = bytes(body)
+        return ObjectInfo(key, 'fixture-etag', hashlib.sha256(body).hexdigest(), len(body), None)
+
+    def put_create_only(self, bucket, key, body, *, content_type, metadata=None):
+        if (bucket, key) in self.objects:
+            raise ObjectAlreadyExists(key)
+        self.objects[(bucket, key)] = bytes(body)
+        return ObjectInfo(key, 'fixture-etag', hashlib.sha256(body).hexdigest(), len(body), None)
 
 
-@dataclass
-class CountDecision:
-    should_print: bool
-    count: int = 0
-    reason_code: str = 'COUNT_EMPTY'
-
-
-class FakeEngine:
-    def __init__(self, should_print=True):
-        self.should_print = should_print
-        self.build_calls = 0
-        self.fail_build_once = False
-
-    def classify_count(self, source):
-        count = int(source.get('count', source.get('Quantity', 0)) or 0)
-        return CountDecision(self.should_print and count > 0, count, 'COUNT_EMPTY')
-
-    def resolve_route(self, source):
-        return '7733154124'
-
-    def build_artifacts(self, source, ssccs, source_key, route):
-        self.build_calls += 1
-        if self.fail_build_once:
-            self.fail_build_once = False
-            raise RuntimeError('simulated worker crash after allocation receipt')
-        csv_body = ('C1\n' + ''.join(f'00{sscc}\n' for sscc in ssccs)).encode()
-        return csv_body, f'<VDF>{source_key}:{route}</VDF>'.encode()
-
-
-class IdempotentLocalAllocator:
+class FakeAllocator:
     def __init__(self):
-        self.requests = {}
         self.calls = []
-        self.drop_first_response = False
 
-    def __call__(self, *, request_id, prefix, count, extension):
-        self.calls.append((request_id, prefix, count, extension))
-        assert extension == 3
-        assert prefix == '460705179'
-        if request_id not in self.requests:
-            self.requests[request_id] = [f'3460705179{i:07d}{(i * 3) % 10}' for i in range(count)]
-        if self.drop_first_response:
-            self.drop_first_response = False
-            raise TimeoutError('allocator committed but response was lost')
-        return self.requests[request_id]
+    def allocate(self, **kwargs):
+        self.calls.append(kwargs)
+        codes = []
+        for serial in range(kwargs['count']):
+            payload = '3' + PREFIX + f'{serial:07d}'
+            codes.append(payload + check_digit(payload))
+        return SimpleNamespace(ssccs=tuple(codes), allocation_id='fixture-allocation')
 
 
-def make_adapter(*, storage=None, engine=None, allocator=None, prefix='460705179', extension=3,
-                 history_reconciled=lambda job_uuid, source_hash: True):
-    storage = storage or FakeStorage()
-    engine = engine or FakeEngine()
-    allocator = allocator or IdempotentLocalAllocator()
-    adapter = PrnsrvLocalAdapter(
-        storage=storage,
-        state_storage=storage,
-        state_root=STATE_ROOT,
-        output_root=ROOT,
-        engine=engine,
-        allocator=allocator,
-        history_reconciled=history_reconciled,
-        prefix=prefix,
-        extension=extension,
+def install_fake_prnsrv(monkeypatch):
+    fake = types.ModuleType('prnsrv')
+    fake.__path__ = []
+    fake.InputValidationError = type('InputValidationError', (ValueError,), {})
+    fake.SSCCClient = type('SSCCClient', (), {})
+
+    def canonical_source_hash(source):
+        payload = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def classify_count(source):
+        raw = source.get('count', source.get('Quantity', 0))
+        try:
+            count = int(raw)
+        except (ValueError, TypeError, OverflowError):
+            count = 0
+        return SimpleNamespace(should_print=count > 0, count=count,
+                               reason_code='COUNT_EMPTY', source_field='count')
+
+    fake.canonical_source_hash = canonical_source_hash
+    fake.classify_count = classify_count
+    fake.resolve_route = lambda source: '7733154124'
+    fake.resolve_template_name = lambda source: source['PasportData']['Format']
+    fake.build_csv = lambda ssccs, count, column_name: (column_name + '\n' + '\n'.join(ssccs)).encode()
+    fake.build_vdf = lambda template, csv, source, mapping, source_path: (
+        b'<Root><DataSource><SourcePath>' + source_path.encode() + b'</SourcePath></DataSource></Root>')
+    monkeypatch.setitem(sys.modules, 'prnsrv', fake)
+    sys.modules.pop('xtrek.prnsrv_local_runtime', None)
+    return importlib.import_module('xtrek.prnsrv_local_runtime')
+
+
+class FakeHttpResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self.payload
+
+
+class FakeSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return FakeHttpResponse(self.payload)
+
+
+def test_local_allocator_uses_stable_mtls_request_and_extension_three():
+    payloads = []
+    for serial in range(2):
+        body = '3' + PREFIX + f'{serial:07d}'
+        payloads.append(body + check_digit(body))
+    session = FakeSession({'ssccs': payloads})
+    allocator = LocalPrnsrvAllocator(url='https://worker94.local', prefix=PREFIX, session=session)
+    first = allocator.allocate(job_uuid=UUID, source_hash='a' * 64, count=2)
+    second = allocator.allocate(job_uuid=UUID, source_hash='a' * 64, count=2)
+    assert first.ssccs == tuple(payloads)
+    assert first.allocation_id == second.allocation_id
+    assert session.calls[0][0] == 'https://worker94.local/v1/allocate'
+    assert session.calls[0][1]['json']['extension'] == 3
+    assert session.calls[0][1]['json']['request_id'] == session.calls[1][1]['json']['request_id']
+
+
+def test_local_allocator_rejects_cloud_signer_token_and_invalid_response():
+    session = FakeSession({'ssccs': ['346070517900000057']})
+    allocator = LocalPrnsrvAllocator(url='https://worker94.local', prefix=PREFIX, session=session)
+    with pytest.raises(LocalAllocatorError, match='SUZ/business signer'):
+        allocator.allocate(job_uuid=UUID, source_hash='b' * 64, count=1, auth_token='unused')
+    session.payload = {'ssccs': ['000000000000000001']}
+    with pytest.raises(LocalAllocatorError, match='wrong-prefix/invalid'):
+        allocator.allocate(job_uuid=UUID, source_hash='b' * 64, count=1)
+
+
+def make_local_function(monkeypatch, *, history=True, count=2):
+    runtime = install_fake_prnsrv(monkeypatch)
+    from xtrek.prnsrv_generator_runtime.config import Settings
+    storage = FakePrnsrvS3()
+    allocator = FakeAllocator()
+    source_key = f'Задания/{UUID}.json'
+    source = {'count': count, 'PasportData': {'Format': 'fixture'},
+              'Manufacturer_inn': '7733154124'}
+    storage.objects[(BUCKET, source_key)] = json.dumps(source).encode()
+    storage.objects[(BUCKET, 'templates/fixture.vdf')] = b'<Root/>'
+    storage.objects[(BUCKET, 'config/mapping.json')] = b'[]'
+    function = runtime.LocalPrnsrvFunction(
+        storage=storage, settings=Settings(
+            bucket_id=BUCKET, templates_bucket=BUCKET, templates_prefix='templates/',
+            mapping_key='config/mapping.json', sscc_prefix=PREFIX, sscc_extension='3',
+        ),
+        allocator=allocator, history_reconciled=lambda *_: history,
+        local_prefix=PREFIX,
     )
-    return adapter, storage, engine, allocator
+    return function, storage, allocator, source_key, source
 
 
-def test_creates_immutable_files_in_separate_printer_tasks_contract():
-    adapter, storage, _, allocator = make_adapter()
-    result = adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    csv_key = f'{ROOT}/printer-tasks/{UUID}.csv'
-    vdf_key = f'{ROOT}/printer-tasks/7733154124_{UUID}.vdf'
-    done_key = f'{ROOT}/_prnsrv/done/{UUID}.done'
-
+def test_existing_prnsrv_function_generates_immutable_outputs_and_local_marker(monkeypatch):
+    function, storage, allocator, key, _ = make_local_function(monkeypatch)
+    result = function.process_object(bucket=BUCKET, key=key, event_id='fixture-event')
+    marker = storage.get_json(BUCKET, f'_prnsrv/done/{UUID}.done')
     assert result['result'] == 'GENERATED'
-    assert set((csv_key, vdf_key, done_key)).issubset(storage.objects)
-    marker = json.loads(storage.objects[done_key])
-    assert marker['source_hash'] == adapter.source_hash(SOURCE)
-    assert marker['allocation']['namespace'] == '460705179/extension-3'
-    assert allocator.calls[0][3] == 3
-    assert not any('C:\\tmp' in key for key in storage.objects)
-
-
-def test_repeated_event_reuses_done_marker_and_does_not_allocate_twice():
-    adapter, _, _, allocator = make_adapter()
-    first = adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    second = adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    assert first['result'] == 'GENERATED'
-    assert second == {'uuid': UUID, 'result': 'GENERATED', 'duplicate': True}
+    assert marker['allocation']['namespace'] == f'{PREFIX}/extension-3'
+    assert marker['outputs']['csv']['key'] == f'printer-tasks/{UUID}.csv'
+    assert marker['outputs']['vdf']['key'] == f'printer-tasks/7733154124_{UUID}.vdf'
+    assert len(allocator.calls) == 1
+    duplicate = function.process_object(bucket=BUCKET, key=key)
+    assert duplicate['duplicate'] is True
     assert len(allocator.calls) == 1
 
 
-def test_lost_allocator_response_retries_same_local_request_id():
-    allocator = IdempotentLocalAllocator()
-    allocator.drop_first_response = True
-    adapter, _, _, _ = make_adapter(allocator=allocator)
-    with pytest.raises(TimeoutError):
-        adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    result = adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    assert result['result'] == 'GENERATED'
-    assert len(allocator.calls) == 2
-    assert allocator.calls[0][0] == allocator.calls[1][0]
-    assert len(allocator.requests) == 1
+def test_local_function_blocks_unreconciled_and_protected_uuid(monkeypatch):
+    function, _, allocator, key, _ = make_local_function(monkeypatch, history=False)
+    with pytest.raises(Exception, match='history is not reconciled'):
+        function.process_object(bucket=BUCKET, key=key)
+    assert allocator.calls == []
 
-
-def test_crash_after_allocator_receipt_resumes_without_new_allocation():
-    engine = FakeEngine()
-    engine.fail_build_once = True
-    allocator = IdempotentLocalAllocator()
-    adapter, _, _, _ = make_adapter(engine=engine, allocator=allocator)
-    with pytest.raises(RuntimeError, match='simulated worker crash'):
-        adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    result = adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    assert result['result'] == 'GENERATED'
-    assert len(allocator.calls) == 1
-
-
-def test_changed_source_hash_conflicts_and_preserves_prior_assignment():
-    adapter, _, _, allocator = make_adapter()
-    adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    changed = dict(SOURCE, Quantity='3')
-    with pytest.raises(OperationConflict):
-        adapter.process(source_key=SOURCE_KEY, source=changed)
-    assert len(allocator.calls) == 1
-
-
-def test_existing_untracked_partial_output_requires_reconciliation_before_allocation():
-    storage = FakeStorage()
-    storage.objects[f'{ROOT}/printer-tasks/{UUID}.csv'] = b'legacy partial'
-    adapter, _, _, allocator = make_adapter(storage=storage)
-    with pytest.raises(ReconciliationRequired, match='Untracked printer artifact'):
-        adapter.process(source_key=SOURCE_KEY, source=SOURCE)
+    protected = '623c20fa-f90c-4478-aeae-9c6635cedc9f'
+    function, storage, allocator, _, source = make_local_function(monkeypatch)
+    protected_key = f'Задания/{protected}.json'
+    storage.objects[(BUCKET, protected_key)] = json.dumps(source).encode()
+    with pytest.raises(Exception, match='Protected uncertain UUID'):
+        function.process_object(bucket=BUCKET, key=protected_key)
     assert allocator.calls == []
 
 
-def test_empty_quantity_writes_no_print_marker_without_allocator():
-    adapter, storage, _, allocator = make_adapter(engine=FakeEngine(should_print=False))
-    result = adapter.process(source_key=SOURCE_KEY, source={'Quantity': ''})
-    marker = json.loads(storage.objects[f'{ROOT}/_prnsrv/done/{UUID}.done'])
+def test_old_generated_marker_without_extension_three_proof_is_held(monkeypatch):
+    function, storage, allocator, key, source = make_local_function(monkeypatch)
+    from prnsrv import canonical_source_hash
+    storage.objects[(BUCKET, f'_prnsrv/done/{UUID}.done')] = json.dumps({
+        'uuid': UUID, 'source_hash': canonical_source_hash(source), 'result': 'GENERATED',
+        'outputs': {'csv': {'key': 'printer-tasks/a.csv', 'sha256': 'a'},
+                    'vdf': {'key': 'printer-tasks/a.vdf', 'sha256': 'b'}},
+    }).encode()
+    with pytest.raises(Exception, match='not proven local extension-3'):
+        function.process_object(bucket=BUCKET, key=key)
+    assert allocator.calls == []
+
+
+def test_empty_count_reuses_existing_no_print_contract_without_allocation(monkeypatch):
+    function, storage, allocator, key, _ = make_local_function(monkeypatch, count='')
+    result = function.process_object(bucket=BUCKET, key=key)
+    marker = storage.get_json(BUCKET, f'_prnsrv/done/{UUID}.done')
     assert result['result'] == 'NO_PRINT'
     assert marker['reason_code'] == 'COUNT_EMPTY'
+    assert 'allocation' not in marker
     assert allocator.calls == []
 
 
-def test_local_allocator_extension_cannot_be_changed_to_cloud_extension_zero():
-    with pytest.raises(ValueError, match='restricted to extension 3'):
-        make_adapter(extension=0)
+def stage_fixture(storage):
+    from xtrek.prnsrv_generator_runtime.storage import ObjectInfo
+    job_uuid = UUID
+    prefix = 'printer-tasks/'
+    csv_key = f'{prefix}{job_uuid}.csv'
+    vdf_key = f'{prefix}7733154124_{job_uuid}.vdf'
+    csv, vdf = b'C1\nSSCC', b'<Root/>'
+    storage.objects[(BUCKET, csv_key)] = csv
+    storage.objects[(BUCKET, vdf_key)] = vdf
+    marker = {
+        'schema_version': 1, 'uuid': job_uuid,
+        'source_key': f'Задания/{job_uuid}.json', 'source_hash': 'a' * 64,
+        'result': 'GENERATED', 'allocation': {'namespace': f'{PREFIX}/extension-3'},
+        'outputs': {
+            'csv': {'key': csv_key, 'sha256': hashlib.sha256(csv).hexdigest()},
+            'vdf': {'key': vdf_key, 'sha256': hashlib.sha256(vdf).hexdigest()},
+        },
+    }
+    storage.objects[(BUCKET, f'_prnsrv/done/{job_uuid}.done')] = json.dumps(marker).encode()
 
 
-def test_history_not_reconciled_blocks_allocator_before_any_request():
-    adapter, _, _, allocator = make_adapter(history_reconciled=lambda *_: False)
-    with pytest.raises(ReconciliationRequired, match='history has not been reconciled'):
-        adapter.process(source_key=SOURCE_KEY, source=SOURCE)
-    assert allocator.calls == []
+def test_bucket_scoped_receiver_matches_prnsrvfunction_marker_and_receipt_contract(tmp_path):
+    storage = FakePrnsrvS3()
+    stage_fixture(storage)
+    receiver = PrnsrvStagingReceiver(
+        storage=storage, bucket=BUCKET, output_root='', receipt_root='',
+        staging_root=str(tmp_path / 'review-stage'), allowlisted_uuids=[UUID],
+    )
+    result = receiver.stage(UUID)
+    receipt = storage.get_json(BUCKET, f'printer-task-stage-receipts/{UUID}.json')
+    assert result['state'] == 'STAGED'
+    assert receipt['done_key'] == f's3://{BUCKET}/_prnsrv/done/{UUID}.done'
+    assert receipt['source_key'] == f'Задания/{UUID}.json'
+    assert set(receipt['files']) == {'csv', 'vdf'}
+    assert (tmp_path / 'review-stage' / UUID / 'manifest.json').is_file()
+    assert receiver.stage(UUID)['state'] == 'STAGED'
 
 
-def test_protected_uncertain_uuid_cannot_reach_allocator():
-    adapter, _, _, allocator = make_adapter()
-    protected = '623c20fa-f90c-4478-aeae-9c6635cedc9f'
-    with pytest.raises(ReconciliationRequired, match='Protected uncertain UUID'):
-        adapter.process(source_key=f'Задания/{protected}.json', source=SOURCE)
-    assert allocator.calls == []
+def test_bucket_scoped_receiver_requires_allowlist_hashes_and_safe_root(tmp_path):
+    storage = FakePrnsrvS3()
+    stage_fixture(storage)
+    receiver = PrnsrvStagingReceiver(
+        storage=storage, bucket=BUCKET, output_root='', receipt_root='',
+        staging_root=str(tmp_path / 'review-stage'), allowlisted_uuids=[],
+    )
+    with pytest.raises(StagingConflict, match='allowlist'):
+        receiver.stage(UUID)
+    receiver.allowlisted.add(UUID)
+    storage.objects[(BUCKET, f'printer-tasks/{UUID}.csv')] = b'corrupt'
+    with pytest.raises(StagingConflict, match='hash does not match'):
+        receiver.stage(UUID)
+    assert (BUCKET, f'printer-task-stage-receipts/{UUID}.json') not in storage.objects
+    with pytest.raises(ValueError, match='watched or printer path'):
+        PrnsrvStagingReceiver(
+            storage=storage, bucket=BUCKET, output_root='', receipt_root='',
+            staging_root='C:/tmp', allowlisted_uuids=[UUID],
+        )

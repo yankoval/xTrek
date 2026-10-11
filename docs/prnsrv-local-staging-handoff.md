@@ -1,8 +1,10 @@
 # Local PRNSRV generation and staging handoff
 
-This patch prepares the full-main owner to replace only the `prnsrv-generator`
-Object Storage event path on worker94. It does not install or activate a worker,
-change the printer runtime, invoke Cloud Functions, or print anything.
+The xTrek Celery S3 poller now has a minimal opt-in hook for the existing
+`PrnsrvFunction`, backed by the pinned `prnsrv` engine. The hook is disabled
+unless `prnsrv_local_generator_enabled: true` is set in runtime config. No
+service was installed or activated and no generator event, allocation, S3
+write, or print ran while preparing this patch.
 
 ## Source, allocator, and durable identity
 
@@ -10,45 +12,45 @@ change the printer runtime, invoke Cloud Functions, or print anything.
 - Count rule follows the pinned `prnsrv` package: `count` takes precedence over
   `Quantity`; empty/invalid/non-positive values complete as `NO_PRINT` without
   allocation.
-- Local allocator: HTTPS mTLS endpoint already configured on worker94; prefix
-  must equal the verified Fito prefix `460705179`, extension is fixed to `3`.
-  Cloud extension `0` is never selected. SSCCs assigned to equipment tasks are
-  kept separate: PRNSRV allocations use the operation business key
-  `prnsrv:<UUID>` and a distinct stable request ID derived from UUID and
-  canonical source hash.
-- The adapter refuses the protected uncertain UUID
-  `623c20fa-f90c-4478-aeae-9c6635cedc9f` and requires a per-UUID/hash history
-  reconciliation callback before it can make the first allocation. This must
-  verify legacy `_prnsrv/done`, both output objects, and available previous
-  allocator evidence; missing or conflicting evidence blocks allocation.
-- Existing local `OperationState` CAS persists the input hash before the local
-  allocator call. Only this adapter's own `local-sscc-v1` request may be retried;
-  it retries with the same allocator request ID, so a lost response returns the
-  same SSCC range. An uncertain cloud extension-0 event is never resumed as an
-  extension-3 retry.
+- Source events arrive through the existing `xtrek.s3_poller` route for
+  `Задания/<UUID>.json` and continue through `tasks.process_s3_event`. The
+  guarded source branch calls
+  `xtrek.prnsrv_local_runtime.process_local_prnsrv_s3_event(...)` before the
+  existing xTrek order workflow when the runtime flag is enabled.
+- `LocalPrnsrvFunction` reuses the existing `PrnsrvFunction` from the
+  `cf-aggregate-ingress-pr12/prnsrv-generator` adapter at source commit
+  `50b8264cf107fe6b53f530338ce5e939527db3a2`; count classification, route,
+  template/mapping reads, CSV/VDF builders, output keys, immutable S3 writes,
+  read-back hashes, and done markers stay with that function and pinned engine.
+- `LocalPrnsrvAllocator` injects the existing function's allocator protocol and
+  sends `extension=3` through the worker's HTTPS mTLS local endpoint. Its
+  request ID is stable from UUID + canonical source hash; the local allocator
+  ledger returns the same result after a lost response. No cloud `SSCCClient`,
+  extension 0, or SUZ/business signing token is used.
+- `LocalPrnsrvFunction` refuses the protected uncertain UUID
+  `623c20fa-f90c-4478-aeae-9c6635cedc9f`. For a UUID without a done marker, it
+  also requires an exact entry in `prnsrv_local_history_eligible` mapping UUID
+  to canonical source hash. A prior generated marker must prove the same local
+  extension-3 namespace; older or ambiguous evidence blocks the attempt.
 
 ## Immutable output and state contract
 
 The engine is the pinned `prnsrv` package at
-`698600cd571f5f9adf8b21e86f6582e210d9b3ce` (see
-`requirements-prnsrv-local.txt`). This adapter owns lifecycle and persistence:
+`698600cd571f5f9adf8b21e86f6582e210d9b3ce` (see `requirements.txt`).
+`PrnsrvFunction` owns lifecycle and persistence:
 
 | Purpose | S3 key |
 |---|---|
 | CSV | `printer-tasks/<UUID>.csv` |
 | VDF | `printer-tasks/<route>_<UUID>.vdf` |
 | completion | `_prnsrv/done/<UUID>.done` |
-| durable CAS | `<operation_state_path>/allocate-pallet-sscc/<sha256("prnsrv:<UUID>")>.json` |
 
-CSV uploads before VDF. Both use create-only `upload_once`, then read-back
-SHA-256 verification. The immutable done marker is published last and records
-UUID, source hash, extension-3 namespace, output keys, and hashes. A repeated
-event with a valid marker returns the existing result. A changed source hash,
-unknown marker, conflicting output, or legacy output without the local guard
-raises a reconciliation error; it never overwrites the artifact or allocates a
-replacement. If the worker dies after the allocator commits but before its
-reply, local idempotency repeats the same request ID. If it dies after saving
-the accepted SSCC list, the adapter rebuilds identical outputs from that list.
+CSV uploads before VDF using conditional immutable writes. Both are read back
+and SHA-256 verified; the done marker is published last. The local wrapper adds
+`allocation.namespace=<prefix>/extension-3` and the stable request ID to the
+existing generated marker. Duplicate events reuse the marker. Conflicting
+outputs or old generated markers without local extension-3 proof are held for
+reconciliation.
 
 The `prnsrv-generator` source contract targets `printer-tasks/` and
 `_prnsrv/done/`; it does not target `solmarkTasks/`, `equipment-tasks/`,
@@ -76,10 +78,29 @@ For review and recovery, use an independent non-hot staging receiver:
 4. Do not copy to `C:\\tmp`, VDFPR, PrintServer, a printer share, or any watched
    folder. There is no physical-print action in the receiver contract.
 
-Production delivery remains blocked until the full-main owner implements and
-reviews this receiver against the correct non-hot filesystem and confirms its
-ownership/permissions on 94. The staging spec is concrete; the staging program
-is intentionally not installed or run here.
+The S3 verification/staging/receipt code is implemented in
+`xtrek/prnsrv_staging.py`; it is a separate, explicitly invoked step and is not
+on the generator's critical path. It has no print operation. The review test
+uses paired CSV/VDF fixtures, verifies both S3 GET bodies against the done
+marker SHA-256 values, reads both staged files back, verifies the manifest,
+and checks the create-only S3 receipt and its readback.
+
+The receiver entrypoint is
+`PrnsrvStagingReceiver.from_xtrek_config(bucket=..., s3_config=...,
+staging_root=..., allowlisted_uuids=...).stage(uuid)`. Required arguments are
+the source bucket, its existing S3 client configuration, an explicit staging
+root, and an explicit UUID allowlist. `output_prefix`, `done_prefix`, and
+`receipt_prefix` default to `printer-tasks/`, `_prnsrv/done/`, and
+`printer-task-stage-receipts/`.
+It returns `STAGED` only after it has: (1) found an immutable
+`_prnsrv/done/<UUID>.done` marker with the same UUID and `GENERATED` result;
+(2) verified both S3 output objects against their marker SHA-256 values and
+expected filenames; (3) atomically staged and read back both files; (4) written
+`manifest.json` last with the source hash, source/output keys, hashes, and
+arrival timestamp; and (5) created/read back the immutable
+`printer-task-stage-receipts/<UUID>.json` receipt. Different existing bytes,
+missing metadata, stale lock, or non-allowlisted UUID blocks staging. The
+receiver has no print, share, or watched-folder operation.
 
 ## MAX pallet-label handoff
 
@@ -100,39 +121,65 @@ The recovery ledger currently has two such rows in chat `-72448994566325`:
 `block_legacy_attempt` with each exact triplet. A matching GET can promote them
 to confirmed, otherwise they remain blocked.
 
-The isolated patch does not run against production credentials. The integration
-owner must connect existing report/task identity checks and the pallet PNG
-renderer, provision the ledger outside watched folders, and verify that the
+The isolated patch does not run against production credentials. The runtime
+owner must provision the ledger outside watched folders and verify that the
 current full-main deployment maps to bot `259171708` and chat
-`-72448994566325`. The 11 October GET audit found no exact pallet-label file
-among 56 assigned equipment SSCCs. Two report objects exist, but their report
-and task contents must be compared before generating labels. Other
+`-72448994566325`. The recovery snapshot recorded no exact pallet-label file
+among 56 assigned equipment SSCCs before delivery. Two MAX POSTs were later
+confirmed by GET and are now recorded as delivered in the ledger. Other
 report/order notifications are not delivery evidence.
 
 The transport follows the official MAX `/uploads`, `/messages`, `/me`, and GET
 history API. This patch has not sent an outbound message.
 
-## Integration points for the full-main owner
+The exact full local event entrypoint is
+`process_equipment_report_event(report_storage=..., task_storage=...,
+report_key="equipment-reports/<report-id>.json", notifier=...)` from
+`xtrek/pallet_label_pipeline.py`. It reads the report and its corresponding
+`equipment-tasks/<report-id>.json`, checks report key/id/task id/schema version,
+assigned SSCCs and check digits, closed pallet/box state, product counts, then
+renders GS1-128 AI 00 PNGs and calls the idempotent notifier. It uses separate
+storage instances so report and task buckets can differ. Rendering requires
+`Pillow`, `python-barcode==0.16.1`, and a Cyrillic-capable font path supplied as
+`XTREK_LABEL_FONT` or `font_path`.
 
-1. Adapt the S3 poller to enqueue exact `Задания/<UUID>.json` events into this
-   adapter after its existing source-task processing is complete. Keep PRNSRV
-   CSV/VDF generation a separate output stage.
-2. Supply the pinned engine's `classify_count`, route selection, and byte
-   builder through the adapter's engine interface. Supply an allocator wrapper
-   around `get_sscc_from_service(..., extension=3, auth_mode="mtls",
-   request_id=...)` and the configured 94 local service URL.
-3. Supply the read-only per-UUID historical reconciliation result before the
-   first call. Do not infer “never allocated” from a missing done marker alone.
-4. Validate allowed prefixes and manufacturer route. The current local
-   extension-3 namespace is Fito-only; the 9 GlobalBio tasks have no approved
-   local prefix/signer route in the saved worker configuration and must remain
-   blocked until that configuration is authorized and verified.
-5. Add a receiver service that stages but never prints, and separately records
-   the receipt contract above. Retain the existing distinct S3 task routes.
-6. Run the isolated adapter tests and the project regression suite in the
-   release checkout; inspect full-main diff and runtime config before release.
-7. Wire the MAX sender to validated report/task content and the established
-   pallet PNG renderer; retain GET-only reconciliation for ambiguous sends.
+## Runtime release handoff
+
+The generator, local extension-3 allocator adapter, S3 staging receiver, and
+MAX report-to-label pipeline are implemented in this checkout. The generator
+entrypoint is `tasks.process_s3_event` →
+`process_local_prnsrv_s3_event(bucket, key, runtime_config, event_id=None)`;
+it runs only when `prnsrv_local_generator_enabled` is true. Configure
+`s3_config`, `prnsrv_local_allocator_by_inn[INN]` with `url`, `prefix`,
+`client_cert`, `client_key`, optional `ca_bundle` and `timeout_seconds`, plus
+`prnsrv_local_history_eligible[UUID] = canonical_source_hash`. The environment
+variable `XTREK_LOCAL_ALLOWED_INNS` must contain the enabled INNs. Optional
+keys are `prnsrv_input_prefix`, `prnsrv_output_prefix`, `prnsrv_done_prefix`,
+`prnsrv_templates_bucket`, `prnsrv_templates_prefix`, `prnsrv_mapping_key`,
+`prnsrv_column_name`, and `prnsrv_vdf_source_dir`. No runtime configuration or
+service was changed here.
+
+1. Set `prnsrv_local_allocator_by_inn` and `XTREK_LOCAL_ALLOWED_INNS` for each
+   explicitly enabled organization, including the worker94 endpoint and mTLS
+   cert/key paths. GlobalBio delegation identity and power of attorney are
+   confirmed; the Smart/Global self-test passed. The remaining release action
+   is runtime allowlist/prefix/endpoint configuration and verification, not
+   signer discovery. Generator allocation does not sign SUZ business documents.
+2. Populate `prnsrv_local_history_eligible` only with UUID/source-hash pairs
+   whose S3 and prior allocator history are reconciled. Do not infer eligibility
+   from a missing done marker.
+3. Enable the non-hot receiver only after the owner confirms
+   `/var/lib/xtrek/prnsrv/staging` ownership and permissions on worker94.
+4. The MAX event entrypoint is
+   `process_equipment_report_event(report_storage, task_storage, report_key,
+   notifier)`; it joins and validates report/task payloads, renders pallet PNGs,
+   then calls the idempotent sender. The caller supplies the two bucket-specific
+   storage instances and notifier credentials/configuration.
+5. Targeted verification in this checkout: 74 tests passed across
+   `test_prnsrv_local.py`, `test_pallet_label_max_notifier.py`,
+   `test_pallet_label_pipeline.py`, and `test_tasks_unit_set_flow.py`.
+   Run the full project regression suite and inspect the release diff and
+   runtime configuration before release.
 
 ## Current 11 October recovery state
 
@@ -142,5 +189,4 @@ history API. This patch has not sent an outbound message.
   next-serial watermark of 56. This does not mean the PRNSRV allocations are
   present.
 - This patch has not allocated numbers, written S3, delivered to 94 staging,
-  or printed. The release owner must first reconcile historical evidence and
-  mark exact `(UUID, source_hash)` rows eligible.
+  or printed. The generation hook remains disabled by default.
