@@ -11,7 +11,7 @@ User=xtrek
 Group=xtrek
 EnvironmentFile=/etc/xtrek/worker.env
 EnvironmentFile=/etc/xtrek/local-s3-mode.env
-WorkingDirectory=/srv/xtrek/current
+WorkingDirectory=/var/lib/xtrek
 ExecStart=/srv/xtrek/venv/bin/python -m xtrek.s3_poller
 Restart=on-failure
 RestartSec=10s
@@ -24,7 +24,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-ReadWritePaths=/var/lib/xtrek/s3-poller
+ReadWritePaths=/var/lib/xtrek
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=true
 
