@@ -73,7 +73,14 @@ def _signing_route(inn, config):
             raise ValueError()
         if options.get('mode') == 'storage' and set(options) == {'mode'}:
             return 'storage', None
-        if options.get('mode') != 'local' or set(options) - {'mode', 'thumbprint', 'store_location', 'pin_file'}:
+        if options.get('mode') != 'local' or set(options) - {'mode', 'thumbprint', 'store_location', 'pin_file', 'identity', 'signer_inn'}:
+            raise ValueError()
+        identity = options.get('identity', 'organization')
+        signer_inn = options.get('signer_inn')
+        if identity == 'delegated':
+            if not re.fullmatch(r'[0-9]{10}', inn) or not isinstance(signer_inn, str) or not re.fullmatch(r'[0-9]{12}', signer_inn):
+                raise ValueError()
+        elif identity != 'organization' or signer_inn is not None:
             raise ValueError()
         thumbprint = _thumbprint(options.get('thumbprint'))
         location = options.get('store_location', 'current_user')
@@ -82,7 +89,7 @@ def _signing_route(inn, config):
                 and (not isinstance(pin_file, str) or not pin_file)):
             raise ValueError()
         return 'local', dict(thumbprint=thumbprint, store_location=location,
-                             pin_file=pin_file, expected_inn=inn)
+                             pin_file=pin_file, expected_inn=signer_inn if identity == 'delegated' else inn)
     except (ValueError, TypeError):
         raise TokenIssuanceError('Invalid token signing configuration', stage='configuration',
                                  reason='invalid_configuration') from None

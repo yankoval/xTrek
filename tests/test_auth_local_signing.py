@@ -101,6 +101,41 @@ def test_document_local_config_does_not_enable_auth_local_mode(monkeypatch):
     backend.assert_not_called()
 
 
+@pytest.mark.parametrize('purpose', ['true_api', 'suz'])
+def test_delegated_identity_binds_personal_signer_and_keeps_organization_scope(session, monkeypatch, tmp_path, purpose):
+    backend = MagicMock(return_value='c2lnbmF0dXJl')
+    monkeypatch.setattr(crpt_auth, 'sign_token_data', backend)
+    settings = config()
+    settings['tokens_signing']['by_inn'][GLOBAL] = {
+        'mode': 'local', 'thumbprint': THUMB, 'identity': 'delegated',
+        'signer_inn': '123456789012'}
+    expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    session.request.side_effect = [response({'uuid': CHALLENGE, 'data': 'literal'}),
+        response({'token': VALUE, 'uuidToken': VALUE, 'expireDate': expiry}),
+        response({'omsId': OMS, 'apiVersion': '3', 'omsVersion': '5'})]
+    with master_runtime():
+        with lock(ProcessLockStore(tmp_path / 'locks.sqlite'), tmp_path).hold():
+            issued = crpt_auth.issue_token(GLOBAL, purpose=purpose, config=settings,
+                connection_id=CON if purpose == 'suz' else None, oms_id=OMS if purpose == 'suz' else None)
+    assert backend.call_args_list[0].kwargs['expected_inn'] == '123456789012'
+    assert issued.inn == GLOBAL
+    assert session.request.call_args_list[1].kwargs['json']['inn'] == GLOBAL
+
+
+@pytest.mark.parametrize('extra', [
+    {'identity': 'delegated'}, {'identity': 'delegated', 'signer_inn': INN},
+    {'signer_inn': '123456789012'}, {'identity': 'auto', 'signer_inn': '123456789012'},
+    {'identity': 'delegated', 'signer_inn': 123456789012},
+])
+def test_delegated_identity_requires_explicit_complete_binding_before_network(session, extra):
+    settings = config()
+    settings['tokens_signing']['by_inn'][GLOBAL] = {'mode': 'local', 'thumbprint': THUMB, **extra}
+    with pytest.raises(crpt_auth.TokenIssuanceError) as error:
+        crpt_auth.issue_token(GLOBAL, purpose='true_api', config=settings)
+    assert error.value.reason == 'invalid_configuration'
+    session.request.assert_not_called()
+
+
 @pytest.mark.parametrize('options', [
     {'mode': 'auto'}, {'mode': 'local'}, {'mode': 'local', 'thumbprint': 'bad'},
     {'mode': 'storage', 'thumbprint': THUMB},
