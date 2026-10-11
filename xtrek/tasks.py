@@ -913,6 +913,29 @@ def logic_start_virtualProdTask_emission(full_key):
         raise RuntimeError(f"create_emission_task failed for {production_order_id}")
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggSetReceipts/ ---
+class AggregationDocumentRejected(ReconciliationRequired):
+    """A rejected aggregation requires operator reconciliation, not a retry."""
+
+
+def _require_checked_aggregation_status(result, production_order_id, operation):
+    # A receipt refers to one existing document. Multiple results and API
+    # errors cannot establish success or a definitive business rejection.
+    target = result[0] if isinstance(result, list) and len(result) == 1 else result
+    if not isinstance(target, dict) or "error" in target:
+        raise RuntimeError(f"{operation} status not confirmed for {production_order_id}")
+    status = target.get("status")
+    if status == "CHECKED_NOT_OK":
+        # ReconciliationRequired is already excluded from Celery autoretry.
+        # Status evidence is persisted by the updater; keep the receipt and
+        # send guard. Do not finalize the report or create another document.
+        raise AggregationDocumentRejected(
+            f"{operation} rejected for {production_order_id}: CHECKED_NOT_OK"
+        )
+    if status != "CHECKED_OK":
+        raise RuntimeError(f"{operation} status not confirmed for {production_order_id}")
+    return target
+
+
 def logic_update_agg_set(full_key):
     group = PRODUCT_GROUP
     print(f"[LOGIC-93] Запуск обработки aggSetReceipts: {full_key}")
@@ -921,30 +944,20 @@ def logic_update_agg_set(full_key):
         return f"No production_order_id found for {full_key}"
 
     result = update_aggregation_set_status(production_order_id, group)
-    if not result:
-        raise RuntimeError(f"update_aggregation_set_status failed for {production_order_id} result:{result}")
-    if isinstance(result, dict) and "error" in result:
-        print("Ошибка API при запросе статуса")
-        raise RuntimeError(f"update_aggregation_set_status failed for {production_order_id} result:{result}")
+    result = _require_checked_aggregation_status(result, production_order_id, "aggregation-set")
+    print(f"[+++] Агрегация наборов для {production_order_id} успешна. Запуск стандартной агрегации...")
 
-    result = result[0] if isinstance(result, list) and len(result) > 0 else result
-    if isinstance(result, dict) and result.get('status') == 'CHECKED_OK':
-        print(f"[+++] Агрегация наборов для {production_order_id} успешна. Запуск стандартной агрегации...")
+    # 1. Создаем отчет об агрегации (стандартный для ЛК)
+    res1 = create_aggregation_report(production_order_id)
+    if not res1:
+        raise RuntimeError(f"create_aggregation_report failed for {production_order_id}")
 
-        # 1. Создаем отчет об агрегации (стандартный для ЛК)
-        res1 = create_aggregation_report(production_order_id)
-        if not res1:
-            raise RuntimeError(f"create_aggregation_report failed for {production_order_id}")
+    # 2. Подписываем и отправляем
+    res2 = sign_and_send_aggregation(production_order_id, group, signing_dir, 120)
+    if _is_failed_send_result(res2):
+        raise RuntimeError(f"sign_and_send_aggregation failed for {production_order_id}")
 
-        # 2. Подписываем и отправляем
-        res2 = sign_and_send_aggregation(production_order_id, group, signing_dir, 120)
-        if _is_failed_send_result(res2):
-            raise RuntimeError(f"sign_and_send_aggregation failed for {production_order_id}")
-
-        return f"Standard aggregation for {production_order_id} started successfully"
-    else:
-        status = result.get('status') if isinstance(result, dict) else 'unknown'
-        raise RuntimeError(f"update_aggregation_set_status for {production_order_id} is {status}")
+    return f"Standard aggregation for {production_order_id} started successfully"
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggReceipts/ ---
 def logic_update_agg(full_key):
@@ -955,20 +968,11 @@ def logic_update_agg(full_key):
         return f"No production_order_id found for {full_key}"
 
     result = update_aggregation_status(production_order_id, group)
-    if not result:
-        raise RuntimeError(f"update_aggregation_status failed for {production_order_id} result:{result}")
-    if isinstance(result, dict) and "error" in result:
-        print("Ошибка API при запросе статуса")
-        raise RuntimeError(f"update_aggregation_status failed for {production_order_id}  result:{result}")
-    result = result[0] if isinstance(result, list) and len(result) > 0 else result
-    if isinstance(result, dict) and result.get('status') == 'CHECKED_OK':
-        # Выполняем проверку отчета и установку тега check
-        print(f"[+++] Агрегация для {production_order_id} успешна. Проверка отчета...")
-        check_aggregation_report(production_order_id)
-        return f"aggregation status for {production_order_id} is CHECKED_OK, report checked and tagged"
-    else:
-        status = result.get('status') if isinstance(result, dict) else 'unknown'
-        raise RuntimeError(f"update_aggregation_status failed for {production_order_id} result status:{status}")
+    result = _require_checked_aggregation_status(result, production_order_id, "aggregation")
+    # Выполняем проверку отчета и установку тега check
+    print(f"[+++] Агрегация для {production_order_id} успешна. Проверка отчета...")
+    check_aggregation_report(production_order_id)
+    return f"aggregation status for {production_order_id} is CHECKED_OK, report checked and tagged"
 
 # --- ГЛАВНЫЙ ВОРКЕР (РОУТЕР) ---
 #@app.task(name='tasks.process_s3_event', bind=True)
