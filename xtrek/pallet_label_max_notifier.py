@@ -128,7 +128,7 @@ class DeliveryLedger:
 class MaxPalletLabelNotifier:
     def __init__(self, *, token: str, chat_id: str, expected_bot_user_id: str,
                  ledger: DeliveryLedger, session: Any, history_start_ms: int,
-                 sleep=time.sleep):
+                 sleep=time.sleep, history_seed=None, max_history_pages: int = 100, allow_truncated_history: bool = False):
         self.token = token
         self.chat_id = str(chat_id)
         self.expected_bot_user_id = str(expected_bot_user_id)
@@ -136,6 +136,11 @@ class MaxPalletLabelNotifier:
         self.session = session
         self.history_start_ms = int(history_start_ms)
         self.sleep = sleep
+        self.history_seed = list(history_seed or [])
+        self.max_history_pages = int(max_history_pages)
+        self.allow_truncated_history = allow_truncated_history is True
+        if not 1 <= self.max_history_pages <= 10000:
+            raise ValueError("Invalid MAX history page limit")
 
     def _get(self, path: str, params: dict | None = None):
         response = self.session.get(
@@ -148,9 +153,9 @@ class MaxPalletLabelNotifier:
         return response.json()
 
     def _history(self) -> list[dict]:
-        messages = []
+        messages = list(self.history_seed)
         cursor = None
-        for _ in range(100):
+        for _ in range(self.max_history_pages):
             params = {'chat_id': self.chat_id, 'count': 100}
             if cursor is not None:
                 params['from'] = cursor - 1
@@ -163,7 +168,9 @@ class MaxPalletLabelNotifier:
             if not stamps or min(stamps) == cursor:
                 raise HistoryIncomplete('MAX history pagination cursor did not advance')
             cursor = min(stamps)
-        raise HistoryIncomplete('MAX history exceeded 100 pages; delivery is held')
+        if self.allow_truncated_history:
+            return messages
+        raise HistoryIncomplete('MAX history page limit exceeded; delivery is held')
 
     @staticmethod
     def _attachment_names(message: dict) -> list[str]:
@@ -205,6 +212,19 @@ class MaxPalletLabelNotifier:
             self.ledger.reserve(item, self.chat_id)
             self.ledger.set_state(item, self.chat_id, 'CONFIRMED', str((existing_message.get('body') or {}).get('mid') or ''))
             return {'state': 'ALREADY_CONFIRMED_BY_GET', 'message_id': (existing_message.get('body') or {}).get('mid')}
+
+        for candidate in history:
+            sender = candidate.get('sender') or {}
+            recipient = candidate.get('recipient') or {}
+            body = candidate.get('body') or {}
+            text = str(body.get('text') or '')
+            if (str(sender.get('user_id')) == self.expected_bot_user_id
+                    and str(recipient.get('chat_id')) == self.chat_id
+                    and item.report_id in text and item.sscc in text
+                    and body.get('attachments')):
+                self.ledger.reserve(item, self.chat_id)
+                self.ledger.set_state(item, self.chat_id, 'POST_UNCERTAIN')
+                raise DeliveryUncertain('Prior attachment candidate lacks exact filename proof; GET reconciliation required')
 
         row = self.ledger.reserve(item, self.chat_id)
         if row['state'] == 'CONFIRMED':

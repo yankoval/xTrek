@@ -1092,3 +1092,11 @@ def process_s3_event(self, data):
         print(f"[ERROR] Критическая ошибка: {e}")
         # Celery перехватит это и сделает retry (если настроено) или залогирует
         raise e
+
+
+@app.task(name='tasks.deliver_pallet_report', bind=True, acks_late=True,
+          reject_on_worker_lost=True)
+def deliver_pallet_report(self, report_key):
+    """Local RabbitMQ task: validated PNG attachment delivery on the VPS worker."""
+    from xtrek.pallet_label_celery_runtime import deliver_pallet_report as deliver
+    return deliver(report_key=report_key, runtime_config=load_config('suz_worker_config'))
