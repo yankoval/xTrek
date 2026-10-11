@@ -76,8 +76,13 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
         raise ValueError('Protected uncertain UUID')
     client = boto3.client('s3', **runtime_config['s3_config'])
     task_bucket = settings['task_bucket']
-    source, source_head = read_snapshot(client, task_bucket, f'Задания/{uid}.json')
-    validate_source(report_id, source, source_head, settings)
+    if settings.get('all_valid_assigned_reports') is not True:
+        source, source_head = read_snapshot(client, task_bucket, f'Задания/{uid}.json')
+        validate_source(report_id, source, source_head, settings)
+    elif report_id not in settings['backlog_report_ids']:
+        # Future sources remain bounded by the explicit cutoff.
+        source, source_head = read_snapshot(client, task_bucket, f'Задания/{uid}.json')
+        validate_source(report_id, source, source_head, settings)
     report, _ = read_snapshot(client, settings['report_bucket'], report_key)
     task_key = f'equipment-tasks/{report_id}.json'
     task, _ = read_snapshot(client, task_bucket, task_key)
@@ -85,8 +90,8 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
         report_storage=SnapshotStorage({report_key: report}),
         task_storage=SnapshotStorage({task_key: task}), report_key=report_key)
     for label in labels:
-        if not label.sscc.startswith('3460705179'):
-            raise ValueError('Assigned pallet SSCC must use shared Fito prefix and extension 3')
+        if label.sscc[1:10] != '460705179':
+            raise ValueError('Assigned pallet SSCC must retain shared Fito prefix')
     env = {}
     for line in Path(settings['max_environment_file']).read_text().splitlines():
         if line.strip() and not line.lstrip().startswith('#'):

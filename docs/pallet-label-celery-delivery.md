@@ -16,7 +16,7 @@ Provision configuration with task/report buckets, three explicitly allowed INNs,
 exact `backlog_report_ids`/`backlog_source_uuids`, a UTC source cutoff, and the two
 `previously_delivered_report_ids`. Blank/nonpositive Quantity and the protected
 uncertain UUID are excluded. Report/task schema and assigned SSCCs must agree;
-each pallet retains its existing assigned Fito extension-3 SSCC, without allocating
+each pallet retains its existing assigned Fito SSCC (including historical extension 0), without allocating
 another number. S3 reads use HEAD ETag + conditional GET.
 
 The configuration must also contain `max_environment_file`, `ledger_path`,
@@ -36,3 +36,10 @@ full main and warm-restart only after active work is complete. Start discovery
 after verifying the new Celery task is registered. Rollback stops discovery first,
 keeps durable ledgers, and restores the previous complete release and settings.
 No printer or hot-folder route is invoked by this pipeline.
+
+For the human-authorized full undelivered backlog, inventory all reports and place
+every valid report/task join in `backlog_report_ids`, then set
+`all_valid_assigned_reports: true`. This uses quantities from scanned report boxes
+and preserves existing pallet assignments; it never creates equipment or print
+jobs from blank Quantity sources. Future sources keep the explicit cutoff/positive
+Quantity guard. Invalid joins and uncertain POSTs remain held.
