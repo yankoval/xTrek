@@ -62,6 +62,43 @@ def test_probe_failure_prevents_publish_and_logs_no_secret(worker, monkeypatch, 
     assert 'secret credential' not in caplog.text
 
 
+def test_signing_failure_logs_stage_without_suz_revocation_warning(worker, monkeypatch, caplog):
+    from xtrek.crpt_auth import TokenIssuanceError
+    worker.tp.remaining_for.side_effect = [3600, 0]
+    monkeypatch.setattr(token_worker, 'issue_token', MagicMock(side_effect=TokenIssuanceError(
+        'SECRET private native text', stage='signing_local', reason='private_key_missing')))
+    assert not worker.check_and_refresh()
+    assert 'stage=signing_local reason=private_key_missing' in caplog.text
+    assert 'SECRET' not in caplog.text
+    assert 'мог быть отозван' not in caplog.text
+    worker.tp.save_record.assert_not_called()
+
+
+def test_ambiguous_suz_failure_logs_stage_and_revocation_warning(worker, monkeypatch, caplog):
+    from xtrek.crpt_auth import TokenIssuanceError
+    worker.tp.remaining_for.side_effect = [3600, 0]
+    monkeypatch.setattr(token_worker, 'issue_token', MagicMock(side_effect=TokenIssuanceError(
+        'SECRET private native text', stage='issuance', reason='transport_failed', outcome_unknown=True)))
+    assert not worker.check_and_refresh()
+    assert 'stage=issuance reason=transport_failed' in caplog.text
+    assert 'мог быть отозван' in caplog.text
+    assert 'SECRET' not in caplog.text
+    worker.tp.save_record.assert_not_called()
+
+
+@pytest.mark.parametrize('post_attempted', [False, True])
+def test_scope_deadline_warns_about_suz_revocation_only_after_post(worker, monkeypatch, caplog, post_attempted):
+    from xtrek.token_runtime import current_runtime, DeadlineExpired
+    worker.tp.remaining_for.side_effect = [3600, 0]
+    def stopped(*args, **kwargs):
+        current_runtime().suz_post_attempted = post_attempted
+        raise DeadlineExpired('scope budget')
+    monkeypatch.setattr(token_worker, 'issue_token', stopped)
+    assert not worker.check_and_refresh()
+    assert ('мог быть отозван' in caplog.text) is post_attempted
+    worker.tp.save_record.assert_not_called()
+
+
 def test_s3_unavailable_prevents_refresh(worker, monkeypatch):
     worker.tp._sync_from_s3.side_effect = RuntimeError('S3 unavailable')
     issue = MagicMock()

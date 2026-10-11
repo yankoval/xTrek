@@ -11,7 +11,7 @@ from pathlib import Path
 from .tokens import TokenProcessor
 from .org_manager import OrganizationManager
 from .config_loader import load_config
-from .crpt_auth import issue_token
+from .crpt_auth import issue_token, TokenIssuanceError, safe_diagnostic
 from .token_runtime import current_runtime, master_runtime, MasterStopped, DeadlineExpired
 
 logger = logging.getLogger("TokenWorker")
@@ -98,7 +98,8 @@ class TokenRefreshWorker:
                     pending.append((inn, purpose, connection, oms, scope, token_format, remaining))
                 except Exception as exc:
                     failed += 1
-                    logger.error("ИНН %s, %s: ошибка обновления (%s)", inn, purpose, type(exc).__name__)
+                    logger.error("ИНН %s, %s: ошибка обновления (%s; %s)", inn, purpose,
+                                 type(exc).__name__, safe_diagnostic(exc))
 
         if pending:
             path, attempts = self._load_attempts()
@@ -114,12 +115,15 @@ class TokenRefreshWorker:
             inn, purpose, connection, oms, scope, token_format, _ = item
             attempts[self._attempt_key(item)] = max(attempts.values(), default=0) + 1
             self._save_attempts(path, attempts)
+            issued = False
+            runtime.suz_post_attempted = False
             try:
                 with runtime.budget(self.scope_seconds):
                     runtime.assert_owner()
                     with runtime.budget(self.scope_seconds - self.publish_reserve):
                         record = issue_token(inn, purpose=purpose, token_format=token_format,
                                              connection_id=connection, oms_id=oms, config=self.config)
+                        issued = True
                     runtime.assert_owner()
                     self.tp.save_record(record)
                     if self.tp.get_token_value_for(inn, purpose, **scope) != record.token:
@@ -128,9 +132,13 @@ class TokenRefreshWorker:
                     logger.info("ИНН %s, %s: проверен и опубликован", inn, purpose)
             except (Exception, DeadlineExpired) as exc:
                 failed += 1
-                if purpose == 'suz':
+                if purpose == 'suz' and (issued or runtime.suz_post_attempted
+                        or isinstance(exc, TokenIssuanceError) and exc.outcome_unknown
+                        or getattr(exc, 'issuance_response_invalid', False) is True):
                     logger.error("СУЗ: выдача или публикация не подтверждена; прежний токен подключения мог быть отозван")
-                logger.error("ИНН %s, %s: ошибка обновления (%s)", inn, purpose, type(exc).__name__)
+                logger.error("ИНН %s, %s: ошибка обновления (%s; %s)", inn, purpose,
+                             type(exc).__name__, safe_diagnostic(exc) if not issued or isinstance(exc, TokenIssuanceError)
+                             else 'stage=publication reason=publication_failed')
                 runtime.check()
 
         logger.info("Цикл завершён: актуальны=%s, обновлены=%s, ошибки=%s, отложены=%s",
@@ -180,7 +188,7 @@ def main(argv=None):
         with master_runtime():
             return 0 if TokenRefreshWorker().check_and_refresh() else 1
     except (Exception, MasterStopped) as exc:
-        logger.error("Цикл обновления токенов не выполнен: %s", exc)
+        logger.error("Цикл обновления токенов не выполнен: %s; %s", type(exc).__name__, safe_diagnostic(exc))
         return 1
 
 

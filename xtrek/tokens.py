@@ -141,7 +141,7 @@ class TokenProcessor(PurposeTokenAccess):
             self._apply_tokens(snapshot)
             logger.debug("Снимок токенов загружен из S3")
         except Exception as exc:
-            logger.error("Не удалось получить актуальные токены из S3: %s", exc)
+            logger.error("Не удалось получить актуальные токены из S3: stage=registry_sync reason=storage_failed (%s)", type(exc).__name__)
             raise RuntimeError("Актуальные токены из S3 недоступны; выполнение xTrek запрещено") from exc
 
     def refresh_from_source(self):
@@ -172,9 +172,9 @@ class TokenProcessor(PurposeTokenAccess):
             return True
         except Exception as exc:
             if required:
-                logger.error("Не удалось получить актуальные токены из S3: %s", exc)
+                logger.error("Не удалось получить актуальные токены из S3: stage=registry_sync reason=storage_failed (%s)", type(exc).__name__)
                 raise RuntimeError("Актуальные токены из S3 недоступны") from exc
-            logger.debug("Серверный режим не загрузил tokens.json из S3: %s", exc)
+            logger.debug("Серверный режим не загрузил tokens.json из S3: stage=registry_sync reason=storage_failed (%s)", type(exc).__name__)
             return False
 
     def _sync_to_s3(self):
@@ -185,7 +185,7 @@ class TokenProcessor(PurposeTokenAccess):
         try:
             self.storage.upload(self.file_path, self.tokens_path)
         except Exception as exc:
-            logger.error("Новый комплект токенов не опубликован в S3: %s", exc)
+            logger.error("Новый комплект токенов не опубликован в S3: stage=publication reason=storage_failed (%s)", type(exc).__name__)
             raise RuntimeError("Не удалось опубликовать tokens.json в S3") from exc
 
     def _write_tokens_file_atomic(self):

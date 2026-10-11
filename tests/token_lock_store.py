@@ -7,20 +7,28 @@ from uuid import uuid4
 class MemoryLockStore:
     def __init__(self):
         self.lock_object = None
+        self._primary_path = None
+        self.objects = {}
 
     @property
     def locked(self):
         return self.lock_object is not None and json.loads(self.lock_object[0])['state'] == 'held'
 
     def read_lock_object(self, path):
-        return self.lock_object
+        if self._primary_path is None:
+            self._primary_path = path
+        return self.lock_object if path == self._primary_path else self.objects.get(path)
 
     def write_lock_object(self, path, content, etag):
-        current = self.lock_object[1] if self.lock_object else None
+        previous = self.read_lock_object(path)
+        current = previous[1] if previous else None
         if current != etag:
             return None
         tag = str(uuid4())
-        self.lock_object = (content, tag)
+        if path == self._primary_path:
+            self.lock_object = (content, tag)
+        else:
+            self.objects[path] = (content, tag)
         return tag
 
 

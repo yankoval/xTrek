@@ -78,6 +78,14 @@ def test_token_challenge_attached(credentials, tmp_path, format_name):
     verify_cryptcp(signature, data.encode("utf-8"), False, tmp_path)
 
 
+@pytest.mark.skipif(not os.environ.get('XTREK_SIGN_TEST_INN'), reason='Opt in with the certificate organization INN')
+def test_auth_certificate_identity_and_crl_validation(credentials, tmp_path):
+    data = CHALLENGE.encode()
+    signature = sign.sign_token_data(data, expected_inn=os.environ['XTREK_SIGN_TEST_INN'], **credentials)
+    verify_python(signature, data, False)
+    verify_cryptcp(signature, data, False, tmp_path)
+
+
 def test_suz_ping_detached(credentials, tmp_path):
     path = "/api/v3/ping?omsId=11111111-1111-4111-8111-111111111111"
     signature = sign.sign_token_data(path, detached=True, **credentials)
