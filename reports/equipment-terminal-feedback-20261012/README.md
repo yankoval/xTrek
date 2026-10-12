@@ -1,7 +1,7 @@
 # Equipment terminal feedback — review evidence, 2026-10-12
 
 Initial base: `0124f9815c243dd0fe4e4490f75e3b30ed802ba3` (PR #112).
-Current integrated main: `834ff1b38fab930251c25ca4df40b1e4181d45e9` (PR #114).
+Current integrated main: `52f0b1ee81759aa17b67485eeda0c38cb32fe7f6` (PR #115).
 Branch: `codex/equipment-terminal-feedback`.
 
 ## Consolidation
@@ -27,7 +27,7 @@ No new phone-task schema flags or changes to MAX JSON-link delivery were introdu
 
 - **27 regression cases** cover unlimited source -> equipment JSON with SSCC ->
   GET-confirmed MAX link, no terminal feedback, restart/repeat idempotency, emission
-  no-op, explicit-zero distinction and unchanged malformed-report validation.
+  rejection without side effects, explicit-zero distinction and unchanged malformed-report validation.
 - Failure after allocation before publication reuses the saved SSCC with no second
   allocator call. Lost allocator reply retries the same mTLS request ID; the service
   returns the same issued SSCC. Old unmarked uncertain guards stay held.
@@ -43,6 +43,20 @@ No new phone-task schema flags or changes to MAX JSON-link delivery were introdu
 - The full command uses the previous interpreter with PYTHONPATH pointing to the
   isolated XlsxWriter directory and this complete worktree. The same ten opt-in
   Linux CSP certificate tests remain skipped.
+
+## PR #115 integration verification
+
+- Preserve PR #115 source routing and INN filter behavior, including original source
+  Quantity checks before emission and one SSCC for unlimited tasks.
+- Share the unlimited predicate; direct emission rejects an unlimited order without
+  writing an artifact or making a business POST.
+- Correct test isolation: keep the real Kombu module for real Celery regression tests,
+  and inject the router storage in the source-to-MAX integration test.
+- Focused conflict regression: **127 passed**.
+- Full suite: **1157 passed, 10 skipped, 14 subtests passed**.
+  [Full log](main115-full-tests.txt).
+- The user authorized merge and full-main production release on 2026-10-12.
+  Production release is sequenced after the creation chat's PR #115 release/recovery.
 
 ## Previous revision verification (c5f64d2)
 
@@ -88,9 +102,8 @@ The operator/chat confirmation table is in the runbook. No actual assignments ar
 assumed from other MAX features. Legacy CIS relationships must be confirmed exactly.
 The example service/timer is not installed or enabled.
 
-Production remains at the user-reported full main `0124f9815c243dd0fe4e4490f75e3b30ed802ba3`;
-its running processes were not inspected or changed in this task. No merge/release,
-source replay, business POST, guard reset, protected-task recovery or chat message
-was performed. Exact-head approval and separate full-main release/activation approval
-are still required. Preserve all current state on rollback; an old binary cannot
-safely resume consumers with new terminal fences/persistence-only retry messages.
+Production activation is tracked separately from this source verification. No
+production mutation was performed to prepare this integration. The example routing
+configuration remains disabled until actual operator/chat destinations are known.
+Preserve all current state on rollback; an old binary cannot safely resume consumers
+with new terminal fences/persistence-only retry messages.

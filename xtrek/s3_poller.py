@@ -159,6 +159,12 @@ class S3EventPoller:
             source = json.loads(response["Body"].read())
         finally:
             response["Body"].close()
+        quantity = source.get("Quantity")
+        if quantity is None or (isinstance(quantity, str) and not quantity.strip()):
+            # Equipment-only tasks must reach the router even when their INN is
+            # outside the local signer allowlist. The router skips all signing
+            # and code issuance for this source state.
+            return True
         inn = str((source.get("PasportData") or {}).get("Manufacturer_inn") or "")
         if inn not in self.allowed_inns:
             LOG.info("Skipping source outside local signer allowlist: key=%s", key)

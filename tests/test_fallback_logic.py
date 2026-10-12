@@ -53,6 +53,35 @@ def test_process_incoming_task_fallback_to_product_info(mock_token_proc, mock_or
     # Verify that the normalized task was uploaded
     mock_storage.upload.assert_called()
 
+
+@pytest.mark.parametrize("quantity_state", ["missing", "null", "empty"])
+def test_process_incoming_task_preserves_unlimited_quantity(quantity_state, monkeypatch):
+    import xtrek.create_emission_task_sample as module
+
+    source = {"Gtin": "04680328040887", "PasportData": {"Batch_number": "BATCH1"}, "Article": "ART1"}
+    if quantity_state == "null":
+        source["Quantity"] = None
+    elif quantity_state == "empty":
+        source["Quantity"] = ""
+    storage = MagicMock()
+    storage.get_tags.return_value = {}
+    storage.read_text.return_value = json.dumps(source)
+    saved = {}
+    monkeypatch.setattr(module, "load_config", lambda *_: {"production_orders_path": "s3://bucket/prod", "s3_config": {}, "allowed_gtins": ["04680328040887"]})
+    monkeypatch.setattr(module, "get_storage", lambda *_: storage)
+    monkeypatch.setattr(module, "get_inn_by_gtin", lambda *_, **__: "7733154124")
+    monkeypatch.setattr(module, "OrganizationManager", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(module, "TokenProcessor", lambda *_args, **_kwargs: MagicMock(get_token_value_for=MagicMock(return_value="token")))
+    monkeypatch.setattr(module, "get_product_info_robust", lambda *_args, **_kwargs: {"result": [{"is_set": True}]})
+    monkeypatch.setattr(module, "_publish_json_result", lambda _storage, path, _target: saved.update(json.loads(open(path, encoding="utf-8").read())))
+
+    assert module.process_incoming_task("s3://bucket/tasks/task1.json")
+    assert ("Quantity" in saved) == (quantity_state != "missing")
+    if quantity_state == "null":
+        assert saved["Quantity"] is None
+    elif quantity_state == "empty":
+        assert saved["Quantity"] == ""
+
 @patch("xtrek.create_emission_task_sample.load_config")
 @patch("xtrek.create_emission_task_sample.get_storage")
 @patch("xtrek.create_emission_task_sample.get_inn_by_gtin")

@@ -49,6 +49,7 @@ def test_source_to_json_to_max_unlimited_with_one_durable_sscc(
     storage.write_text(f's3://{TASK_BUCKET}/{key}', json.dumps(source))
     monkeypatch.setattr(flow, 'load_config', lambda *_: tasks.config)
     monkeypatch.setattr(flow, 'get_storage', lambda *_: storage)
+    monkeypatch.setattr(tasks, 'get_storage', lambda *_: storage)
     monkeypatch.setattr(operation_state, 'get_storage', lambda *_: storage)
     monkeypatch.setattr('xtrek.storage.get_storage', lambda *_: storage)
     allocations = {}
@@ -152,7 +153,7 @@ def test_direct_emission_entrypoint_is_noop_for_unlimited_source(monkeypatch, fi
     external = MagicMock(side_effect=AssertionError('No business API or artifact'))
     monkeypatch.setattr(flow, 'get_inn_by_gtin', external)
     monkeypatch.setattr(flow, '_publish_json_result', external)
-    assert flow.create_emission_task('T-unlimited', 'chemistry', 'scan') == 'T-unlimited'
+    assert flow.create_emission_task('T-unlimited', 'chemistry', 'scan') is None
     external.assert_not_called()
     storage.upload.assert_not_called()
 
