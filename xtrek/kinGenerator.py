@@ -56,22 +56,12 @@ class KinReportGenerator:
             # Первая часть содержит GTIN и короткий код
             main_part = parts[0]
 
-            # Ищем позицию идентификатора 21 (код товара)
-            pos_21 = main_part.find('21')
-            if pos_21 == -1:
-                logger.warning("В полной маркировке не найден идентификатор '21'")
+            # AI 21 follows AI 01 and the 14-digit GTIN; it may also occur inside GTIN.
+            if (not main_part.startswith('01') or not main_part[2:16].isdigit()
+                    or main_part[16:18] != '21' or not main_part[18:]):
+                logger.error("Некорректный код маркировки: ожидается 01 + GTIN + 21 + серийный номер")
                 return None
-
-            # Извлекаем 6 символов после '21'
-            short_code_start = pos_21 + 2
-            short_code_end = short_code_start + 6
-
-            if short_code_end <= len(main_part):
-                short_code = main_part[short_code_start:short_code_end]
-                return short_code
-            else:
-                logger.warning("Не удалось извлечь 6 символов после '21'. Код слишком короткий")
-                return None
+            return main_part[18:]
 
         except Exception as e:
             logger.error(f"Ошибка при извлечении короткого кода: {e}")
@@ -204,8 +194,17 @@ class KinReportGenerator:
         for filename in sorted(self.uploaded_files.keys()):
             data = self.uploaded_files[filename]
             if 'codes' in data and data.get('codes'):
-                if data['codes'] and gtin in data['codes'][0]:
-                    all_codes.extend(data['codes'])
+                codes = data['codes']
+                if not isinstance(codes, list):
+                    raise ValueError("Поле codes должно быть списком")
+                for code in codes:
+                    if not self.extract_short_code(code):
+                        raise ValueError("В загруженном файле есть некорректный код маркировки")
+                    if code[2:16] == gtin:
+                        all_codes.append(code)
+        identifiers = [code.split('\x1d')[0] for code in all_codes]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError(f"Повторные коды для GTIN {gtin}; проверьте загруженные файлы")
 
         if not all_codes:
             logger.warning(f"Не найдены коды для GTIN {gtin}")
@@ -233,14 +232,25 @@ class KinReportGenerator:
                             kit_gtins.append(kit_gtin)
                 break
 
+        if main_data:
+            sets = [pack for level in main_data['Hierarchy']
+                    if level['LevelType'] == 'Kigu' for pack in level['Packs']]
+            if len(sets) != 1 or kigu_gtin in kit_gtins:
+                raise ValueError("Рецепт должен содержать один GTIN набора и отдельные GTIN вложений")
+            expected = sets[0].get('CountPacksInside')
+            if expected is not None and (type(expected) is not int or expected <= 0
+                                         or expected != len(kit_gtins)):
+                raise ValueError(f"Неполный состав: CountPacksInside={expected}, строк Kit={len(kit_gtins)}. "
+                                 "В рецепте нужна отдельная строка на каждую единицу вложения")
         return main_data, kigu_gtin, kit_gtins
 
-    def generate_kin_report(self, file_names, num_kits=None):
+    def generate_kin_report(self, file_names, num_kits=None, *, strict_quantity=False):
         """
         Основная процедура для генерации КИН отчета
         """
         logger.info("Запуск генерации КИН отчета...")
 
+        self.uploaded_files = {}
         # Загружаем файлы
         if not self.load_files(file_names):
             logger.error("Не удалось загрузить файлы")
@@ -308,8 +318,8 @@ class KinReportGenerator:
         if max_kits == 0:
             logger.error("Недостаточно кодов для создания наборов")
             logger.error(f"   Коды Kigu: {len(kigu_codes)}")
-            for i, kit_codes in enumerate(all_kit_codes):
-                logger.error(f"   Коды Kit {kit_gtins[i]}: {len(kit_codes)}")
+            for gtin, codes in kit_codes_by_gtin.items():
+                logger.error(f"   Коды Kit {gtin}: {len(codes)}; на набор нужно {gtin_counts[gtin]}")
             return None
 
         logger.info("Доступно кодов:")
@@ -318,12 +328,18 @@ class KinReportGenerator:
             logger.info(f"   - Kit ({gtin}): {len(codes)} продуктов")
         logger.info(f"Максимально можно создать: {max_kits} наборов")
 
-        # Определяем количество наборов для генерации
+        # The bot requires enough components for every SET unless an explicit quantity is given.
         if num_kits is None:
-            num_kits = max_kits
-        elif num_kits > max_kits:
-            logger.warning(f"Запрошено {num_kits} наборов, но доступно только {max_kits}")
-            num_kits = max_kits
+            num_kits = len(kigu_codes) if strict_quantity else max_kits
+        if type(num_kits) is not int or num_kits <= 0:
+            logger.error("Количество наборов должно быть положительным целым числом")
+            return None
+        if num_kits > max_kits:
+            logger.error(f"Запрошено {num_kits} наборов, но полностью укомплектовать можно только {max_kits}")
+            for gtin, count in gtin_counts.items():
+                logger.error(f"GTIN {gtin}: нужно {num_kits * count}, загружено {len(kit_codes_by_gtin[gtin])}")
+            return None
+        logger.info(f"Неиспользованных кодов наборов останется: {len(kigu_codes) - num_kits}")
 
         logger.info(f"Генерация {num_kits} наборов...")
 
@@ -431,13 +447,14 @@ class KinReportGenerator:
         }
 
 # Функция для вызова из внешних модулей
-def generate_kin_report_from_files(file_names, num_kits=None):
+def generate_kin_report_from_files(file_names, num_kits=None, *, strict_quantity=False):
     """
     Генерирует КИН отчет из указанных файлов
     
     Args:
         file_names: список путей к JSON файлам
         num_kits: количество наборов (None - максимальное доступное)
+        strict_quantity: при num_kits=None требовать вложения для всех кодов набора
     
     Returns:
         str: путь к созданному файлу отчета или None при ошибке
@@ -445,7 +462,7 @@ def generate_kin_report_from_files(file_names, num_kits=None):
     try:
         logger.info("Вызов generate_kin_report_from_files")
         generator = KinReportGenerator()
-        return generator.generate_kin_report(file_names, num_kits)
+        return generator.generate_kin_report(file_names, num_kits, strict_quantity=strict_quantity)
     except Exception as e:
         logger.error(f"Критическая ошибка при генерации отчета: {e}")
         return None
