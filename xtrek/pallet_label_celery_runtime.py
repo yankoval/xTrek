@@ -44,15 +44,6 @@ def validate_source(report_id, source, source_head, settings):
     inn = str((source.get('PasportData') or {}).get('Manufacturer_inn') or '')
     if inn not in settings['allowed_inns']:
         raise ValueError('Unconfigured INN')
-    raw_quantity = source.get('Quantity')
-    from decimal import Decimal, InvalidOperation
-    try:
-        quantity = Decimal(str(raw_quantity).strip()) if not isinstance(raw_quantity, bool) else Decimal(0)
-        positive = quantity.is_finite() and quantity > 0 and quantity == quantity.to_integral_value()
-    except InvalidOperation:
-        positive = False
-    if not positive:
-        raise ValueError('Blank/nonpositive quantity is notification only')
 
 
 def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=None):

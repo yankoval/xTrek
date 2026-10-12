@@ -14,8 +14,10 @@ Celery send task.
 
 Provision configuration with task/report buckets, three explicitly allowed INNs,
 exact `backlog_report_ids`/`backlog_source_uuids`, a UTC source cutoff, and the two
-`previously_delivered_report_ids`. Blank/nonpositive Quantity and the protected
-uncertain UUID are excluded. Report/task schema and assigned SSCCs must agree;
+`previously_delivered_report_ids`. The protected uncertain UUID is excluded.
+Production-order `Quantity` controls emission/printing preparation only; it does
+not restrict equipment-report quantities or pallet PNG delivery. Label box and
+product counts come from the actual scanned report. Report/task schema and assigned SSCCs must agree;
 each pallet retains its existing assigned Fito SSCC (including historical extension 0), without allocating
 another number. S3 reads use HEAD ETag + conditional GET.
 
@@ -41,8 +43,9 @@ For the human-authorized full undelivered backlog, inventory all reports and pla
 every valid report/task join in `backlog_report_ids`, then set
 `all_valid_assigned_reports: true`. This uses quantities from scanned report boxes
 and preserves existing pallet assignments; it never creates equipment or print
-jobs from blank Quantity sources. Future sources keep the explicit cutoff/positive
-Quantity guard. Invalid joins and uncertain POSTs remain held.
+jobs from blank Quantity sources. Reports from those sources still receive pallet
+PNGs when the report/task join and assigned SSCCs are valid. Future sources keep
+the explicit cutoff guard. Invalid joins and uncertain POSTs remain held.
 
 For a large available MAX history, `scan_history_batch` saves a durable VPS-only
 checkpoint after every page and resumes in bounded batches until the server's

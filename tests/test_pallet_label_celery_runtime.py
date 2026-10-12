@@ -25,9 +25,8 @@ def test_exact_backlog_source_allowed():
 
 
 @pytest.mark.parametrize('quantity', ['', 0, None])
-def test_blank_or_nonpositive_never_prints(quantity):
-    with pytest.raises(ValueError, match='notification only'):
-        validate_source(RID, source(quantity), {}, settings())
+def test_report_delivery_does_not_depend_on_order_quantity(quantity):
+    validate_source(RID, source(quantity), {}, settings())
 
 
 def test_protected_uuid_never_delivered():
