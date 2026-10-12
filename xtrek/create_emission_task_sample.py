@@ -33,6 +33,7 @@ from .crpt_auth import get_new_token
 from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
+from .equipment_task_contract import unlimited_aggregation_source
 from .utilisation_attributes import build_utilisation_attributes
 from .production_order_identity import safe_production_order_component
 from .sign import DocumentSigner, SigningError
@@ -87,7 +88,7 @@ def _publish_json_result(storage, temporary, destination, initial_tags=None):
 
 def is_unlimited_equipment_quantity(value):
     """Missing/null/blank quantity selects equipment-only aggregation."""
-    return value is None or (isinstance(value, str) and not value.strip())
+    return unlimited_aggregation_source({'Quantity': value})
 
 
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
@@ -705,7 +706,6 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         gtin = prod_data.get('Gtin')
-
         if is_unlimited_equipment_quantity(prod_data.get('Quantity')):
             raise ValueError(
                 "Emission task is disabled for an unlimited equipment quantity"
@@ -3818,6 +3818,8 @@ def create_equipment_aggregation_task(production_order_id: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         pasport = prod_data.get('PasportData', {})
+        if unlimited_aggregation_source(prod_data) and not config.get('operation_state_path'):
+            raise RuntimeError('Unlimited task SSCC requires durable operation state')
         pallet_assignment = _allocate_task_pallets(production_order_id, prod_data, config)
 
         # Поле id теперь совпадает с production_order_id (без расширения .json)
@@ -5828,6 +5830,7 @@ update_emission_order_status = guarded('poll-emission-status',
 
 for _name, (_operation, _input, _resume) in _GUARDED_WORKFLOWS.items():
     globals()[_name] = guarded(_operation, input_path=_input, resume=_resume,
+                              retry_idempotent_external=_name == '_allocate_task_pallets',
                               cache_none=_name == 'create_virtual_production_tasks',
                               config_loader=lambda name: load_config(name))(globals()[_name])
 

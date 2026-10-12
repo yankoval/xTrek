@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "enabled": false,
+  "ledger_path": "/var/lib/xtrek/terminal-feedback/events.sqlite3",
+  "operator_routes": {
+    "EXACT_OPERATOR_A": "line-a",
+    "EXACT_OPERATOR_B": "line-b",
+    "EXACT_OPERATOR_SHARED": "$default"
+  },
+  "default_route": "line-a",
+  "routes": {
+    "line-a": {
+      "transport": "max",
+      "chat_id": "CONFIRM_CHAT_A",
+      "bot_user_id": "CONFIRM_BOT_ID",
+      "token_env": "XTREK_FEEDBACK_MAX_TOKEN",
+      "ca_file": "/etc/xtrek/max-ca.pem"
+    },
+    "line-b": {
+      "transport": "max",
+      "chat_id": "CONFIRM_CHAT_B",
+      "bot_user_id": "CONFIRM_BOT_ID",
+      "token_env": "XTREK_FEEDBACK_MAX_TOKEN",
+      "ca_file": "/etc/xtrek/max-ca.pem"
+    }
+  },
+  "production_order_overrides": {},
+  "protected_ids": ["623c20fa-f90c-4478-aeae-9c6635cedc9f"],
+  "max_history_pages": 100
+}

@@ -223,7 +223,7 @@ def test_generated_marker_requires_matching_local_allocation_request(monkeypatch
 def test_runtime_requires_shared_prefix_for_every_inn(monkeypatch, inn):
     runtime = install_fake_prnsrv(monkeypatch)
     monkeypatch.setenv('XTREK_LOCAL_ALLOWED_INNS', inn)
-    monkeypatch.setattr(runtime, '_load_source', lambda *_: {'PasportData': {'Manufacturer_inn': inn}})
+    monkeypatch.setattr(runtime, '_load_source', lambda *_: {'Quantity': '1', 'PasportData': {'Manufacturer_inn': inn}})
     config = {'prnsrv_local_generator_enabled': True, 's3_config': {}, 'sscc_prefix': PREFIX,
               'prnsrv_local_allocator_by_inn': {inn: {'prefix': '123456789'}}}
     with pytest.raises(Exception, match='shared SSCC prefix'):

@@ -1,0 +1,25 @@
+........................................................................ [  6%]
+........................................................................ [ 12%]
+........................................................................ [ 19%]
+........................................................................ [ 25%]
+........................................................................ [ 32%]
+........................................................................ [ 38%]
+........................................................................ [ 45%]
+........................................................................ [ 51%]
+........................................................................ [ 58%]
+......................................................ssssssssss........ [ 64%]
+........................................................................ [ 70%]
+........................................................................ [ 77%]
+........................................................................ [ 83%]
+.......................................................... [ 89%]
+........................................................................ [ 95%]
+..................................................                       [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_sign_integration.py:58: Requires opt-in Linux CSP certificate via XTREK_SIGN_TEST_THUMBPRINT
+SKIPPED [3] tests/test_sign_integration.py:72: Requires opt-in Linux CSP certificate via XTREK_SIGN_TEST_THUMBPRINT
+SKIPPED [1] tests/test_sign_integration.py:81: Opt in with the certificate organization INN
+SKIPPED [1] tests/test_sign_integration.py:89: Requires opt-in Linux CSP certificate via XTREK_SIGN_TEST_THUMBPRINT
+SKIPPED [2] tests/test_sign_integration.py:96: Requires opt-in Linux CSP certificate via XTREK_SIGN_TEST_THUMBPRINT
+SKIPPED [1] tests/test_sign_integration.py:107: Requires opt-in Linux CSP certificate via XTREK_SIGN_TEST_THUMBPRINT
+SKIPPED [1] tests/test_sign_integration.py:116: Requires opt-in Linux CSP certificate via XTREK_SIGN_TEST_THUMBPRINT
+1106 passed, 10 skipped, 14 subtests passed in 16.74s
