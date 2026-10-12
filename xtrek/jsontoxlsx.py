@@ -38,10 +38,12 @@ def convert_json_to_xlsx(input_json, output_xlsx=None):
         raise FileNotFoundError(f"Файл не найден: {input_path}")
 
     # Читаем данные
-    with open(input_path, 'r', encoding='utf-8') as f:
+    with open(input_path, 'r', encoding='utf-8-sig') as f:
         data = json.load(f)
     
-    raw_codes = data.get("productNumbersFull", [])
+    raw_codes = data.get("productNumbersFull")
+    if raw_codes is None:
+        raw_codes = data.get("codes", [])
     
     # Создаем Excel
     workbook = xlsxwriter.Workbook(str(output_path))
