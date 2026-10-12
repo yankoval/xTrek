@@ -3,6 +3,7 @@ import json
 import re
 from functools import partial
 from celery import Celery
+from celery.exceptions import Reject, Retry
 from celery.signals import task_postrun, task_prerun, worker_ready
 from kombu import Queue
 from urllib.parse import quote, urlparse
@@ -62,6 +63,9 @@ from xtrek.suz_api_models import (
     EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
 )
 from .operation_state import guarded, OperationConflict, ReconciliationRequired
+from .terminal_feedback import (TerminalBusinessError, TerminalRecorded, classify,
+                                event_identity, source_stage)
+from .terminal_feedback_runtime import worker_ledger
 
 # 2. Настройки доступа
 ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
@@ -352,8 +356,9 @@ def trigger_set_aggregation_if_ready(parent_id):
         return f"Set {parent_id} not ready yet"
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 1bf11148... / ПАПКА: Задания ---
-class CisInformationChangeRejected(RuntimeError):
+class CisInformationChangeRejected(TerminalBusinessError):
     """An existing correction document was definitively rejected by True API."""
+    category = "cis_rejected"
 
 
 def logic_send_cis_information_change(full_key):
@@ -371,6 +376,8 @@ def logic_update_cis_information_change(full_key):
     # responses must never be accepted as either successful or terminal.
     target = result[0] if isinstance(result, list) and len(result) == 1 else result
     status = target.get("status") if isinstance(target, dict) else None
+    if isinstance(target, dict) and "error" in target:
+        raise RuntimeError("CIS_INFORMATION_CHANGE status not confirmed")
     if status == "CHECKED_NOT_OK":
         # The status updater has already persisted the API response and tag.
         # Leave receipts and send guards intact; fail the task without resending
@@ -593,8 +600,10 @@ def logic_update_introduce(full_key):
     if isinstance(result, dict) and "error" in result:
         print("Ошибка API при запросе статуса")
         raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id}  result:{result}")
-    result = result[0] if isinstance(result, list) and len(result) > 0 else result
-    if isinstance(result, dict) and result.get('status')== 'CHECKED_OK':
+    result = result[0] if isinstance(result, list) and len(result) == 1 else result
+    if isinstance(result, dict) and "error" not in result and result.get('status') == 'CHECKED_NOT_OK':
+        raise TerminalBusinessError("Introduction document rejected")
+    if isinstance(result, dict) and "error" not in result and result.get('status') == 'CHECKED_OK':
         prod_id = result.get('productionOrderId') or _find_production_order_id_by_suz_order_id(introduceReceipt_id)
         if not prod_id:
             return f"introduce status for {introduceReceipt_id} is CHECKED_OK, but prod_id not found"
@@ -663,18 +672,12 @@ def logic_start_equipment_reports(full_key):
                     report_path,
                     "true-api-403-forbidden",
                 )
-                return (
-                    f"Обработка отчета оборудования {production_order_id} "
-                    f"остановлена без retry: {api_error}"
-                )
+                raise TerminalBusinessError("Report authorization requires reconciliation")
             raise RuntimeError(
                 f"equipment report precheck True API failure for "
                 f"{production_order_id}: {api_error}"
             )
-        return (
-            f"Отчет оборудования об агрегации {production_order_id} "
-            f"пропускаем. Найдены ошибки: {error}."
-        )
+        raise TerminalBusinessError("Report business validation requires reconciliation")
     
     # Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство
     print(f"Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство")
@@ -702,7 +705,7 @@ def logic_start_equipment_reports(full_key):
         if not vtResult:
             print(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
             print(f"Дальнейшая обработка в автомате невозможна. Отчет оборудования f{report_id}.")
-            return(f"Ошибка при попытке создания виртуальных заданий на производство по отчету оборудования f{report_id}.")
+            raise RuntimeError("Virtual task prerequisites are not confirmed")
     
     print(f" Успешно обработан отчет оборудования {report_id}")
 
@@ -731,19 +734,13 @@ def _aggregate_operation_precheck(result, report_id, operation):
                     report_path,
                     "true-api-403-forbidden",
                 )
-                return (
-                    f"Обработка отчета оборудования {report_id} остановлена "
-                    f"без retry: {api_error}"
-                )
+                raise TerminalBusinessError("Report authorization requires reconciliation")
             raise RuntimeError(
                 f"{operation} report precheck True API failure for "
                 f"{report_id}: {api_error}"
             )
 
-    return (
-        f"Отчет оборудования {operation} {report_id} пропускаем. "
-        f"Найдены ошибки: {error}."
-    )
+    raise TerminalBusinessError("Report business validation requires reconciliation")
 
 
 def _aggregate_operation_status_target(result, operation, task_id):
@@ -755,12 +752,14 @@ def _aggregate_operation_status_target(result, operation, task_id):
         raise RuntimeError(
             f"update_{operation}_status failed for {task_id}: {result}"
         )
-    target = result[0] if isinstance(result, list) and result else result
-    if not isinstance(target, dict):
+    target = result[0] if isinstance(result, list) and len(result) == 1 else result
+    if not isinstance(target, dict) or "error" in target:
         raise RuntimeError(
             f"update_{operation}_status returned unexpected result for "
             f"{task_id}: {result}"
         )
+    if target.get("status") == "CHECKED_NOT_OK":
+        raise AggregationDocumentRejected("Aggregate operation rejected")
     return target
 
 
@@ -780,10 +779,7 @@ def _finish_aggregate_operation_report(operation, task_id, check_result):
             )
         if check_result.get("finished"):
             return f"{operation} {task_id} finished and report tagged"
-    return (
-        f"{operation} {task_id} status is CHECKED_OK, but final report "
-        f"check stopped with errors: {check_result}"
-    )
+    raise TerminalBusinessError("Final report validation requires reconciliation")
 
 
 # --- Расформирование агрегата: equipment report -> task -> receipt/status ---
@@ -913,8 +909,9 @@ def logic_start_virtualProdTask_emission(full_key):
         raise RuntimeError(f"create_emission_task failed for {production_order_id}")
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: aggSetReceipts/ ---
-class AggregationDocumentRejected(ReconciliationRequired):
+class AggregationDocumentRejected(TerminalBusinessError):
     """A rejected aggregation requires operator reconciliation, not a retry."""
+    category = "aggregation_rejected"
 
 
 def _require_checked_aggregation_status(result, production_order_id, operation):
@@ -982,18 +979,32 @@ for _route_name in tuple(name for name in globals() if name.startswith('logic_')
     globals()[_route_name] = guarded('route-' + _route_name, cache_none=True,
                                      config_loader=lambda name: config)(globals()[_route_name])
 
+def _retry_terminal_persistence(task, data, category):
+    try:
+        raise task.retry(args=(), kwargs={'data': data, 'terminal_failure': category},
+                         exc=RuntimeError('Terminal ledger unavailable'), countdown=60,
+                         max_retries=None)
+    except Retry:
+        raise
+    except Exception:
+        # If even the durable retry cannot be published, preserve the original
+        # RabbitMQ delivery. Existing business send guards remain authoritative.
+        raise Reject('Terminal persistence retry was not published', requeue=True) from None
+
+
 @app.task(
     name='tasks.process_s3_event',
     bind=True,
     acks_late=True,
     autoretry_for=(Exception,),
-    dont_autoretry_for=(OperationConflict, ReconciliationRequired, CisInformationChangeRejected),
+    dont_autoretry_for=(OperationConflict, ReconciliationRequired, CisInformationChangeRejected, Reject),
+    max_retries=None,  # Persistence-only retries must not lose a terminal event.
     retry_kwargs={'max_retries': 200}, # Увеличено до 200 для ожидания до 12+ часов
     retry_backoff=60,                 # 60, 120, 240, 300...
     retry_backoff_max=300,
     retry_jitter=True
 )
-def process_s3_event(self, data):
+def process_s3_event(self, data, terminal_failure=None):
     bucket = data.get('bucket')
     key = data.get('key') or ""
 
@@ -1007,6 +1018,21 @@ def process_s3_event(self, data):
         if not key.startswith(event_prefix):
             return "Skipped: Outside configured prefix"
         key = key[len(event_prefix):]
+    # Check the terminal ledger before guarded business work. A lost acknowledgement
+    # or replay cannot turn a recorded terminal failure back into a business retry.
+    try:
+        feedback_ledger = worker_ledger(config, bucket, key)
+        if terminal_failure is not None:
+            if feedback_ledger is None:
+                raise RuntimeError('Terminal persistence requires enabled configuration')
+            feedback_ledger.record(bucket, data['key'], source_stage(key), terminal_failure)
+        recorded = feedback_ledger and feedback_ledger.get(event_identity(bucket, data['key']))
+    except Exception:
+        # Celery preserves this intent in the durable retry message. No business
+        # route is entered while the ledger cannot be read/written.
+        return _retry_terminal_persistence(self, data, terminal_failure)
+    if recorded:
+        raise TerminalRecorded('Equipment processing requires reconciliation')
     print(f"\n[ROUTER] Новое событие S3: {full_key}")
 
     try:
@@ -1108,9 +1134,16 @@ def process_s3_event(self, data):
             return "Skipped: No match"
 
     except Exception as e:
-        print(f"[ERROR] Критическая ошибка: {e}")
-        # Celery перехватит это и сделает retry (если настроено) или залогирует
-        raise e
+        category = classify(e, retries=getattr(getattr(self, 'request', None), 'retries', 0),
+                            retry_limit=200)
+        if category and feedback_ledger:
+            try:
+                feedback_ledger.record(bucket, data['key'], source_stage(key), category)
+            except Exception:
+                return _retry_terminal_persistence(self, data, category)
+            raise TerminalRecorded('Equipment processing requires reconciliation') from None
+        print(f"[ERROR] Processing failed: {type(e).__name__}")
+        raise
 
 
 @app.task(name='tasks.deliver_pallet_report', bind=True, acks_late=True,

@@ -1,0 +1,18 @@
+{
+  "base_main": "0124f9815c243dd0fe4e4490f75e3b30ed802ba3",
+  "python": "3.14.0",
+  "celery": "5.6.3",
+  "pytest": "9.1.1",
+  "sha256": {
+    "xtrek/tasks.py": "319c27c12afda49198f5b81158930b794acd27dca244818b8c666c8fb9d223ec",
+    "xtrek/utils.py": "084b8437c89f6f11f2cb10a7a177c0b341828d2373f1a6dfe46bfc000c9edaee",
+    "xtrek/terminal_feedback.py": "03e2acfffe203b7be7fd22f55fef09363cc3a76dbdfb21ecea0a71af0517e971",
+    "xtrek/terminal_feedback_max.py": "49f19d7cdd85fb240a7e7b5863b3c7462d6fd4057ee80f76b3f87de8a3c27f37",
+    "xtrek/terminal_feedback_runtime.py": "fae744f057c8d0d5705e15c10277ba48df7fceae4e37d267f508947d6790d485",
+    "tests/test_terminal_feedback.py": "a0527ea2e2a5fa8cf0b120b821ae847097adabcbff847df96569c833d53ed43f",
+    "tests/test_tasks_unit_set_flow.py": "b46699bc01236e68c5e1693c17d43dce1db69c86854001ed9dc0bee0af8cb2cd",
+    "examples/terminal-feedback.json": "38a833f920958c668d4c670c4f9654b8c00c893f804ea8c852194ad6418ba846",
+    "deploy/systemd/xtrek-terminal-feedback.service": "c221f0367e41ed2f081ac8534cf52d2c42c4ec0d2d71235cf7c3492aff2b7057",
+    "deploy/systemd/xtrek-terminal-feedback.timer": "6a6c3361481bb71f2e4e7b2c0319f6ef406c8b6116961eb9a85824eeacb8a170"
+  }
+}

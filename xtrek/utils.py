@@ -538,8 +538,12 @@ _RESOURCES_CACHE = {
     'config': None,
 }
 
-class EquipmentReportValidationError(ReconciliationRequired):
+from .terminal_feedback import TerminalBusinessError
+
+
+class EquipmentReportValidationError(TerminalBusinessError):
     """Invalid report input requires correction, not a business POST or retry."""
+    category = "invalid_report"
 
 
 class EquipmentReportResourceError(RuntimeError):

@@ -1,0 +1,22 @@
+[Unit]
+Description=xTrek terminal feedback outbox drain (explicit activation required)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/xtrek/terminal-feedback.json
+ConditionPathExists=/var/lib/xtrek/terminal-feedback/events.sqlite3
+
+[Service]
+Type=oneshot
+User=xtrek
+Group=xtrek
+EnvironmentFile=/etc/xtrek/worker.env
+EnvironmentFile=/etc/xtrek/terminal-feedback.env
+WorkingDirectory=/srv/xtrek/current
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.terminal_feedback_runtime drain --settings /etc/xtrek/terminal-feedback.json
+TimeoutStartSec=infinity
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xtrek/terminal-feedback

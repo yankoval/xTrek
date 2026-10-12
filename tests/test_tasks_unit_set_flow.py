@@ -233,7 +233,8 @@ def test_equipment_report_stops_without_retry_on_forbidden_precheck(monkeypatch)
         "key": "equipment-reports/T-UNIT.json",
     }])
 
-    assert result.successful()
+    assert not result.successful()
+    assert isinstance(result.result, tasks.TerminalBusinessError)
     set_check_tag.assert_called_once_with(
         "s3://internal-bucket/equipment-reports/T-UNIT.json",
         "true-api-403-forbidden",
@@ -242,7 +243,7 @@ def test_equipment_report_stops_without_retry_on_forbidden_precheck(monkeypatch)
     sign_util.assert_not_called()
 
 
-def test_equipment_report_skips_business_validation_errors_without_retry(monkeypatch):
+def test_equipment_report_fails_business_validation_without_retry(monkeypatch):
     tasks = import_tasks(monkeypatch)
     create_util = MagicMock()
     sign_util = MagicMock()
@@ -261,7 +262,8 @@ def test_equipment_report_skips_business_validation_errors_without_retry(monkeyp
         "key": "equipment-reports/T-UNIT.json",
     }])
 
-    assert result.successful()
+    assert not result.successful()
+    assert isinstance(result.result, tasks.TerminalBusinessError)
     create_util.assert_not_called()
     sign_util.assert_not_called()
 
@@ -559,7 +561,8 @@ def test_aggregate_operation_business_error_stops_without_retry(monkeypatch):
         "key": "equipment-reports-reaggregation-removing/T-SSCC-uuid.json",
     }])
 
-    assert result.successful()
+    assert not result.successful()
+    assert isinstance(result.result, tasks.TerminalBusinessError)
     create_task.assert_not_called()
 
 
