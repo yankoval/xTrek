@@ -108,6 +108,27 @@ def test_create_emission_task_unit(mock_dependencies):
         data = json.load(f)
         assert data['products'][0]['cisType'] == 'UNIT'
 
+
+@pytest.mark.parametrize("quantity_state", ["missing", "null", "empty"])
+def test_create_emission_task_rejects_unlimited_quantity(mock_dependencies, quantity_state):
+    deps = mock_dependencies
+    deps['load_config'].return_value = {
+        'production_orders_path': 's3://bucket/prod/',
+        'emission_orders_path': 's3://bucket/emission/'
+    }
+    storage = MagicMock()
+    deps['get_storage'].return_value = storage
+    storage.exists.return_value = True
+    source = {'Gtin': '12345678901234', 'PasportData': {'Product_PackQty': '5'}}
+    if quantity_state == 'null':
+        source['Quantity'] = None
+    elif quantity_state == 'empty':
+        source['Quantity'] = ''
+    storage.read_text.return_value = json.dumps(source)
+
+    assert create_emission_task('unlimited', 'chemistry', 'contact') is None
+    storage.upload.assert_not_called()
+
 def test_create_emission_task_nk_failure(mock_dependencies):
     deps = mock_dependencies
 

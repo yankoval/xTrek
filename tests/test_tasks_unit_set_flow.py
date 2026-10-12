@@ -64,6 +64,7 @@ def import_tasks(monkeypatch, module_name="tasks"):
         types.SimpleNamespace(task_prerun=_FakeSignal(), task_postrun=_FakeSignal(),
                               worker_ready=_FakeSignal()),
     )
+    monkeypatch.setitem(sys.modules, "kombu", types.SimpleNamespace(Queue=lambda *args, **kwargs: (args, kwargs)))
     config = {
         "input_bucket": "input-bucket",
         "internal_bucket": "internal-bucket",
@@ -124,14 +125,47 @@ def test_local_prnsrv_function_is_a_configured_source_event_fanout(monkeypatch, 
                         types.SimpleNamespace(process_local_prnsrv_s3_event=process_generator))
     order = MagicMock(return_value='Order created')
     monkeypatch.setattr(tasks, 'logic_create_order', order)
+    source = {"Quantity": "5", "PasportData": {}}
+    source_storage = MagicMock()
+    source_storage.read_text.return_value = json.dumps(source)
+    monkeypatch.setattr(tasks, 'get_storage', MagicMock(return_value=source_storage))
     result = tasks.process_s3_event.apply(args=[{
         'bucket': 'input-bucket',
         'key': 'Задания/11111111-1111-4111-8111-111111111111.json',
     }])
     assert result.successful()
     process_generator.assert_called_once()
-    order.assert_called_once_with('input-bucket/Задания/11111111-1111-4111-8111-111111111111.json')
+    order.assert_called_once_with('input-bucket/Задания/11111111-1111-4111-8111-111111111111.json', source_data=source)
     assert 'local PRNSRV: GENERATED' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("quantity", [None, "", "   "])
+def test_blank_quantity_routes_equipment_only_and_skips_prnsrv_and_emission(monkeypatch, quantity, capsys):
+    tasks = import_tasks(monkeypatch)
+    tasks.config['prnsrv_local_generator_enabled'] = True
+    source = {"PasportData": {}}
+    if quantity is not None:
+        source['Quantity'] = quantity
+    source_storage = MagicMock()
+    source_storage.read_text.return_value = json.dumps(source)
+    monkeypatch.setattr(tasks, 'get_storage', MagicMock(return_value=source_storage))
+    process_generator = MagicMock()
+    monkeypatch.setitem(sys.modules, 'xtrek.prnsrv_local_runtime',
+                        types.SimpleNamespace(process_local_prnsrv_s3_event=process_generator))
+    monkeypatch.setattr(tasks, 'process_incoming_task', MagicMock(return_value='T-UNLIMITED'))
+    monkeypatch.setattr(tasks, 'create_equipment_aggregation_task', MagicMock(return_value='T-UNLIMITED'))
+    emission = MagicMock()
+    monkeypatch.setattr(tasks, 'create_emission_task', emission)
+
+    result = tasks.process_s3_event.apply(args=[{
+        'bucket': 'input-bucket',
+        'key': 'Задания/unlimited.json',
+    }])
+
+    assert result.successful()
+    assert 'emission skipped' in capsys.readouterr().out
+    process_generator.assert_not_called()
+    emission.assert_not_called()
 
 
 def test_unit_equipment_report_creates_utilisation_and_skips_virtual_tasks(monkeypatch):
@@ -741,7 +775,9 @@ def test_order_starts_emission_after_equipment_task_is_ready(monkeypatch):
     monkeypatch.setattr(tasks, 'create_equipment_aggregation_task', MagicMock(return_value='T-SSCC'))
     emission = MagicMock(return_value=True)
     monkeypatch.setattr(tasks, 'create_emission_task', emission)
-    assert 'emission task started' in tasks.logic_create_order('input-bucket/Задания/order.json')
+    assert 'emission task started' in tasks.logic_create_order(
+        'input-bucket/Задания/order.json', source_data={'Quantity': '1'}
+    )
     emission.assert_called_once_with('T-SSCC', 'chemistry', 'scan')
 
 

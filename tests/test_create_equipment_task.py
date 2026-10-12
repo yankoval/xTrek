@@ -186,6 +186,33 @@ def test_pallet_assignment_rejects_invalid_explicit_norm(
         )
 
 
+@pytest.mark.parametrize("quantity", [None, "", "   "])
+def test_unlimited_quantity_with_pallet_norm_allocates_one_v1_sscc(
+    quantity, mock_suz_config, monkeypatch,
+):
+    from xtrek.create_emission_task_sample import _create_pallet_assignment
+    from unittest.mock import MagicMock
+    import xtrek.create_emission_task_sample as emission
+
+    get_sscc = MagicMock(return_value=["046070517921585754"])
+    monkeypatch.setattr(emission, "get_sscc_from_service", get_sscc)
+    prod_data = {"numBoxesInPallet": 8}
+    if quantity is not None:
+        prod_data["Quantity"] = quantity
+
+    assignment = _create_pallet_assignment(prod_data, mock_suz_config)
+
+    assert assignment == {
+        "reportSchemaVersion": 1,
+        "plannedPalletCount": 1,
+        "palletSsccReserve": 0,
+        "palletNumbers": ["046070517921585754"],
+    }
+    get_sscc.assert_called_once_with(
+        'https://sscc.example.test', '460705179', 1, '0'
+    )
+
+
 @patch('xtrek.create_emission_task_sample.get_sscc_from_service')
 def test_pallet_assignment_rejects_duplicate_sscc(
     mock_get_sscc,

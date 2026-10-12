@@ -11,9 +11,11 @@ from urllib.parse import quote, urlparse
 from xtrek.config_loader import load_config
 from xtrek.sign import DocumentSigner
 from xtrek.tokens import TokenProcessor
+from xtrek.storage import get_storage
 from xtrek.create_emission_task_sample import (
     process_incoming_task, 
     create_equipment_aggregation_task, 
+    is_unlimited_equipment_quantity,
     create_emission_task, 
     sign_and_send_emission,
     update_emission_order_status,
@@ -369,7 +371,7 @@ def logic_update_cis_information_change(full_key):
     return result
 
 
-def logic_create_order(full_key):
+def logic_create_order(full_key, source_data=None):
     group, contact = PRODUCT_GROUP, CONTACT_PERSON
     print(f"[LOGIC-0] Запуск создания заказа для: {full_key}")
     
@@ -380,6 +382,21 @@ def logic_create_order(full_key):
     equipment_task = create_equipment_aggregation_task(production_order_id)
     if not equipment_task:
         raise RuntimeError(f"create_equipment_aggregation_task failed for {production_order_id}")
+
+    # Blank/missing Quantity requests an equipment aggregation task only.
+    # Do not start emission: there is no finite code quantity to issue.
+    if source_data is None:
+        source_bucket, _, source_key = full_key.partition('/')
+        try:
+            source_config = config.get('s3_config')
+            source_storage = get_storage(f"s3://{source_bucket}/{source_key}", source_config)
+            source_data = json.loads(source_storage.read_text(f"s3://{source_bucket}/{source_key}"))
+        except Exception as exc:
+            # If we cannot establish the source quantity, fail closed before emission.
+            raise RuntimeError(f"Could not verify source Quantity before emission: {full_key}") from exc
+    if is_unlimited_equipment_quantity(source_data.get('Quantity')):
+        return f"Equipment task {production_order_id} created; emission skipped (unlimited quantity)"
+
     resultCEmT = create_emission_task(production_order_id, group, contact)
     
     if not resultCEmT:
@@ -994,7 +1011,10 @@ def process_s3_event(self, data):
         # Условие №1: Создание заказа
         if bucket == INPUT_BUCKET and key.startswith("Задания/"):
             prnsrv_result = None
-            if config.get('prnsrv_local_generator_enabled') is True:
+            source_storage = get_storage(f"s3://{bucket}/{key}", config.get('s3_config'))
+            source = json.loads(source_storage.read_text(f"s3://{bucket}/{key}"))
+            unlimited_quantity = is_unlimited_equipment_quantity(source.get('Quantity'))
+            if config.get('prnsrv_local_generator_enabled') is True and not unlimited_quantity:
                 from xtrek.prnsrv_local_runtime import process_local_prnsrv_s3_event
                 prnsrv_result = process_local_prnsrv_s3_event(
                     bucket=bucket,
@@ -1002,7 +1022,7 @@ def process_s3_event(self, data):
                     runtime_config=config,
                     event_id=str(getattr(getattr(self, 'request', None), 'id', '') or ''),
                 )
-            result = logic_create_order(full_key)
+            result = logic_create_order(full_key, source_data=source)
             if prnsrv_result is not None:
                 result = f"{result}; local PRNSRV: {prnsrv_result.get('result', prnsrv_result.get('state'))}"
             print(f"[OK] {result}")

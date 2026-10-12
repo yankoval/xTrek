@@ -85,6 +85,11 @@ def _publish_json_result(storage, temporary, destination, initial_tags=None):
         storage.upload(str(temporary), destination)
 
 
+def is_unlimited_equipment_quantity(value):
+    """Missing/null/blank quantity selects equipment-only aggregation."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 # --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
 DEFAULT_SIGNING_DIR = os.path.join(os.path.expanduser("~"), "tst")
 DEFAULT_SIGNING_TIMEOUT = 60
@@ -536,7 +541,7 @@ def process_incoming_task(s3_full_key: str):
             storage.set_tags(s3_path, {'status': 'error', 'error': 'format'})
             raise
 
-        mandatory_fields = ['Gtin', 'Quantity', 'PasportData']
+        mandatory_fields = ['Gtin', 'PasportData']
         for field in mandatory_fields:
             if field not in prod_data:
                 logger.error(f"[!] В задании отсутствует обязательное поле: {field}")
@@ -554,10 +559,9 @@ def process_incoming_task(s3_full_key: str):
         normalized_gtin = gtin.zfill(14)
         prod_data['Gtin'] = normalized_gtin
 
-        # Нормализация Quantity
-        quantity_val = prod_data.get('Quantity')
-        if quantity_val is None or str(quantity_val).strip() == "":
-            prod_data['Quantity'] = "0"
+        # Пустое количество означает неограниченную агрегацию на оборудовании.
+        # Сохраняем исходное значение (включая отсутствие поля), не превращая его
+        # в ноль: downstream emission должен быть пропущен, а pallet SSCC выдан.
 
         # 5. Определение ИНН владельца карточки товара.
         # Для собственных GTIN обычно хватает локальной GS1-базы. Для linked
@@ -701,6 +705,11 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         gtin = prod_data.get('Gtin')
+
+        if is_unlimited_equipment_quantity(prod_data.get('Quantity')):
+            raise ValueError(
+                "Emission task is disabled for an unlimited equipment quantity"
+            )
 
         # Количество в заказе указано в коробках.
         # Чтобы получить количество КМ, умножаем на количество в одной коробке (Product_PackQty)
@@ -3657,7 +3666,9 @@ def _create_pallet_assignment(prod_data, config):
     raw_boxes_per_pallet = prod_data.get('numBoxesInPallet')
     has_pallet_norm = raw_boxes_per_pallet not in (None, '')
 
-    if has_pallet_norm:
+    unlimited_quantity = is_unlimited_equipment_quantity(prod_data.get('Quantity'))
+
+    if has_pallet_norm and not unlimited_quantity:
         try:
             boxes_per_pallet = int(raw_boxes_per_pallet)
         except (TypeError, ValueError) as e:
