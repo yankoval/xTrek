@@ -9,6 +9,7 @@ import sys
 import argparse
 from pathlib import Path
 import textwrap
+import tempfile
 from typing import Any
 
 import coloredlogs
@@ -32,6 +33,52 @@ coloredlogs.install(level=logging.DEBUG, logger=logger, isatty=True,
 
 # Отключаем предупреждения о небезопасном соединении
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# Limit the rendered response, including escaped newlines and UTF-8 characters.
+SUZ_ERROR_LOG_LIMIT = 4096
+
+
+def _log_utilisation_error(response, headers):
+    """Retain the error diagnostic without flooding Celery's journal."""
+    text = response.text
+    request = getattr(response, 'request', None)
+    request_headers = dict(headers)
+    if request is not None:
+        request_headers.update(request.headers)
+    secrets = {str(value) for name, value in request_headers.items()
+               if name.lower() in {'clienttoken', 'authorization', 'x-signature'} and value}
+    secrets.update(value[7:] for value in tuple(secrets)
+                   if value.lower().startswith('bearer ') and value[7:])
+    for value in sorted(secrets, key=len, reverse=True):
+        text = text.replace(value, '[REDACTED]')
+
+    rendered = json.dumps(text, ensure_ascii=False)
+    if len(rendered.encode('utf-8')) <= SUZ_ERROR_LOG_LIMIT:
+        logger.error('СУЗ: HTTP %s, тело ответа: %s', response.status_code, rendered)
+        return
+
+    # NamedTemporaryFile creates a unique, owner-only file (0600). Retain it
+    # after the exception/signing context exits so the operator can inspect it.
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                         prefix='xtrek-suz-error-', suffix='.txt',
+                                         delete=False) as stream:
+            path = stream.name
+            stream.write(text)
+        logger.error('СУЗ: HTTP %s, ответ (%s байт) сохранён: %s',
+                     response.status_code, len(text.encode('utf-8')), path)
+    except OSError as error:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        # Disk/permission errors must not replace the original HTTPError or
+        # fall back to dumping a potentially enormous response in the journal.
+        logger.error('СУЗ: HTTP %s, большой ответ не сохранён в tmp (%s)',
+                     response.status_code, type(error).__name__)
 
 
 class SUZ:
@@ -156,7 +203,9 @@ class SUZ:
                 data = response.json()
                 return data.get('reportId', '')
             return ""
-        except Exception:
+        except Exception as error:
+            if getattr(error, 'response', None) is not None:
+                _log_utilisation_error(error.response, self.headers)
             logger.exception("Ошибка отправки нанесения; исход требует сверки")
             raise
 
