@@ -5,6 +5,9 @@ import types
 from unittest.mock import MagicMock, patch
 
 import pytest
+import celery as real_celery_module
+import celery.signals as real_celery_signals
+from celery import Celery as RealCelery
 
 
 class _EagerResult:
@@ -49,7 +52,7 @@ class _FakeSignal:
         return func
 
 
-def import_tasks(monkeypatch, module_name="tasks"):
+def import_tasks(monkeypatch, module_name="tasks", celery_class=_FakeCelery):
     monkeypatch.setenv("YMQ_ACCESS_KEY", "test-access")
     monkeypatch.setenv("YMQ_SECRET_KEY", "test-secret")
     monkeypatch.setenv("YMQ_QUEUE_URL", "https://example.test/queue")
@@ -57,10 +60,12 @@ def import_tasks(monkeypatch, module_name="tasks"):
     sys.modules.pop("xtrek.tasks", None)
     # The compatibility entry point also imports the attribute cached on xtrek.
     monkeypatch.delattr("xtrek.tasks", raising=False)
-    monkeypatch.setitem(sys.modules, "celery", types.SimpleNamespace(Celery=_FakeCelery))
+    monkeypatch.setitem(sys.modules, "celery", real_celery_module if celery_class is RealCelery
+                        else types.SimpleNamespace(Celery=celery_class))
     monkeypatch.setitem(
         sys.modules,
         "celery.signals",
+        real_celery_signals if celery_class is RealCelery else
         types.SimpleNamespace(task_prerun=_FakeSignal(), task_postrun=_FakeSignal(),
                               worker_ready=_FakeSignal()),
     )
@@ -825,3 +830,92 @@ def test_cis_change_success_stops_status_retries(monkeypatch, result):
         "internal-bucket/isolated/run/cisInformationChangeReceipts/test.json",
     ) == result
     update.assert_called_once_with("test", "chemistry")
+
+
+@pytest.mark.parametrize("as_list", [False, True])
+def test_cis_change_rejection_fails_without_autoretry_or_resend(monkeypatch, as_list):
+    tasks = import_tasks(monkeypatch, celery_class=RealCelery)
+    response = {"status": "CHECKED_NOT_OK", "number": "existing-document",
+                "commonErrors": [{"errorCode": "ERROR_24", "cis": "private-code"}]}
+    update = MagicMock(return_value=[response] if as_list else response)
+    send = MagicMock()
+    retry = MagicMock(side_effect=AssertionError("must not retry rejected document"))
+    monkeypatch.setattr(tasks, "update_cis_information_change_status", update)
+    monkeypatch.setattr(tasks, "sign_and_send_cis_information_change", send)
+    monkeypatch.setattr(tasks.process_s3_event, "retry", retry)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket", "key": "cisInformationChangeReceipts/test.json",
+    }])
+
+    assert not result.successful()
+    assert isinstance(result.result, tasks.CisInformationChangeRejected)
+    assert "CHECKED_NOT_OK" in str(result.result)
+    assert "private-code" not in str(result.result)
+    update.assert_called_once_with("test", "chemistry")
+    retry.assert_not_called()
+    send.assert_not_called()
+
+
+@pytest.mark.parametrize("response", [
+    {"status": "IN_PROGRESS"}, {"status": "UNKNOWN"}, {}, [], None,
+    [{"status": "CHECKED_OK"}, {"status": "CHECKED_NOT_OK"}],
+    [{"status": "CHECKED_NOT_OK"}, {"status": "CHECKED_OK"}],
+    {"error": "upstream unavailable", "status_code": 503},
+])
+def test_cis_change_pending_or_ambiguous_response_keeps_autoretry(monkeypatch, response):
+    tasks = import_tasks(monkeypatch, celery_class=RealCelery)
+    update = MagicMock(return_value=response)
+    send = MagicMock()
+    retry = MagicMock(side_effect=RuntimeError("retry scheduled"))
+    monkeypatch.setattr(tasks, "update_cis_information_change_status", update)
+    monkeypatch.setattr(tasks, "sign_and_send_cis_information_change", send)
+    monkeypatch.setattr(tasks.process_s3_event, "retry", retry)
+
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket", "key": "cisInformationChangeReceipts/test.json",
+    }])
+
+    assert not result.successful()
+    assert not isinstance(result.result, tasks.CisInformationChangeRejected)
+    retry.assert_called_once()
+    send.assert_not_called()
+
+
+def test_cis_change_transport_failure_keeps_autoretry(monkeypatch):
+    tasks = import_tasks(monkeypatch, celery_class=RealCelery)
+    monkeypatch.setattr(tasks, "update_cis_information_change_status",
+                        MagicMock(side_effect=ConnectionError("connection lost")))
+    retry = MagicMock(side_effect=RuntimeError("retry scheduled"))
+    monkeypatch.setattr(tasks.process_s3_event, "retry", retry)
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket", "key": "cisInformationChangeReceipts/test.json",
+    }])
+    assert not result.successful()
+    retry.assert_called_once()
+
+
+@pytest.mark.parametrize("as_list", [False, True])
+def test_cis_change_checked_ok_succeeds_in_real_celery(monkeypatch, as_list):
+    tasks = import_tasks(monkeypatch, celery_class=RealCelery)
+    response = {"status": "CHECKED_OK", "number": "existing-document"}
+    monkeypatch.setattr(tasks, "update_cis_information_change_status",
+                        MagicMock(return_value=[response] if as_list else response))
+    retry = MagicMock(side_effect=AssertionError("must not retry successful document"))
+    send = MagicMock()
+    monkeypatch.setattr(tasks.process_s3_event, "retry", retry)
+    monkeypatch.setattr(tasks, "sign_and_send_cis_information_change", send)
+    result = tasks.process_s3_event.apply(args=[{
+        "bucket": "internal-bucket", "key": "cisInformationChangeReceipts/test.json",
+    }])
+    assert result.successful()
+    retry.assert_not_called()
+    send.assert_not_called()
+
+
+def test_terminal_task_failure_records_failure_not_success(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    record = MagicMock()
+    monkeypatch.setattr(tasks, "_record_local_event_state", record)
+    tasks._finish_token_snapshot(task_id="existing-event", state="FAILURE")
+    record.assert_called_once_with("existing-event", "failed")

@@ -352,6 +352,10 @@ def trigger_set_aggregation_if_ready(parent_id):
         return f"Set {parent_id} not ready yet"
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 1bf11148... / ПАПКА: Задания ---
+class CisInformationChangeRejected(RuntimeError):
+    """An existing correction document was definitively rejected by True API."""
+
+
 def logic_send_cis_information_change(full_key):
     task_id = full_key.rsplit("/", 1)[-1].removesuffix(".json")
     result = sign_and_send_cis_information_change(task_id, PRODUCT_GROUP, signing_dir, 120)
@@ -363,9 +367,20 @@ def logic_send_cis_information_change(full_key):
 def logic_update_cis_information_change(full_key):
     task_id = full_key.rsplit("/", 1)[-1].removesuffix(".json")
     result = update_cis_information_change_status(task_id, PRODUCT_GROUP)
-    target = result[0] if isinstance(result, list) and result else result
-    if not isinstance(target, dict) or target.get("status") != "CHECKED_OK":
-        raise RuntimeError(f"CIS_INFORMATION_CHANGE pending or failed for {task_id}: {result}")
+    # This receipt identifies one existing document. Ambiguous or malformed
+    # responses must never be accepted as either successful or terminal.
+    target = result[0] if isinstance(result, list) and len(result) == 1 else result
+    status = target.get("status") if isinstance(target, dict) else None
+    if status == "CHECKED_NOT_OK":
+        # The status updater has already persisted the API response and tag.
+        # Leave receipts and send guards intact; fail the task without resending
+        # the document or scheduling another status retry.
+        raise CisInformationChangeRejected(
+            f"CIS_INFORMATION_CHANGE rejected for {task_id}: CHECKED_NOT_OK"
+        )
+    if status != "CHECKED_OK":
+        # Do not put the API payload (including marking codes) into the journal.
+        raise RuntimeError(f"CIS_INFORMATION_CHANGE status not confirmed for {task_id}")
     return result
 
 
@@ -968,7 +983,7 @@ for _route_name in tuple(name for name in globals() if name.startswith('logic_')
     bind=True,
     acks_late=True,
     autoretry_for=(Exception,),
-    dont_autoretry_for=(OperationConflict, ReconciliationRequired),
+    dont_autoretry_for=(OperationConflict, ReconciliationRequired, CisInformationChangeRejected),
     retry_kwargs={'max_retries': 200}, # Увеличено до 200 для ожидания до 12+ часов
     retry_backoff=60,                 # 60, 120, 240, 300...
     retry_backoff_max=300,
