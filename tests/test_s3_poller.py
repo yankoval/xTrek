@@ -109,8 +109,8 @@ def test_scan_allows_only_configured_local_signer_inn(tmp_path, monkeypatch):
     denied = dict(allowed, Key="Задания/denied.json", ETag='"other"')
     s3 = FakeS3([{"Contents": [allowed, denied]}])
     s3.source_objects = {
-        allowed["Key"]: json.dumps({"PasportData": {"Manufacturer_inn": "7733154124"}}).encode(),
-        denied["Key"]: json.dumps({"PasportData": {"Manufacturer_inn": "9723161905"}}).encode(),
+        allowed["Key"]: json.dumps({"Quantity": "2", "PasportData": {"Manufacturer_inn": "7733154124"}}).encode(),
+        denied["Key"]: json.dumps({"Quantity": "2", "PasportData": {"Manufacturer_inn": "9723161905"}}).encode(),
     }
     ledger = EventLedger(str(tmp_path / "ledger.sqlite3"))
     scanner = S3EventPoller(s3, ledger, datetime(2025, 1, 1, tzinfo=timezone.utc),
@@ -118,6 +118,31 @@ def test_scan_allows_only_configured_local_signer_inn(tmp_path, monkeypatch):
     assert scanner.scan() == 1
     row = ledger.claim()
     assert row is not None and json.loads(row[1])["key"] == allowed["Key"]
+    ledger.close()
+
+
+def test_scan_allows_blank_quantity_outside_local_signer_allowlist(tmp_path, monkeypatch):
+    import json
+    import xtrek.s3_poller as poller
+    monkeypatch.setattr(poller, "ROUTED_PREFIXES", {poller.INPUT_BUCKET: ("Задания/",)})
+    blank = _obj()
+    blank["Key"] = "Задания/unlimited.json"
+    null = dict(blank, Key="Задания/null.json", ETag='"null"')
+    missing = dict(blank, Key="Задания/missing.json", ETag='"missing"')
+    finite = dict(blank, Key="Задания/finite.json", ETag='"finite"')
+    s3 = FakeS3([{"Contents": [blank, null, missing, finite]}])
+    s3.source_objects = {
+        blank["Key"]: json.dumps({"Quantity": "  ", "PasportData": {"Manufacturer_inn": "9999999999"}}).encode(),
+        null["Key"]: json.dumps({"Quantity": None, "PasportData": {"Manufacturer_inn": "9999999999"}}).encode(),
+        missing["Key"]: json.dumps({"PasportData": {"Manufacturer_inn": "9999999999"}}).encode(),
+        finite["Key"]: json.dumps({"Quantity": "10", "PasportData": {"Manufacturer_inn": "9999999999"}}).encode(),
+    }
+    ledger = EventLedger(str(tmp_path / "ledger.sqlite3"))
+    scanner = S3EventPoller(s3, ledger, datetime(2025, 1, 1, tzinfo=timezone.utc),
+                            allowed_inns=frozenset({"7733154124"}))
+    assert scanner.scan() == 3
+    keys = {json.loads(ledger.claim()[1])["key"] for _ in range(3)}
+    assert keys == {blank["Key"], null["Key"], missing["Key"]}
     ledger.close()
 
 
