@@ -66,6 +66,7 @@ from .operation_state import guarded, OperationConflict, ReconciliationRequired
 from .terminal_feedback import (TerminalBusinessError, TerminalRecorded, classify,
                                 event_identity, source_stage)
 from .terminal_feedback_runtime import worker_ledger
+from .equipment_task_contract import unlimited_aggregation_source
 
 # 2. Настройки доступа
 ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
@@ -402,6 +403,11 @@ def logic_create_order(full_key):
     equipment_task = create_equipment_aggregation_task(production_order_id)
     if not equipment_task:
         raise RuntimeError(f"create_equipment_aggregation_task failed for {production_order_id}")
+    source = get_production_order_data(production_order_id)
+    if source is None:
+        raise RuntimeError('Production order contract is not available')
+    if unlimited_aggregation_source(source):
+        return f"Unlimited aggregation notification task {production_order_id} created"
     resultCEmT = create_emission_task(production_order_id, group, contact)
     
     if not resultCEmT:

@@ -747,6 +747,7 @@ def test_order_starts_emission_after_equipment_task_is_ready(monkeypatch):
     tasks = import_tasks(monkeypatch)
     monkeypatch.setattr(tasks, 'process_incoming_task', MagicMock(return_value='T-SSCC'))
     monkeypatch.setattr(tasks, 'create_equipment_aggregation_task', MagicMock(return_value='T-SSCC'))
+    monkeypatch.setattr(tasks, 'get_production_order_data', MagicMock(return_value={'Quantity': '1'}))
     emission = MagicMock(return_value=True)
     monkeypatch.setattr(tasks, 'create_emission_task', emission)
     assert 'emission task started' in tasks.logic_create_order('input-bucket/Задания/order.json')

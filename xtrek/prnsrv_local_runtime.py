@@ -7,6 +7,7 @@ import os
 from typing import Any, Callable, Mapping
 
 from .operation_state import ReconciliationRequired
+from .equipment_task_contract import unlimited_aggregation_source
 from .prnsrv_local_allocator import LocalPrnsrvAllocator
 from .prnsrv_generator_runtime.app import PrnsrvFunction
 from .prnsrv_generator_runtime.config import Settings
@@ -90,6 +91,12 @@ def process_local_prnsrv_s3_event(*, bucket: str, key: str,
         raise RuntimeError('s3_config is required for local PRNSRV generation')
     raw_storage = _load_source(s3_config, bucket, key)
     job_uuid = key[len(input_prefix):].removesuffix('.json')
+    if job_uuid in PROTECTED_UNCERTAIN_UUIDS:
+        raise ReconciliationRequired('Protected uncertain UUID is not eligible for processing')
+    if unlimited_aggregation_source(raw_storage):
+        # This entrypoint handles production sources, unlike generic printer jobs.
+        # No allocator, printing template, history gate or CSV/VDF artifact is needed.
+        return {'state': 'NOTIFICATION_ONLY', 'quantity_mode': 'unlimited'}
     manufacturer_inn = str((raw_storage.get('PasportData') or {}).get('Manufacturer_inn') or '')
     allowed_inns = {value.strip() for value in os.environ.get('XTREK_LOCAL_ALLOWED_INNS', '').split(',') if value.strip()}
     if not allowed_inns or manufacturer_inn not in allowed_inns:

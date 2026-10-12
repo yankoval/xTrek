@@ -33,6 +33,7 @@ from .crpt_auth import get_new_token
 from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
+from .equipment_task_contract import unlimited_aggregation_source
 from .utilisation_attributes import build_utilisation_attributes
 from .production_order_identity import safe_production_order_component
 from .sign import DocumentSigner, SigningError
@@ -536,7 +537,7 @@ def process_incoming_task(s3_full_key: str):
             storage.set_tags(s3_path, {'status': 'error', 'error': 'format'})
             raise
 
-        mandatory_fields = ['Gtin', 'Quantity', 'PasportData']
+        mandatory_fields = ['Gtin', 'PasportData']
         for field in mandatory_fields:
             if field not in prod_data:
                 logger.error(f"[!] В задании отсутствует обязательное поле: {field}")
@@ -554,10 +555,8 @@ def process_incoming_task(s3_full_key: str):
         normalized_gtin = gtin.zfill(14)
         prod_data['Gtin'] = normalized_gtin
 
-        # Нормализация Quantity
-        quantity_val = prod_data.get('Quantity')
-        if quantity_val is None or str(quantity_val).strip() == "":
-            prod_data['Quantity'] = "0"
+        # Preserve missing/null/blank Quantity: an unlimited phone aggregation
+        # assignment is notification-only, not numeric zero or an empty report.
 
         # 5. Определение ИНН владельца карточки товара.
         # Для собственных GTIN обычно хватает локальной GS1-базы. Для linked
@@ -701,6 +700,8 @@ def create_emission_task(production_order_id: str, group: str, contact: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         gtin = prod_data.get('Gtin')
+        if unlimited_aggregation_source(prod_data):
+            return production_order_id  # No emission artifact or external POST.
 
         # Количество в заказе указано в коробках.
         # Чтобы получить количество КМ, умножаем на количество в одной коробке (Product_PackQty)
@@ -3655,7 +3656,10 @@ def create_equipment_set_report_from_report(production_order_id: str):
 def _create_pallet_assignment(prod_data, config):
     """Build the task pallet assignment and allocate all SSCCs once."""
     raw_boxes_per_pallet = prod_data.get('numBoxesInPallet')
-    has_pallet_norm = raw_boxes_per_pallet not in (None, '')
+    # Unlimited tasks retain the established v1 assignment: one required SSCC,
+    # not zero pallets. A finite pallet count cannot be inferred from a box norm.
+    has_pallet_norm = (not unlimited_aggregation_source(prod_data)
+                       and raw_boxes_per_pallet not in (None, ''))
 
     if has_pallet_norm:
         try:
@@ -3807,6 +3811,8 @@ def create_equipment_aggregation_task(production_order_id: str):
 
         prod_data = json.loads(storage_prod.read_text(prod_order_path))
         pasport = prod_data.get('PasportData', {})
+        if unlimited_aggregation_source(prod_data) and not config.get('operation_state_path'):
+            raise RuntimeError('Unlimited task SSCC requires durable operation state')
         pallet_assignment = _allocate_task_pallets(production_order_id, prod_data, config)
 
         # Поле id теперь совпадает с production_order_id (без расширения .json)
@@ -5817,6 +5823,7 @@ update_emission_order_status = guarded('poll-emission-status',
 
 for _name, (_operation, _input, _resume) in _GUARDED_WORKFLOWS.items():
     globals()[_name] = guarded(_operation, input_path=_input, resume=_resume,
+                              retry_idempotent_external=_name == '_allocate_task_pallets',
                               cache_none=_name == 'create_virtual_production_tasks',
                               config_loader=lambda name: load_config(name))(globals()[_name])
 

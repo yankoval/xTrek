@@ -1,7 +1,8 @@
 # Terminal equipment-report feedback
 
-This is the combined successor to PRs #109, #110 and #111, based on main
-`0124f9815c243dd0fe4e4490f75e3b30ed802ba3` (PR #112). Review and merge the combined
+This is the combined successor to PRs #109, #110 and #111, initially based on main
+`0124f9815c243dd0fe4e4490f75e3b30ed802ba3` (PR #112), now including
+`834ff1b38fab930251c25ca4df40b1e4181d45e9` (PR #114) by an ordinary merge. Review and merge the combined
 PR once; do not also merge the three original branches. They remain open for
 review provenance. All three changes applied cleanly; the combined baseline
 passed 1025 tests before feedback changes.
@@ -167,3 +168,43 @@ Never drain, purge or rewrite the queue as an implicit rollback step. Restore on
 complete previously approved main release, verify actual loaded sources, and retain
 all current guards/receipts/outboxes/terminal ledger. Roll forward to a corrected
 complete main release is preferred when active terminal events already exist.
+
+## Unlimited aggregation sources with required SSCC
+
+Missing `Quantity`, JSON null, an empty string or a whitespace-only string in an
+aggregation production source means unlimited aggregation on the phone. It is not
+an error and is not numeric zero. Source normalization preserves the original
+field/value, including absence. Explicit zero retains its separate existing meaning.
+Source/task classification is independent of scanned-report validation.
+
+The equipment task retains the existing, previously working v1 format:
+`reportSchemaVersion: 1`, `plannedPalletCount: 1`, `palletSsccReserve: 0`, and **one
+required SSCC in palletNumbers**. The phone needs that SSCC, including the second
+version of «Скан». No new `quantityMode`/`notificationOnly` fields are introduced in
+the phone JSON. Unlimited Quantity cannot yield a finite pallet count from a box
+norm, so this case uses the existing one-pallet assignment. MAX receives the same
+JSON-link notification format and its existing idempotent GET-confirmed delivery.
+
+The regular equipment-task allocator owns the SSCC. It requires configured durable
+`operation_state_path`. The nested `allocate-pallet-sscc` guard retains the result
+before publishing the task JSON; reopening the worker reuses that assignment after
+a publication failure. In mTLS mode the existing stable request ID binds allocation
+to the operation/source fingerprint. Safe local SSCC retry is now wired to that
+existing guard: if the allocator accepted a request but lost its response, the same
+request ID returns the same SSCC. Old uncertain guards without the explicit
+`local-sscc-v1` marker remain reconciliation-only; no legacy guard is reset. Without
+durable state, a new unlimited task is held before allocation instead of risking a
+duplicate. Existing task JSON and completed guards stay authoritative.
+
+The production-source PRNSRV adapter skips only its printing/extension-3 path:
+no CSV, VDF, print marker or printing allocation is created. The regular equipment
+SSCC allocation above still occurs. Protected UUID checks precede the shortcut.
+The order router skips emission preparation, and the direct emission preparation
+entrypoint is also a no-op for unlimited sources. There is no product-code emission,
+utilisation or other business document POST on this source path. Generic printer
+jobs with a separate `count` contract are unchanged.
+
+A later actual equipment report must still contain physical boxes and nonempty
+code arrays. Missing/empty/malformed report content remains terminal regardless of
+Quantity. A valid unlimited source/task itself produces no terminal error message.
+No historical objects, sources or completed guards are rewritten.

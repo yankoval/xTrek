@@ -1,7 +1,7 @@
 # Equipment terminal feedback — review evidence, 2026-10-12
 
-Base: `0124f9815c243dd0fe4e4490f75e3b30ed802ba3` (`main`, PR #112).
-Refetched immediately before PR preparation; main was unchanged.
+Initial base: `0124f9815c243dd0fe4e4490f75e3b30ed802ba3` (PR #112).
+Current integrated main: `834ff1b38fab930251c25ca4df40b1e4181d45e9` (PR #114).
 Branch: `codex/equipment-terminal-feedback`.
 
 ## Consolidation
@@ -16,7 +16,35 @@ All three cherry-picks applied cleanly on current main. One combined PR should b
 reviewed/merged once. The originals remain open and should not also be merged.
 No changes were pushed to their branches.
 
-## Verification
+## Latest correction: unlimited aggregation WITH required SSCC
+
+Human correction supersedes the unfinished no-SSCC interpretation. That variant
+was never committed, pushed or activated. Missing/null/empty/whitespace Quantity is
+preserved as unlimited, not rewritten to zero. Equipment task JSON uses the existing
+v1 schema and contains one required pallet SSCC. The regular task allocator and
+its durable operation guard own that SSCC; the independent printing path is skipped.
+No new phone-task schema flags or changes to MAX JSON-link delivery were introduced.
+
+- **27 regression cases** cover unlimited source -> equipment JSON with SSCC ->
+  GET-confirmed MAX link, no terminal feedback, restart/repeat idempotency, emission
+  no-op, explicit-zero distinction and unchanged malformed-report validation.
+- Failure after allocation before publication reuses the saved SSCC with no second
+  allocator call. Lost allocator reply retries the same mTLS request ID; the service
+  returns the same issued SSCC. Old unmarked uncertain guards stay held.
+- No product-code emission, utilisation, CSV/VDF/printing or extra business POSTs:
+  only the required idempotent SSCC request and normal MAX notification are allowed
+  by test doubles. All live HTTP is blocked; no production calls were made.
+- Current main `834ff1b38fab930251c25ca4df40b1e4181d45e9` (PR #114) included by normal
+  merge `c23fff0`; no history rewrite/force push. Its new XlsxWriter dependency was
+  installed as version 3.2.9 into an isolated temporary test dependency directory.
+- Latest focused suite: **309 passed**. [Log](unlimited-focused-tests.txt).
+- Latest full suite: **1144 passed, 10 skipped, 14 subtests**.
+  [Log and skip reasons](unlimited-full-tests.txt).
+- The full command uses the previous interpreter with PYTHONPATH pointing to the
+  isolated XlsxWriter directory and this complete worktree. The same ten opt-in
+  Linux CSP certificate tests remain skipped.
+
+## Previous revision verification (c5f64d2)
 
 - Combined baseline before new feature: **1025 passed, 10 skipped, 14 subtests**.
   [Baseline log](baseline-tests.txt).
