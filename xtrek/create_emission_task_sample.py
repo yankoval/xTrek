@@ -34,6 +34,7 @@ from .org_manager import OrganizationManager
 from .storage import get_storage, LocalStorage, S3Storage
 from .config_loader import load_config
 from .utilisation_attributes import build_utilisation_attributes
+from .production_order_identity import safe_production_order_component
 from .sign import DocumentSigner, SigningError
 from .aggregation_builder import (
     AggregationBuildError,
@@ -469,7 +470,9 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
             }
 
             # Название файла задания создаем по следующей маске
-            new_filename = f"V-{source_stem}-{comp_gtin}.json"
+            safe_source_stem = safe_production_order_component(source_stem)
+            safe_comp_gtin = safe_production_order_component(comp_gtin)
+            new_filename = f"V-{safe_source_stem}-{safe_comp_gtin}.json"
             target_path = f"{production_orders_path.rstrip('/')}/{new_filename}"
 
             # Сохранение
@@ -644,13 +647,17 @@ def process_incoming_task(s3_full_key: str):
         article = prod_data.get('Article', 'unknown')
         batch_number = pasport.get('Batch_number', 'unknown')
 
-        new_filename = f"T-{article}-{batch_number}-{original_filename}"
+        safe_article = safe_production_order_component(article)
+        safe_batch_number = safe_production_order_component(batch_number)
+        safe_source_stem = safe_production_order_component(original_filename[:-5])
+        production_order_id = f"T-{safe_article}-{safe_batch_number}-{safe_source_stem}"
+        new_filename = f"{production_order_id}.json"
         target_path = f"{production_orders_path.rstrip('/')}/{new_filename}"
 
         storage_prod = get_storage(production_orders_path, s3_config)
 
         # Сохраняем нормализованный JSON
-        temp_file = Path(f"temp_norm_{original_filename}")
+        temp_file = Path(f"temp_norm_{uuid.uuid4().hex}.json")
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(prod_data, f, indent=4, ensure_ascii=False)
 
@@ -664,7 +671,7 @@ def process_incoming_task(s3_full_key: str):
         storage.set_tags(s3_path, {'task': 'created'})
         logger.info(f"[+++] Задание {original_filename} успешно обработано")
 
-        return Path(new_filename).stem
+        return production_order_id
 
     except Exception as e:
         logger.error(f"[!] Ошибка в process_incoming_task: {e}")
