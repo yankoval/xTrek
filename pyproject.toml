@@ -19,6 +19,7 @@ classifiers = [
 dependencies = [
     "coloredlogs>=15.0.0",
     "openpyxl",
+    "xlsxwriter",
     "python-slugify",
     "requests",
     "pyperclip",
