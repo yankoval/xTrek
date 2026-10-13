@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import time
 from uuid import uuid4
 
@@ -19,6 +20,9 @@ from .token_master_lock import owner_identity, owner_is_dead
 
 logger = logging.getLogger(__name__)
 _current = ContextVar('xtrek_operation', default=None)
+
+def current_operation():
+    return _current.get()
 
 
 class OperationBusy(RuntimeError):
@@ -65,6 +69,7 @@ class OperationState:
         self.storage = storage
         digest = hashlib.sha256(str(business_key).encode()).hexdigest()
         self.path = '{}/{}/{}.json'.format(root.rstrip('/'), operation, digest)
+        self.root = root
         self.operation, self.business_key = operation, str(business_key)
         self.input_hash = input_hash
         self.retry_mode = retry_mode
@@ -125,10 +130,21 @@ class OperationState:
                 raise OperationConflict('Unknown operation state: ' + self.path)
             if phase == 'held' and not owner_is_dead(previous.get('owner'), self.owner):
                 raise OperationBusy('Operation owned by a live/unknown worker: ' + self.path)
+            retry_at = previous.get('next_retry_at')
+            if retry_at is not None:
+                if isinstance(retry_at, bool) or not isinstance(retry_at, (int, float)) or not math.isfinite(retry_at):
+                    raise OperationConflict('Invalid operation backoff timestamp')
+                if retry_at > time.time():
+                    from .document_create_resilience import DocumentCreateDeferred
+                    raise DocumentCreateDeferred(retry_at, 'operation_backoff')
         self.value = {'version': 1, 'operation': self.operation,
                       'business_key': self.business_key, 'input_hash': self.input_hash,
                       'owner_id': self.owner_id, 'owner': self.owner,
                       'phase': 'held', 'updated_at': time.time()}
+        if previous:
+            for name in ('http_attempt', 'document_attempt_count', 'last_error', 'next_retry_at'):
+                if name in previous:
+                    self.value[name] = previous[name]
         if self.retry_mode:
             self.value['retry_mode'] = self.retry_mode
         self.etag = self._persist(self.value, etag)
@@ -137,10 +153,12 @@ class OperationState:
         logger.info('[OPERATION] claimed operation=%s key=%s owner=%s',
                     self.operation, self.business_key, self.owner_id)
 
-    def update(self, phase, result=None):
+    def update(self, phase, result=None, **metadata):
         if not self.value or self.value.get('owner_id') != self.owner_id or self.cached:
             raise OperationBusy('Operation ownership changed: ' + self.path)
-        value = dict(self.value, phase=phase, updated_at=time.time())
+        if set(metadata) - {'http_attempt', 'document_attempt_count', 'last_error', 'next_retry_at'}:
+            raise ValueError('Unsupported operation checkpoint metadata')
+        value = dict(self.value, phase=phase, updated_at=time.time(), **metadata)
         if result is not None or phase == 'complete':
             value['result'] = encode_result(result)
         # The prior ETag proves ownership. IfMatch rejects any newer owner;
@@ -151,7 +169,9 @@ class OperationState:
         self.value, self.etag = value, tag
 
     def external(self):
-        self.update('external')
+        from .document_create_resilience import before_send
+        if not before_send(self):
+            self.update('external')
 
     def accepted(self, result):
         self.update('accepted', result)
@@ -166,6 +186,10 @@ class OperationState:
             self.update('ready')
 
     def failed(self, error):
+        from .document_create_resilience import DocumentCreateDeferred, DocumentCreateUncertain
+        if self.value and isinstance(error, (DocumentCreateDeferred, DocumentCreateUncertain)):
+            self.update(self.value['phase'], last_error=error.safety_metadata,
+                        next_retry_at=error.next_retry_at)
         if self.value and self.value['phase'] == 'accepted':
             self.value['replay_allowed'] = True
             self.update('accepted')

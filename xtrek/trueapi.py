@@ -68,6 +68,8 @@ class HonestSignAPI:
         self.clientToken = clientToken or os.getenv('CLIENT_TOKEN')
 
         self.host = host or os.getenv('TRUE_API_HOST', "https://markirovka.crpt.ru")
+        from .document_create_resilience import bind_endpoint
+        bind_endpoint(self.host.rstrip('/') + '/api/v3/true-api/lk/documents/create')
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -147,43 +149,10 @@ class HonestSignAPI:
             return {"error": str(e)}
 
     def documents_create(self, wrapped_document_json: str, pg: str) -> Dict[str, Any]:
-        """
-        Отправка отчета в ЛК ЧЗ (Метод /api/v3/true-api/lk/documents/create)
-        Ожидает в качестве document_json обертку с base64 телом и подписью.
-        """
-        url = f"{self.host}/api/v3/true-api/lk/documents/create"
-        params = {"pg": pg}
-        try:
-            logger.info(f"Отправка документа в ЛК (pg={pg})...")
-            response = requests.post(
-                url,
-                data=wrapped_document_json.encode('utf-8'),
-                params=params,
-                headers=self.headers,
-                verify=False,
-                timeout=(10, 30),
-            )
-            logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
-
-            if response.status_code == 429:
-                response.raise_for_status()
-
-            if response.status_code >= 400:
-                logger.error(f"Ошибка API (Status {response.status_code}): {response.text}")
-                return {"error": response.text, "status_code": response.status_code}
-
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                # Если сервер вернул ID документа просто строкой (бывает в True API)
-                return {"document_id": response.text.strip('"')}
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 429:
-                raise
-            return {"error": str(e)}
-        except Exception as e:
-            logger.error(f"Ошибка при отправке документа: {e}")
-            return {"error": str(e)}
+        """One guarded POST; shared admission and redacted HTTP telemetry."""
+        from .document_create_resilience import send_document
+        url = self.host.rstrip('/') + "/api/v3/true-api/lk/documents/create"
+        return send_document(url, self.headers, wrapped_document_json, pg)
 
     def doc(self, doc_id: str, body: bool = False, content: bool = False, pg: str = None) -> Dict[str, Any]:
         """

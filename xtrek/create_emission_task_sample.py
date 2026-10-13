@@ -2426,8 +2426,6 @@ def sign_and_send_aggregation(task_uuid: str, group: str, signing_dir: str, time
             # Отправка через TrueAPI
             api = HonestSignAPI(token=token)
             wrapped_json = wrapper.to_json()
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"[*] Текст запроса агрегации: {wrapped_json}")
 
             before_external_request()
             submission_ambiguous = True
