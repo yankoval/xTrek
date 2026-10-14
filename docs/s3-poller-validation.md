@@ -9,7 +9,7 @@ Dependencies were installed from `requirements.txt`, `requirements-test.txt` and
 ## Test results
 
 * Clean main: **1239 passed, 10 skipped, 14 subtests passed**.
-* Updated full suite: **1281 passed, 10 skipped, 14 subtests passed**.
+* Updated full suite: **1289 passed, 10 skipped, 14 subtests passed**.
 * The 10 skips are opt-in Linux CSP/certificate integration tests. No real signing,
   business API mutation, RabbitMQ event injection or production restart was used.
 * An initial attempt using an existing environment failed one baseline test due
@@ -28,6 +28,7 @@ The new tests exercise real temporary SQLite databases, process death via
 | GET 500 and total LIST outage | Other records proceed; committed outbox publishes; retries/backoff survive reopen |
 | Scanner blocked in LIST | A separate process delivers existing pending while scanner remains blocked |
 | Access/auth, malformed JSON/schema, missing object | Separate safe categories, persistent attempts and bounded backoff |
+| LIST milliseconds vs GET HTTP-date | Real botocore parser admits unchanged input, retains the pre-fix identity, skips GET after restart, and recovers persisted fractional retry metadata; signer rejection and true metadata differences remain enforced |
 | Overwrite between LIST/GET | Conditional GET or returned metadata mismatch prevents admission under old identity |
 | Slow retry and request exhaustion | Discovery gets a page slot; unvisited GET candidates are durable before checkpoint |
 | SQL checkpoint failure | Cursor transaction rolls back; committed retry survives |
@@ -44,6 +45,17 @@ The full suite also retains existing concurrent business-workflow/operation-guar
 and uncertain external-result tests. Fake-broker tests do not establish exactly
 once delivery or exactly once external POST. Real RabbitMQ/systemd/CSP behavior
 must be checked during a separately authorized release.
+
+## P1 precision regression correction
+
+Before the fix, new SDK-parser regression cases failed for both admission and
+signer rejection: LIST `2026-01-01T00:00:00.870Z` and GET
+`Thu, 01 Jan 2026 00:00:00 GMT` caused a false terminal `replaced` record.
+After the fix, eight new cases pass. They retain the exact pre-fix SHA-256 event
+identity, exercise enqueue/skip after restart and durable retry recovery, reject
+changed second/ETag/size, preserve INN validation, and compare nonzero GET
+fractions exactly. The targeted poller suite is **59 passed**. No production
+state or event identities were rewritten.
 
 ## Offline memory and known-page benchmark
 

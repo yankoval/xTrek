@@ -310,7 +310,23 @@ class S3EventPoller:
                       'VersionId': response.get('VersionId') if obj.get('VersionId') else None}
             if any(actual[field] is None for field in ('ETag', 'Size', 'LastModified')):
                 raise RuntimeError('Incomplete GET metadata')
-            if event_identity(bucket, key, actual, ()) != event_identity(bucket, key, obj, ()):
+            # LIST may preserve milliseconds, whereas GET's HTTP-date has only
+            # whole seconds. Normalize only this comparison, never the LIST
+            # metadata used by the durable event identity or retry record.
+            expected = dict(obj)
+            listed_modified = obj.get('LastModified')
+            returned_modified = actual['LastModified']
+            if isinstance(listed_modified, str):
+                listed_modified = datetime.fromisoformat(listed_modified.replace('Z', '+00:00'))
+            if isinstance(returned_modified, str):
+                returned_modified = datetime.fromisoformat(returned_modified.replace('Z', '+00:00'))
+            if (not isinstance(listed_modified, datetime) or listed_modified.tzinfo is None
+                    or not isinstance(returned_modified, datetime) or returned_modified.tzinfo is None):
+                raise RuntimeError('Invalid GET or LIST modification time')
+            expected['LastModified'] = (listed_modified.replace(microsecond=0)
+                                        if returned_modified.microsecond == 0 else listed_modified)
+            actual['LastModified'] = returned_modified
+            if event_identity(bucket, key, actual, ()) != event_identity(bucket, key, expected, ()):
                 raise ObjectReplaced()
             source = json.loads(response['Body'].read())
         finally:

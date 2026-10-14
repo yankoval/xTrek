@@ -646,3 +646,114 @@ def test_hard_publisher_restart_preserves_lease_and_stable_delivery_id(tmp_path)
     assert sender.send_task.call_args.kwargs['task_id'] == (tmp_path / 'accepted').read_text() == 'stable'
     assert ledger.db.execute('SELECT attempts FROM s3_outbox').fetchone()[0] == 2
     ledger.close()
+
+
+@pytest.mark.parametrize('get_modified,get_etag,get_size,allowed,expected', [
+    ('Thu, 01 Jan 2026 00:00:00 GMT', '"one"', len(SOURCE), True, 'enqueue'),
+    ('Thu, 01 Jan 2026 00:00:00 GMT', '"one"', len(SOURCE), False, 'denied'),
+    ('Thu, 01 Jan 2026 00:00:01 GMT', '"one"', len(SOURCE), True, 'replaced'),
+    ('Wed, 31 Dec 2025 23:59:59 GMT', '"one"', len(SOURCE), True, 'replaced'),
+    ('Thu, 01 Jan 2026 00:00:00 GMT', '"changed"', len(SOURCE), True, 'replaced'),
+    ('Thu, 01 Jan 2026 00:00:00 GMT', '"one"', len(SOURCE) + 1, True, 'replaced'),
+])
+def test_fractional_list_timestamp_vs_http_get_preserves_identity_and_policy(
+        case, monkeypatch, get_modified, get_etag, get_size, allowed, expected):
+    """Real SDK parser: LIST preserves milliseconds; HTTP-date cannot carry them."""
+    monkeypatch.setattr(poller, 'ROUTED_PREFIXES', {BUCKET: ('Задания/',)})
+    import boto3
+    from botocore.awsrequest import AWSResponse
+    from botocore.config import Config
+    ledger, _, _ = case
+    client = boto3.client('s3', endpoint_url='https://s3.test.invalid',
+                          aws_access_key_id='fake', aws_secret_access_key='fake',
+                          config=Config(retries={'total_max_attempts': 1}))
+    listing = (f'<ListBucketResult><IsTruncated>false</IsTruncated><Contents>'
+               f'<Key>Задания/order.json</Key><ETag>"one"</ETag><Size>{len(SOURCE)}</Size>'
+               '<LastModified>2026-01-01T00:00:00.870Z</LastModified>'
+               '</Contents></ListBucketResult>').encode()
+    calls = []
+    class Raw(io.BytesIO):
+        def stream(self, amt=1024, **kw):
+            while chunk := self.read(amt):
+                yield chunk
+    def send(request):
+        calls.append('LIST' if 'list-type=2' in request.url else 'GET')
+        if calls[-1] == 'LIST':
+            return AWSResponse(request.url, 200, {}, Raw(listing))
+        assert request.headers['If-Match'] == b'"one"'
+        return AWSResponse(request.url, 200,
+                           {'etag': get_etag, 'last-modified': get_modified,
+                            'content-length': str(get_size)}, Raw(SOURCE))
+    monkeypatch.setattr(client._endpoint.http_session, 'send', send)
+    scanner = S3EventPoller(client, ledger, CUTOFF,
+                            allowed_inns=frozenset({'allowed' if allowed else 'other'}))
+    assert scanner.scan(max_pages=1) == (1 if expected == 'enqueue' else 0)
+    assert calls == ['LIST', 'GET']
+    # This is the exact identity from the pre-fix implementation, retaining .870.
+    identity = '1ad05fdc53b075c810cf85cde73ae006d9b9d8c775497fe83d7c680a147c336d'
+    listed = obj(modified=MODIFIED.replace(microsecond=870000))
+    assert event_identity(BUCKET, listed['Key'], listed, ()) == identity
+    if expected == 'enqueue':
+        assert ledger.known(identity)
+        assert ledger.db.execute('SELECT event_id FROM s3_outbox').fetchall() == [(identity,)]
+        assert ledger.db.execute('SELECT COUNT(*) FROM discovery_retry').fetchone()[0] == 0
+        # Restart: an unchanged identity is known, with no second GET or enqueue.
+        reopened = EventLedger(str(ledger.path))
+        try:
+            resumed = S3EventPoller(client, reopened, CUTOFF, allowed_inns=frozenset({'allowed'}))
+            assert resumed.scan(max_pages=1) == 0
+            assert calls == ['LIST', 'GET', 'LIST']
+            assert resumed.metrics['known_skips'] == 1
+            assert publish_pending(reopened, Mock()) == 1
+        finally:
+            reopened.close()
+    elif expected == 'denied':
+        assert not ledger.known(identity)
+        assert scanner.metrics['inn_denied'] == 1
+        assert ledger.db.execute('SELECT COUNT(*) FROM discovery_retry').fetchone()[0] == 0
+    else:
+        assert not ledger.known(identity)
+        assert ledger.retry_record(identity)[0] == 'replaced'
+
+
+def test_nonzero_get_fraction_is_compared_without_truncation(case, monkeypatch):
+    ledger, s3, scanner = case
+    item = obj(modified=MODIFIED.replace(microsecond=870000))
+    add(s3, item)
+    original = s3.get_object
+    def mismatched(**kw):
+        response = original(**kw)
+        response['LastModified'] = MODIFIED.replace(microsecond=871000)
+        return response
+    monkeypatch.setattr(s3, 'get_object', mismatched)
+    assert scanner.scan(max_pages=1) == 0
+    assert ledger.db.execute('SELECT reason,state FROM discovery_retry').fetchone() == ('replaced', 'replaced')
+
+
+def test_fractional_list_metadata_survives_durable_retry_restart(case, monkeypatch):
+    ledger, s3, scanner = case
+    item = obj(modified=MODIFIED.replace(microsecond=870000))
+    add(s3, item)
+    s3.failures[item['Key']] = error('InternalError')
+    assert scanner.scan(max_pages=1) == 0
+    stored = json.loads(ledger.db.execute('SELECT object_meta FROM discovery_retry').fetchone()[0])
+    assert stored['LastModified'] == '2026-01-01T00:00:00.870000+00:00'
+    make_due(ledger)
+    s3.failures.clear()
+    original = s3.get_object
+    def seconds_only(**kw):
+        response = original(**kw)
+        response['LastModified'] = MODIFIED
+        return response
+    monkeypatch.setattr(s3, 'get_object', seconds_only)
+    reopened = EventLedger(str(ledger.path))
+    try:
+        resumed = S3EventPoller(s3, reopened, CUTOFF, allowed_inns=frozenset({'allowed'}))
+        assert resumed.scan(max_pages=0) == 1
+        identity = '1ad05fdc53b075c810cf85cde73ae006d9b9d8c775497fe83d7c680a147c336d'
+        assert reopened.known(identity)
+        assert reopened.retry_record(identity)[0] == 'resolved'
+        assert item['LastModified'].microsecond == 870000
+        assert reopened.db.execute('SELECT object_meta FROM discovery_retry').fetchone()[0] == json.dumps(stored, ensure_ascii=False)
+    finally:
+        reopened.close()

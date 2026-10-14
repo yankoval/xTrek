@@ -73,9 +73,15 @@ state, including pending/published/completed, skips GET. New identities still
 pass the existing signer-INN policy, including the equipment-only blank-Quantity
 exception. The historical backfill allowlist does not bypass INN validation.
 
-Input GET uses `IfMatch` (and VersionId when available). Returned ETag, size and
-LastModified must match the listed identity before its bytes can authorize that
-identity. A detected overwrite is retained as a `replaced` retry record; regular
+Input GET uses `IfMatch` (and VersionId when available). Returned ETag and size
+must match the listed metadata before its bytes can authorize that identity.
+GET's HTTP-date has whole-second precision while LIST may preserve milliseconds:
+only the validation comparison truncates LIST time to seconds when GET has no
+fractional part. If GET provides a fractional part, it is compared exactly.
+A different second, ETag, size or explicitly listed version still rejects the
+object. The original full-precision LIST metadata continues to determine the
+stored `event_id` and retry metadata; no identity migration or replay is added.
+A detected overwrite is retained as a `replaced` retry record; regular
 LIST discovers and validates the replacement independently. The business task
 envelope still contains bucket/key, not immutable version bytes: the existing
 router and operation guards remain responsible for subsequent business reads.
