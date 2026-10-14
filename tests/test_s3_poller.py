@@ -74,7 +74,9 @@ class FakeS3:
 
     def get_object(self, **kwargs):
         import io
-        return {"Body": io.BytesIO(self.source_objects[kwargs["Key"]])}
+        obj = next(obj for page in self.paginator.pages for obj in page.get('Contents', []) if obj['Key'] == kwargs['Key'])
+        return {"Body": io.BytesIO(self.source_objects[kwargs["Key"]]), 'ETag': obj['ETag'],
+                'ContentLength': obj['Size'], 'LastModified': obj['LastModified']}
 
 def test_scan_paginates_and_deduplicates(tmp_path, monkeypatch):
     import xtrek.s3_poller as poller
@@ -108,8 +110,10 @@ def test_scan_fails_closed_on_list_error(tmp_path, monkeypatch):
     ledger = EventLedger(str(tmp_path / "ledger.sqlite3"))
     scanner = S3EventPoller(FakeS3([{"Contents": [_obj()]}], list_error=RuntimeError("list api down")), ledger,
                              datetime(2025, 1, 1, tzinfo=timezone.utc))
-    with pytest.raises(RuntimeError, match="list api down"):
-        scanner.scan()
+    assert scanner.scan() == 0
+    assert scanner.metrics['status'] == 'degraded'
+    assert scanner.metrics['list_calls'] == 1
+    assert ledger.page_token('b', 'Задания/') is None
     assert ledger.claim() is None
     ledger.close()
 
