@@ -41,12 +41,16 @@ SUZ_ERROR_LOG_LIMIT = 4096
 
 def _log_utilisation_error(response, headers):
     """Retain the error diagnostic without flooding Celery's journal."""
-    text = response.text
     request = getattr(response, 'request', None)
     request_headers = dict(headers)
     if request is not None:
         request_headers.update(request.headers)
-    secrets = {str(value) for name, value in request_headers.items()
+    log_suz_diagnostic(response.text, request_headers, context=f'HTTP {response.status_code}')
+
+
+def log_suz_diagnostic(text, headers, *, context):
+    """Share the bounded journal/private tmp-file policy for SUZ diagnostics."""
+    secrets = {str(value) for name, value in headers.items()
                if name.lower() in {'clienttoken', 'authorization', 'x-signature'} and value}
     secrets.update(value[7:] for value in tuple(secrets)
                    if value.lower().startswith('bearer ') and value[7:])
@@ -55,7 +59,7 @@ def _log_utilisation_error(response, headers):
 
     rendered = json.dumps(text, ensure_ascii=False)
     if len(rendered.encode('utf-8')) <= SUZ_ERROR_LOG_LIMIT:
-        logger.error('СУЗ: HTTP %s, тело ответа: %s', response.status_code, rendered)
+        logger.error('СУЗ: %s, тело ответа: %s', context, rendered)
         return
 
     # NamedTemporaryFile creates a unique, owner-only file (0600). Retain it
@@ -67,8 +71,8 @@ def _log_utilisation_error(response, headers):
                                          delete=False) as stream:
             path = stream.name
             stream.write(text)
-        logger.error('СУЗ: HTTP %s, ответ (%s байт) сохранён: %s',
-                     response.status_code, len(text.encode('utf-8')), path)
+        logger.error('СУЗ: %s, ответ (%s байт) сохранён: %s',
+                     context, len(text.encode('utf-8')), path)
     except OSError as error:
         if path is not None:
             try:
@@ -77,8 +81,8 @@ def _log_utilisation_error(response, headers):
                 pass
         # Disk/permission errors must not replace the original HTTPError or
         # fall back to dumping a potentially enormous response in the journal.
-        logger.error('СУЗ: HTTP %s, большой ответ не сохранён в tmp (%s)',
-                     response.status_code, type(error).__name__)
+        logger.error('СУЗ: %s, большой ответ не сохранён в tmp (%s)',
+                     context, type(error).__name__)
 
 
 class SUZ:
@@ -111,13 +115,11 @@ class SUZ:
                 self.token = self.token_refresher()
                 self.headers["clientToken"] = self.token
                 response = requests.get(url, params=params, headers=self.headers, verify=False, timeout=(10, 30))
-            if response.status_code != 200:
-                logger.debug(f"GET {url} failed with {response.status_code}: {response.text}")
             response.raise_for_status()
             return response.json()
         except Exception as e:
             if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"GET {url} failed. Status: {e.response.status_code}, Body: {e.response.text}")
+                _log_utilisation_error(e.response, self.headers)
             raise
 
     def order_list(self):
@@ -215,6 +217,18 @@ class SUZ:
         """
         url = f"{self.base_url}/api/v3/report/info?omsId={self.omsId}&reportId={reportId}"
         return self._get(url)
+
+    def receipt_info(self, report_id: str):
+        """Get Receipt 2.0 by the submitted report ID (method 4.4.18)."""
+        return self._get(f"{self.base_url}/api/v3/receipts/receipt", params={
+            'omsId': self.omsId, 'resultDocId': report_id,
+        })
+
+    def receipt_document(self, result_doc_id: str, doc_id: str):
+        """Get the document referenced by a receipt event (method 4.4.20)."""
+        return self._get(f"{self.base_url}/api/v3/receipts/document", params={
+            'omsId': self.omsId, 'resultDocId': result_doc_id, 'docId': doc_id,
+        })
 
     def utilisation_reports_list(self, orderId: str, limit: int = None, skip: int = None):
         """

@@ -324,6 +324,10 @@ def publish_utilisation_status(storage, path, value):
             for field in ('omsId', 'reportId', 'productionOrderId'):
                 if previous.get(field) != value.get(field):
                     raise OperationConflict('Utilisation status identity changed: ' + path)
+            if previous.get('failureDetails'):
+                from .suz_receipts import merge_failure_details
+                value = dict(value, failureDetails=merge_failure_details(
+                    previous['failureDetails'], value.get('failureDetails')))
             if (previous == value or previous.get('reportStatus') == 'SUCCESS'
                     or (previous.get('reportStatus') == 'SENT'
                         and value['reportStatus'] == 'READY_TO_SEND')):
