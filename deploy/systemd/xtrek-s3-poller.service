@@ -1,8 +1,7 @@
 [Unit]
-Description=xTrek temporary S3 event poller and durable Celery outbox
-After=network-online.target rabbitmq-server.service celery.service
+Description=xTrek S3 discovery scanner
+After=network-online.target
 Wants=network-online.target
-Requires=rabbitmq-server.service celery.service
 ConditionPathExists=/etc/xtrek/local-s3-mode.env
 
 [Service]
@@ -12,7 +11,7 @@ Group=xtrek
 EnvironmentFile=/etc/xtrek/worker.env
 EnvironmentFile=/etc/xtrek/local-s3-mode.env
 WorkingDirectory=/var/lib/xtrek
-ExecStart=/srv/xtrek/venv/bin/python -m xtrek.s3_poller
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.s3_poller --role scan
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=30s
