@@ -167,7 +167,7 @@ class S3EventPoller:
             return True
         inn = str((source.get("PasportData") or {}).get("Manufacturer_inn") or "")
         if inn not in self.allowed_inns:
-            LOG.info("Skipping source outside local signer allowlist: key=%s", key)
+            LOG.debug("Skipping source outside local signer allowlist: key=%s", key)
             return False
         return True
 
@@ -234,6 +234,15 @@ def publish_pending(ledger: EventLedger, celery_app, limit: int = 100) -> int:
     return published
 
 
+def configure_poller_logging():
+    """Imports may change logger levels; suppress SDK headers/bodies afterwards."""
+    logging.getLogger().setLevel(logging.INFO)
+    namespaces = ('boto3', 'botocore', 'urllib3', 's3transfer')
+    for name in list(logging.Logger.manager.loggerDict) + list(namespaces):
+        if any(name == n or name.startswith(n + '.') for n in namespaces):
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="scan and publish once")
@@ -256,6 +265,7 @@ def main():
         raise SystemExit("Set XTREK_LOCAL_ALLOWED_INNS explicitly; unvalidated business signers are not admitted")
     # Import after environment guard so ordinary tools do not load the worker.
     from xtrek.tasks import app
+    configure_poller_logging()
     ledger = EventLedger(db_path)
     endpoint = os.environ.get("XTREK_S3_ENDPOINT_URL", "https://storage.yandexcloud.net")
     access_key = os.environ.get("XTREK_S3_ACCESS_KEY")
@@ -269,7 +279,10 @@ def main():
         while True:
             count = poller.scan()
             sent = publish_pending(ledger, app)
-            LOG.info("S3 poll complete: discovered=%d published=%d", count, sent)
+            if count or sent:
+                LOG.info("S3 poll complete: discovered=%d published=%d", count, sent)
+            else:
+                LOG.debug("S3 poll idle")
             if args.once:
                 return
             time.sleep(interval)
