@@ -1,0 +1,26 @@
+[Unit]
+Description=xTrek managed S3 PRNSRV generation and non-hot staging
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=xtrek
+Environment=PYTHONPATH=/srv/xtrek/current
+EnvironmentFile=/etc/xtrek/worker.env
+EnvironmentFile=/etc/xtrek/local-s3-mode.env
+WorkingDirectory=/var/lib/xtrek
+ExecStartPre=/srv/xtrek/venv/bin/python /usr/local/libexec/xtrek/verify-release.py
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.prnsrv_supervisor
+UMask=0077
+Restart=on-failure
+RestartSec=30s
+RestartPreventExitStatus=78
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=infinity
+StandardOutput=journal
+StandardError=journal
