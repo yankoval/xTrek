@@ -335,7 +335,7 @@ def _utc_setting(name: str) -> datetime:
 def scan_and_deliver(notifier: TaskNotifier, *, s3: Any, cutoff_utc: datetime,
                      allowlist: frozenset[str]=frozenset(), max_pages: int=100) -> int:
     """Reconcile only fresh or explicitly allowlisted equipment-task JSONs."""
-    token=None; processed=0
+    token=None; processed=0; already_delivered=0; states: dict[str,int]={}
     for _ in range(max_pages):
         request={"Bucket":TASK_BUCKET,"Prefix":TASK_PREFIX,"MaxKeys":1000}
         if token: request["ContinuationToken"]=token
@@ -355,8 +355,14 @@ def scan_and_deliver(notifier: TaskNotifier, *, s3: Any, cutoff_utc: datetime,
                 LOG.error("Notifier failed before result: key=%s error=%s",key,type(exc).__name__)
                 continue
             processed+=1
-            LOG.info("Task notification: key=%s state=%s message_id=%s",
-                     key,result.state,result.message_id or "")
+            states[result.state]=states.get(result.state,0)+1
+            if result.state=="delivered" and result.detail=="logical task already delivered":
+                already_delivered+=1
+                LOG.debug("Task notification already delivered: key=%s",key)
+            else:
+                log=LOG.info if result.state=="delivered" else LOG.warning
+                log("Task notification: key=%s state=%s message_id=%s",
+                    key,result.state,result.message_id or "")
         if not page.get("IsTruncated"):
             break
         token=page.get("NextContinuationToken")
@@ -364,6 +370,8 @@ def scan_and_deliver(notifier: TaskNotifier, *, s3: Any, cutoff_utc: datetime,
             raise RuntimeError("S3 returned a truncated page without a continuation token")
     else:
         LOG.warning("Notifier scan page cap reached; remaining objects will be reconciled next cycle")
+    LOG.info("Notifier scan complete: candidate_objects=%d already_delivered=%d states=%s",
+             processed,already_delivered,json.dumps(states,sort_keys=True))
     return processed
 
 
@@ -395,9 +403,8 @@ def main():
     interval=max(10,int(os.environ.get("XTREK_MAX_NOTIFIER_SECONDS","20")))
     while True:
         try:
-            count=scan_and_deliver(notifier,s3=s3,cutoff_utc=task_cutoff,allowlist=allowlist,
+            scan_and_deliver(notifier,s3=s3,cutoff_utc=task_cutoff,allowlist=allowlist,
                 max_pages=max(1,int(os.environ.get("XTREK_MAX_NOTIFIER_SCAN_PAGES","100"))))
-            LOG.info("Notifier scan complete: candidate_objects=%d",count)
         except Exception as exc:
             LOG.error("Notifier scan failed: %s",type(exc).__name__)
         time.sleep(interval)

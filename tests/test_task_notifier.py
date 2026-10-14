@@ -1,14 +1,15 @@
 """Offline safety tests for the handoff notifier. All HTTP/S3 calls are mocked."""
 from datetime import datetime, timezone
 import io
+import logging
 import json
 from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
-from xtrek.task_notifier import NotifierSettings, TASK_BUCKET, TaskNotifier
+from xtrek.task_notifier import DeliveryResult, NotifierSettings, TASK_BUCKET, TaskNotifier, scan_and_deliver
 
 
 KEY = "equipment-tasks/T-00000000-0000-4000-8000-000000000001.json"
@@ -159,6 +160,27 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(result.state,"delivered")
         self.assertEqual(result.message_id,"mid-1")
         post.assert_not_called()
+
+
+class ScanLoggingTests(unittest.TestCase):
+    def test_repeated_delivery_is_debug_new_delivery_is_info_and_problem_is_warning(self):
+        s3=Mock()
+        s3.list_objects_v2.return_value={"Contents":[
+            {"Key":KEY,"LastModified":datetime.now(timezone.utc)} for _ in range(3)]}
+        notifier=Mock()
+        notifier.process_object.side_effect=[
+            DeliveryResult("delivered",KEY,"old-mid","logical task already delivered"),
+            DeliveryResult("delivered",KEY,"new-mid"),
+            DeliveryResult("uncertain",KEY,detail="manual review required")]
+        with self.assertLogs("xtrek.task_notifier",level="DEBUG") as logs:
+            count=scan_and_deliver(notifier,s3=s3,cutoff_utc=datetime.fromtimestamp(0,timezone.utc))
+        self.assertEqual(count,3)
+        self.assertEqual([r.levelno for r in logs.records],
+                         [logging.DEBUG,logging.INFO,logging.WARNING,logging.INFO])
+        self.assertIn("new-mid",logs.output[1])
+        self.assertIn("already_delivered=1",logs.output[-1])
+        self.assertIn('"uncertain": 1',logs.output[-1])
+        self.assertEqual(notifier.process_object.call_count,3)
 
 
 if __name__ == "__main__":
