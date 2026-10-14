@@ -23,6 +23,7 @@ from .suz_api_models import (
 )
 from .kiz_from_rep import extract_and_flatten
 from .suz import SUZ
+from .suz_receipts import collect_failure_details, log_failure_details
 from .trueapi import HonestSignAPI
 from .nkapi import NK
 from .gs1_processor import get_inn_by_gtin
@@ -2562,6 +2563,22 @@ def update_utilisation_report_status(order_id: str):
         storage_reports = get_storage(utilisation_reports_path, s3_config)
         output_path = f"{utilisation_reports_path.rstrip('/')}/{order_id}.json"
 
+        previous_details = None
+        if status_obj.reportStatus == 'FAILED':
+            try:
+                if storage_reports.exists(output_path):
+                    previous = json.loads(storage_reports.read_text(output_path))
+                    if all(previous.get(key) == getattr(status_obj, key)
+                           for key in ('omsId', 'reportId', 'productionOrderId')):
+                        previous_details = previous.get('failureDetails')
+                status_obj.failureDetails = collect_failure_details(
+                    suz_api, report_id, previous_details)
+            except Exception as error:
+                # Diagnostics must not hide a known FAILED status. Never log an
+                # unbounded exception message (it may contain a response body).
+                logger.warning('СУЗ: подробности отказа недоступны (%s)', type(error).__name__)
+                status_obj.failureDetails = previous_details
+
         logger.info(f"[*] Сохранение статуса отчета в {output_path}")
         if config.get('operation_state_path'):
             effective = publish_utilisation_status(
@@ -2575,6 +2592,14 @@ def update_utilisation_report_status(order_id: str):
                 storage_reports.set_tags(output_path, {"reportStatus": status_obj.reportStatus})
             finally:
                 temp_local.unlink(missing_ok=True)
+
+        if status_obj.reportStatus == 'FAILED' and status_obj.failureDetails:
+            try:
+                log_failure_details(
+                    status_obj.failureDetails, suz_api.headers, report_id, output_path,
+                    include_details=status_obj.failureDetails != previous_details)
+            except Exception as error:
+                logger.warning('СУЗ: не удалось записать диагностику в журнал (%s)', type(error).__name__)
 
         return status_obj
 

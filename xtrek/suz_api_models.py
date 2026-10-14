@@ -86,6 +86,7 @@ class UtilisationReportStatus(SUZBase):
     reportStatus: str
     errorReason: Optional[str] = None
     productionOrderId: Optional[str] = None
+    failureDetails: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
 @dataclass
 class GtinDocument(SUZBase):

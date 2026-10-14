@@ -140,3 +140,73 @@ def test_lost_success_reply_recovers_without_regression(monkeypatch):
         publish_utilisation_status(store, 'status', snapshot('SUCCESS'))
     assert publish_utilisation_status(store, 'status', snapshot('SENT')) == snapshot('SUCCESS')
     assert store.tags['reportStatus'] == 'SUCCESS'
+
+
+@pytest.mark.parametrize('coordinated', [False, True])
+def test_failed_poll_saves_per_cis_errors_and_reuses_complete_details(polling, coordinated):
+    config, store, api = polling
+    if not coordinated:
+        config.pop('operation_state_path')
+    api.headers = {'clientToken': 'TEST-TOKEN'}
+    api.report_info.return_value = snapshot('FAILED')
+    api.receipt_info.return_value = {'results': [{
+        'resultDocId': 'REPORT', 'operations': [
+            {'operationType': 'RNMS_GIS_PROCESSED', 'docId': 'RESULT'}]}]}
+    api.receipt_document.return_value = {'content': json.dumps({'cisList': [
+        {'cis': 'SYNTHETIC-CIS', 'code': 12, 'description': 'Нет карточки НК'}]})}
+    first = flow.update_utilisation_report_status('T-JOB')
+    second = flow.update_utilisation_report_status('T-JOB')
+    assert first.reportStatus == second.reportStatus == 'FAILED'
+    assert first.failureDetails['state'] == 'complete'
+    path = config['utilisation_reports'] + '/T-JOB.json'
+    saved = json.loads(store.read_text(path))
+    assert saved['failureDetails']['documents'][0]['cisList'][0]['code'] == 12
+    assert store.get_tags(path)['reportStatus'] == 'FAILED'
+    api.receipt_info.assert_called_once_with('REPORT')
+    api.receipt_document.assert_called_once_with('REPORT', 'RESULT')
+    api.utilisation_send.assert_not_called()
+
+
+def test_failed_poll_keeps_status_when_receipt_is_not_available(polling):
+    config, store, api = polling
+    api.headers = {}
+    api.report_info.return_value = snapshot('FAILED')
+    api.receipt_info.side_effect = TimeoutError('unbounded-body-' * 1000)
+    result = flow.update_utilisation_report_status('T-JOB')
+    assert result.reportStatus == 'FAILED'
+    assert result.failureDetails['state'] == 'unavailable'
+    saved = json.loads(store.read_text(config['utilisation_reports'] + '/T-JOB.json'))
+    assert saved['reportStatus'] == 'FAILED'
+    assert 'unbounded-body' not in json.dumps(saved)
+    api.utilisation_send.assert_not_called()
+
+
+def test_non_failed_poll_never_fetches_receipts(polling):
+    _, _, api = polling
+    api.report_info.side_effect = [snapshot('SENT'), snapshot('SUCCESS')]
+    assert flow.update_utilisation_report_status('T-JOB').reportStatus == 'SENT'
+    assert flow.update_utilisation_report_status('T-JOB').reportStatus == 'SUCCESS'
+    api.receipt_info.assert_not_called()
+    api.receipt_document.assert_not_called()
+
+
+def test_failed_publisher_keeps_details_from_competing_poll(monkeypatch):
+    store = AtomicS3()
+    details = {'state': 'complete', 'receipts': [], 'documents': [
+        {'resultDocId': 'REPORT', 'docId': 'DOC', 'cisList': [
+            {'cis': 'SYNTHETIC-CIS', 'code': 12}]}], 'issues': []}
+    publish_utilisation_status(store, 'status', snapshot('SENT'))
+    write = store.write_lock_object
+
+    def competing(path, text, etag, *, tags):
+        write(path, json.dumps(dict(snapshot('FAILED'), failureDetails=details)), etag,
+              tags={'reportStatus': 'FAILED'})
+        return write(path, text, etag, tags=tags)
+
+    monkeypatch.setattr(store, 'write_lock_object', competing)
+    unavailable = {'state': 'unavailable', 'receipts': [], 'documents': [], 'issues': []}
+    effective = publish_utilisation_status(
+        store, 'status', dict(snapshot('FAILED'), failureDetails=unavailable))
+    assert effective['reportStatus'] == 'FAILED'
+    assert effective['failureDetails'] == details
+    assert json.loads(store.value)['failureDetails'] == details
