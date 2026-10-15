@@ -1,0 +1,26 @@
+[Unit]
+Description=Verify and rotate five SSCC snapshots in a dedicated S3 bucket
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/xtrek-sscc/ledger.sqlite3
+
+[Service]
+Type=oneshot
+User=xtrek
+Group=xtrek
+EnvironmentFile=/etc/xtrek/worker.env
+EnvironmentFile=/etc/xtrek/sscc-backup.env
+WorkingDirectory=/srv/xtrek/current
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.sscc_backup --config SSCC_BACKUP_CONFIG
+TimeoutStartSec=4min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/xtrek-sscc
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
