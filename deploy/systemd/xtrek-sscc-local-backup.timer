@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the SSCC ledger for a changed backup every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=xtrek-sscc-local-backup.service
+
+[Install]
+WantedBy=timers.target
