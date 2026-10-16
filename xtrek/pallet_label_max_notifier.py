@@ -103,6 +103,10 @@ class DeliveryLedger:
                 if existing['state'] in {'POST_STARTED', 'POST_UNCERTAIN', 'POSTED_UNCONFIRMED'}:
                     db.execute('COMMIT')
                     return existing
+                if (existing['state'] == 'CONFIRMED' and existing['source_hash'] == message.source_hash
+                        and existing['file_name'] == message.file_name):
+                    db.execute('COMMIT')
+                    return existing
                 if (existing['source_hash'] != message.source_hash
                         or existing['file_name'] != message.file_name
                         or existing['file_sha256'] != file_hash):
@@ -180,7 +184,7 @@ class MaxPalletLabelNotifier:
             names.extend(str(payload[key]) for key in ('name', 'filename') if payload.get(key))
         return names
 
-    def _exact_message(self, history: list[dict], item: LabelMessage) -> dict | None:
+    def _exact_message(self, history: list[dict], item: LabelMessage, *, image_only: bool = False) -> dict | None:
         for message in history:
             sender = message.get('sender') or {}
             recipient = message.get('recipient') or {}
@@ -190,10 +194,11 @@ class MaxPalletLabelNotifier:
                     or str(recipient.get('chat_id')) != self.chat_id):
                 continue
             attachments = body.get('attachments') or []
-            has_file = any(a.get('type') == 'file' for a in attachments)
+            allowed_types = {'image'} if image_only else {'image', 'file'}
+            has_attachment = any(a.get('type') in allowed_types for a in attachments)
             filename_proven = (item.file_name in self._attachment_names(message)
                                or item.file_name in text)
-            if (has_file and filename_proven and item.report_id in text and item.sscc in text):
+            if (has_attachment and filename_proven and item.report_id in text and item.sscc in text):
                 return message
         return None
 
@@ -211,7 +216,10 @@ class MaxPalletLabelNotifier:
         if existing_message:
             self.ledger.reserve(item, self.chat_id)
             self.ledger.set_state(item, self.chat_id, 'CONFIRMED', str((existing_message.get('body') or {}).get('mid') or ''))
-            return {'state': 'ALREADY_CONFIRMED_BY_GET', 'message_id': (existing_message.get('body') or {}).get('mid')}
+            is_image = any(a.get('type') == 'image'
+                           for a in existing_message['body'].get('attachments', []))
+            kind = 'ALREADY_CONFIRMED_BY_GET' if is_image else 'LEGACY_FILE_CONFIRMED_BY_GET'
+            return {'state': kind, 'message_id': (existing_message.get('body') or {}).get('mid')}
 
         for candidate in history:
             sender = candidate.get('sender') or {}
@@ -233,29 +241,49 @@ class MaxPalletLabelNotifier:
             self.ledger.set_state(item, self.chat_id, 'POST_UNCERTAIN')
             raise DeliveryUncertain('Prior message POST is ambiguous; GET only, never auto-repeat')
 
+        caption = f'{item.text}\nФайл: {item.file_name}'
+        if len(caption) > 4000:
+            raise ValueError('Complete pallet caption exceeds MAX 4000-character limit')
+
         upload = self.session.post(
-            MAX_API + '/uploads', params={'type': 'file'},
+            MAX_API + '/uploads', params={'type': 'image'},
             headers={'Authorization': self.token}, timeout=20,
         )
         upload.raise_for_status()
-        upload_url = upload.json().get('url')
-        if not upload_url:
+        try:
+            upload_init = upload.json()
+        except ValueError:
+            raise DeliveryUncertain('MAX image upload init returned invalid JSON') from None
+        if not isinstance(upload_init, dict) or upload_init.get('code'):
+            raise DeliveryUncertain('MAX image upload init returned an error')
+        upload_url = upload_init.get('url')
+        if not isinstance(upload_url, str) or not upload_url.strip():
             raise DeliveryUncertain('MAX upload init returned no URL')
         uploaded = self.session.post(
             upload_url, headers={'Authorization': self.token},
-            files={'file': (item.file_name, item.png_bytes, 'image/png')}, timeout=60,
+            files={'data': (item.file_name, item.png_bytes, 'image/png')}, timeout=60,
         )
         uploaded.raise_for_status()
-        file_token = uploaded.json().get('token')
-        if not file_token:
-            raise DeliveryUncertain('MAX upload returned no file token')
+        try:
+            upload_data = uploaded.json()
+        except ValueError:
+            raise DeliveryUncertain('MAX image upload returned invalid JSON') from None
+        if not isinstance(upload_data, dict) or upload_data.get('code'):
+            raise DeliveryUncertain('MAX image upload returned an error')
+        photos = upload_data.get('photos')
+        tokens = [photo.get('token') for photo in photos.values()
+                  if isinstance(photo, dict) and isinstance(photo.get('token'), str)
+                  and photo['token'].strip()] if isinstance(photos, dict) else []
+        if len(tokens) != 1:
+            raise DeliveryUncertain('MAX image upload must return exactly one image token')
+        file_token = tokens[0]
         self.ledger.set_state(item, self.chat_id, 'FILE_UPLOADED')
 
         body = {
-            # GET schemas do not promise that file attachments retain their
+            # GET schemas do not promise that image attachments retain their
             # original upload filename, so include it in message text too.
-            'text': f'{item.text}\nФайл: {item.file_name}',
-            'attachments': [{'type': 'file', 'payload': {'token': file_token}}],
+            'text': caption,
+            'attachments': [{'type': 'image', 'payload': {'token': file_token}}],
             'notify': True,
         }
         self.ledger.set_state(item, self.chat_id, 'POST_STARTED')
@@ -289,7 +317,7 @@ class MaxPalletLabelNotifier:
             raise DeliveryUncertain('Message POST outcome is ambiguous; reconcile by GET') from exc
 
         # Confirm the exact sender, recipient, report, SSCC, and filename by GET.
-        confirmed = self._exact_message(self._history(), item)
+        confirmed = self._exact_message(self._history(), item, image_only=True)
         if not confirmed:
             raise DeliveryUncertain('MAX returned success but exact attachment is absent in GET history')
         message_id = (confirmed.get('body') or {}).get('mid')

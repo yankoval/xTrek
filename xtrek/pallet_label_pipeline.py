@@ -27,6 +27,7 @@ class PalletLabelSpec:
     count: int
     boxes: int
     products: int
+    box_numbers: str
 
 
 def normalize_sscc(value: Any, field: str) -> str:
@@ -40,6 +41,46 @@ def normalize_sscc(value: Any, field: str) -> str:
     if int(code[-1]) != expected:
         raise PalletLabelValidationError(f'{field} has an invalid SSCC check digit')
     return code
+
+
+def compact_box_numbers(boxes: Sequence[Mapping]) -> str:
+    """Cloud-compatible serial ranges; never merge different SSCC namespaces."""
+    codes = [normalize_sscc(box.get('boxNumber'), 'boxNumber') for box in boxes]
+    if len({code[:10] for code in codes}) > 1:
+        raise PalletLabelValidationError('Box SSCC namespaces differ; serial ranges are ambiguous')
+    numbers = sorted({code[10:-1] for code in codes}, key=int)
+    ranges = []
+    if numbers:
+        start = previous = numbers[0]
+        for current in numbers[1:]:
+            if int(current) == int(previous) + 1:
+                previous = current
+                continue
+            ranges.append(start if start == previous else f'{start}-{previous}')
+            start = previous = current
+        ranges.append(start if start == previous else f'{start}-{previous}')
+    return ', '.join(ranges)
+
+
+def _wrap_label_text(text, measure, max_width):
+    """Wrap by rendered pixel width, including long unbroken filenames."""
+    lines = []
+    line = ''
+    for char in text:
+        candidate = line + char
+        if line and measure(candidate) > max_width:
+            split = line.rfind(' ')
+            if split > 0:
+                lines.append(line[:split])
+                line = line[split + 1:] + char
+            else:
+                lines.append(line)
+                line = char
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return lines
 
 
 def _object(storage: Any, key: str) -> dict:
@@ -105,7 +146,7 @@ def validate_report_task(report_key: str, report: Mapping, task_key: str,
             raise PalletLabelValidationError('Schema v1 requires exactly one assigned pallet SSCC')
         boxes = _array(report.get('readyBox', []), 'readyBox', nonempty=True)
         product_count = sum(_product_count(box, f'readyBox[{i}]') for i, box in enumerate(boxes))
-        specs.append(PalletLabelSpec(report_id, operator, assigned[0], 1, 1, len(boxes), product_count))
+        specs.append(PalletLabelSpec(report_id, operator, assigned[0], 1, 1, len(boxes), product_count, compact_box_numbers(boxes)))
         return dict(report), specs
 
     pallets = _array(report.get('readyPallet'), 'readyPallet', nonempty=True)
@@ -130,14 +171,14 @@ def validate_report_task(report_key: str, report: Mapping, task_key: str,
                 raise PalletLabelValidationError(f'{box_field}.boxNumber is duplicated or collides with pallet SSCC')
             seen_boxes.add(box_sscc)
             product_count += _product_count(box, box_field)
-        specs.append(PalletLabelSpec(report_id, operator, sscc, i + 1, len(pallets), len(boxes), product_count))
+        specs.append(PalletLabelSpec(report_id, operator, sscc, i + 1, len(pallets), len(boxes), product_count, compact_box_numbers(boxes)))
     return dict(report), specs
 
 
 def render_pallet_label_png(*, report_id: str, operator: str, pallet_number: str,
                             pallet_index: int, pallet_count: int,
                             boxes_count: int, products_count: int,
-                            font_path: str | None = None) -> bytes:
+                            box_numbers: str = '', font_path: str | None = None) -> bytes:
     """Render the established 300-dpi GS1-128 AI 00 label locally."""
     from barcode import get_barcode_class
     from barcode.writer import ImageWriter
@@ -163,13 +204,15 @@ def render_pallet_label_png(*, report_id: str, operator: str, pallet_number: str
     width, padding = max(1200, barcode_image.width + 120), 60
     probe = ImageDraw.Draw(Image.new('RGB', (1, 1)))
     details = []
+    measure = lambda text: probe.textlength(text, font=fonts[28])
     for line in (f'Отчёт: {report_id}', f'Оператор: {operator}'):
-        if probe.textbbox((0, 0), line, font=fonts[28])[2] > width - 2 * padding:
-            details.extend([line[i:i + 45] for i in range(0, len(line), 45)])
-        else:
-            details.append(line)
+        details.extend(_wrap_label_text(line, measure, width - 2 * padding))
     count_lines = [f'Коробов: {boxes_count}', f'Штук: {products_count}']
+    if box_numbers:
+        count_lines.extend(_wrap_label_text(f'Номера коробов: {box_numbers}', measure, width - 2 * padding))
     height = padding + 55 + 25 + len(details) * 38 + 25 + len(count_lines) * 38 + 15 + barcode_image.height + 25 + 45 + padding
+    if width > 7680 or height > 7680:
+        raise PalletLabelValidationError('Label with complete box ranges exceeds MAX image dimensions')
     image = Image.new('RGB', (width, height), 'white')
     draw = ImageDraw.Draw(image)
     draw.rectangle([0, 0, width - 1, height - 1], outline='black', width=5)
@@ -224,12 +267,13 @@ def prepare_report_label_messages(*, report_storage: Any, task_storage: Any,
         png = renderer(report_id=spec.report_id, operator=spec.operator,
                        pallet_number=spec.sscc, pallet_index=spec.index,
                        pallet_count=spec.count, boxes_count=spec.boxes,
-                       products_count=spec.products)
+                       products_count=spec.products, box_numbers=spec.box_numbers)
         if not isinstance(png, bytes) or not png.startswith(b'\x89PNG\r\n\x1a\n'):
             raise PalletLabelValidationError('Renderer must return PNG bytes')
         text = (f'Ярлык паллета {spec.index}/{spec.count}\nОтчёт: {spec.report_id}'
                 f'\nОператор: {spec.operator}\nSSCC: {spec.sscc}'
-                f'\nКоробов: {spec.boxes}\nШтук: {spec.products}')
+                f'\nКоробов: {spec.boxes}\nШтук: {spec.products}'
+                f'\nНомера коробов: {spec.box_numbers}')
         result.append(LabelMessage(spec.report_id, spec.sscc, file_name, text, png, source_hash))
     return result
 

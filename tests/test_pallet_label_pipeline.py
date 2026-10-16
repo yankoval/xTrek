@@ -122,3 +122,84 @@ def test_event_entrypoint_passes_only_validated_rendered_messages_to_notifier():
     )
     assert [result['sscc'] for result in results] == [PALLET_1, PALLET_2]
     assert all(item.file_name.endswith('.png') for item in notifier.items)
+
+
+def make_sscc(serial, namespace='0460705179'):
+    body = namespace + f'{serial:07d}'
+    check = (10 - sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(body))) % 10) % 10
+    return body + str(check)
+
+
+def test_compact_ranges_match_cloud_with_leading_zeros_gaps_and_ai00():
+    from xtrek.pallet_label_pipeline import compact_box_numbers
+    codes = [make_sscc(n) for n in [5, 2, 1, 2, 8, 9]]
+    assert compact_box_numbers([{'boxNumber': '00' + c} for c in codes]) == '0000001-0000002, 0000005, 0000008-0000009'
+
+
+def test_serial_ranges_reject_ambiguous_namespaces_and_bad_check_digits():
+    from xtrek.pallet_label_pipeline import compact_box_numbers
+    with pytest.raises(PalletLabelValidationError, match='namespaces'):
+        compact_box_numbers([{'boxNumber': make_sscc(1)}, {'boxNumber': make_sscc(2, '1460705179')}])
+    with pytest.raises(PalletLabelValidationError, match='check digit'):
+        compact_box_numbers([{'boxNumber': make_sscc(1)[:-1] + '0'}])
+
+
+def test_each_pallet_caption_and_renderer_get_only_its_boxes_without_source_files():
+    calls = []
+    labels = prepare_report_label_messages(
+        report_storage=FakeStorage({'equipment-reports/report-0001.json': report_v2()}),
+        task_storage=FakeStorage({'equipment-tasks/report-0001.json': task_v2()}),
+        report_key='equipment-reports/report-0001.json',
+        renderer=lambda **kw: calls.append(kw) or b'\x89PNG\r\n\x1a\nfixture')
+    assert [c['box_numbers'] for c in calls] == ['0000002', '0000003']
+    for i, label in enumerate(labels):
+        assert f"Номера коробов: {calls[i]['box_numbers']}" in label.text
+        assert 'Отчёт-файл:' not in label.text
+        assert 'Задание-файл:' not in label.text
+        assert '93TAIL' not in label.text
+
+
+def test_v1_boxes_are_included_in_single_assigned_pallet():
+    report = {'id': REPORT_ID, 'readyBox': [{'boxNumber': make_sscc(n), 'productNumbersFull': ['fixture']} for n in (1, 2, 5)]}
+    task = {'id': REPORT_ID, 'reportSchemaVersion': 1, 'palletNumbers': [PALLET_1]}
+    _, specs = validate_report_task(f'equipment-reports/{REPORT_ID}.json', report, '', task)
+    assert specs[0].box_numbers == '0000001-0000002, 0000005'
+
+
+@pytest.mark.parametrize('ranges', ['0000001-0000010', ', '.join(f'{n:07d}' for n in range(0, 700, 2))])
+def test_rendered_label_contains_complete_wrapped_ranges_and_decodable_barcode(monkeypatch, ranges):
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+    from xtrek.pallet_label_pipeline import render_pallet_label_png
+    import zxingcpp
+    drawn = []
+    original = ImageDraw.ImageDraw.text
+    def text(self, xy, value, *args, **kw):
+        if isinstance(value, str): drawn.append((xy, value, kw.get('font')))
+        return original(self, xy, value, *args, **kw)
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', text)
+    data = render_pallet_label_png(report_id='Синтетический отчёт', operator='Оператор',
+        pallet_number=PALLET_1, pallet_index=1, pallet_count=1, boxes_count=350,
+        products_count=700, box_numbers=ranges, font_path='/Library/Fonts/Arial Unicode.ttf')
+    image = Image.open(BytesIO(data))
+    assert image.width <= 7680 and image.height <= 7680
+    assert any('Номера коробов:' in v for _, v, _ in drawn)
+    # Whitespace may be removed only at wrap boundaries; every serial survives.
+    all_text = ''.join(v.replace(' ', '') for _, v, _ in drawn)
+    assert ranges.replace(' ', '') in all_text
+    for (x, y), value, font in drawn:
+        if font:
+            assert x >= 50
+            assert x + ImageDraw.Draw(image).textlength(value, font=font) <= image.width - 50
+            assert y < image.height - 40
+    result = zxingcpp.read_barcode(image)
+    assert result is not None
+    assert result.text.replace('(', '').replace(')', '').endswith('00' + PALLET_1)
+
+
+def test_label_rejects_unbounded_ranges_instead_of_clipping():
+    from xtrek.pallet_label_pipeline import render_pallet_label_png
+    with pytest.raises(PalletLabelValidationError, match='dimensions'):
+        render_pallet_label_png(report_id='fixture', operator='fixture', pallet_number=PALLET_1,
+            pallet_index=1, pallet_count=1, boxes_count=10000, products_count=10000,
+            box_numbers=', '.join(f'{n:07d}' for n in range(10000)), font_path='/Library/Fonts/Arial Unicode.ttf')

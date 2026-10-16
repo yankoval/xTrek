@@ -67,7 +67,8 @@ def test_snapshot_storage_has_only_frozen_join():
     assert '"a"' in x.read_text('a')
 
 
-def test_celery_delivery_calls_notifier_and_caches_png(tmp_path, monkeypatch):
+@pytest.mark.parametrize('existing_state,missing_cache', [(None, False), ('CONFIRMED', False), ('CONFIRMED', True), ('UPLOAD_PENDING', False), ('FILE_UPLOADED', False), ('FILE_UPLOADED', True), ('POST_UNCERTAIN', True), ('POSTED_UNCONFIRMED', True)])
+def test_celery_delivery_calls_notifier_and_caches_png(tmp_path, monkeypatch, existing_state, missing_cache):
     import json
     import boto3
     import requests
@@ -84,6 +85,17 @@ def test_celery_delivery_calls_notifier_and_caches_png(tmp_path, monkeypatch):
     monkeypatch.setattr(requests,'Session',lambda:type('Session',(),{})())
     monkeypatch.setattr(runtime,'read_snapshot',lambda client,bucket,key:(source() if key.startswith('Задания/') else {},{}))
     item=LabelMessage(RID,'346070517900000057','pallet_1_346070517900000057.png','fixture',b'\x89PNG\r\n\x1a\nfixture','source-hash')
+    from dataclasses import replace
+    ledger = DeliveryLedger(cfg['ledger_path'])
+    original_item = item
+    if existing_state:
+        ledger.reserve(item, cfg['chat_id'])
+        ledger.set_state(item, cfg['chat_id'], existing_state, 'old-mid')
+        if not missing_cache:
+            cached = tmp_path/'png'/RID/item.file_name
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(item.png_bytes)
+        item = replace(item, png_bytes=b'\x89PNG\r\n\x1a\nnew renderer', text='new caption')
     monkeypatch.setattr(runtime,'prepare_report_label_messages',lambda **kw:[item])
     calls=[]
     class Notifier:
@@ -92,8 +104,26 @@ def test_celery_delivery_calls_notifier_and_caches_png(tmp_path, monkeypatch):
             assert kw['expected_bot_user_id']=='259171708'
         def _verify_bot(self):pass
         def _history(self):return []
-        def deliver(self,label):calls.append(label);return {'state':'CONFIRMED','message_id':'mid.fixture'}
+        def deliver(self,label):
+            if existing_state == 'POST_UNCERTAIN':
+                raise runtime.DeliveryUncertain('Prior message POST is ambiguous; GET only, never auto-repeat')
+            calls.append(label)
+            return {'state':'CONFIRMED','message_id':'mid.fixture'}
     monkeypatch.setattr(runtime,'MaxPalletLabelNotifier',Notifier)
-    out=runtime.deliver_pallet_report(report_key='equipment-reports/'+RID+'.json',runtime_config={'s3_config':{}},delivery_config_path=str(tmp_path/'config.json'))
-    assert out['state']=='DELIVERED' and len(calls)==1
-    assert (tmp_path/'png'/RID/item.file_name).read_bytes()==item.png_bytes
+    def deliver():
+        return runtime.deliver_pallet_report(report_key='equipment-reports/'+RID+'.json',runtime_config={'s3_config':{}},delivery_config_path=str(tmp_path/'config.json'))
+    if missing_cache and existing_state not in {'CONFIRMED', 'POSTED_UNCONFIRMED'}:
+        with pytest.raises(runtime.DeliveryUncertain, match='never auto-repeat' if existing_state == 'POST_UNCERTAIN' else 'Previous PNG unavailable'):
+            deliver()
+        assert not calls
+        assert ledger.get(RID, item.sscc, cfg['chat_id'])['state'] == existing_state
+        return
+    out=deliver()
+    assert out['state']=='DELIVERED'
+    assert len(calls)==(0 if existing_state == 'CONFIRMED' else 1)
+    if not missing_cache:
+        assert (tmp_path/'png'/RID/item.file_name).read_bytes()==original_item.png_bytes
+    if calls and existing_state != 'POSTED_UNCONFIRMED':
+        assert calls[0].png_bytes == original_item.png_bytes
+    if existing_state:
+        assert out['labels'][0]['png_sha256'] == ledger.get(RID, item.sscc, cfg['chat_id'])['file_sha256']

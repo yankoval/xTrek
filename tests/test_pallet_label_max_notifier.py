@@ -54,7 +54,7 @@ class FakeSession:
         if url.endswith('/uploads'):
             return Response(value={'url': MAX_UPLOAD_URL})
         if url == MAX_UPLOAD_URL:
-            return Response(value={'token': 'fixture-file-token'})
+            return Response(value={'photos': {'one': {'token': 'fixture-image-token'}}})
         if url.endswith('/messages'):
             self.message_number += 1
             text = kwargs['json']['text']
@@ -66,7 +66,7 @@ class FakeSession:
                 'body': {
                     'mid': f'mid-{self.message_number}',
                     'text': text,
-                    'attachments': [{'type': 'file', 'payload': {'name': filename, 'token': 'fixture-file-token'}}],
+                    'attachments': [{'type': 'image', 'payload': {'token': 'fixture-image-token'}}],
                 },
             }
             self.history.insert(0, message)
@@ -121,7 +121,7 @@ def test_exact_existing_file_in_get_prevents_any_post(tmp_path):
     session = FakeSession(history=[existing])
     notifier, ledger = make_notifier(tmp_path, session)
     result = notifier.deliver(make_item())
-    assert result == {'state': 'ALREADY_CONFIRMED_BY_GET', 'message_id': 'already-there'}
+    assert result == {'state': 'LEGACY_FILE_CONFIRMED_BY_GET', 'message_id': 'already-there'}
     assert session.posts == []
     assert ledger.get(REPORT, SSCC, CHAT)['state'] == 'CONFIRMED'
 
@@ -192,7 +192,7 @@ def test_seeded_exact_old_attachment_prevents_new_post(tmp_path):
     notifier,ledger=make_notifier(tmp_path,session)
     notifier.history_seed=[{'timestamp':1,'sender':{'user_id':BOT},'recipient':{'chat_id':int(CHAT)},
        'body':{'mid':'old-seed','text':REPORT+' '+SSCC+' '+FILENAME,'attachments':[{'type':'file','payload':{'name':FILENAME}}]}}]
-    assert notifier.deliver(make_item())['state']=='ALREADY_CONFIRMED_BY_GET'
+    assert notifier.deliver(make_item())['state']=='LEGACY_FILE_CONFIRMED_BY_GET'
     assert not session.posts
 
 
@@ -231,3 +231,122 @@ def test_explicit_approved_bounded_history_accepts_page_limit(tmp_path):
     notifier,ledger=make_notifier(tmp_path,Pages())
     notifier.history_start_ms=0;notifier.max_history_pages=2;notifier.allow_truncated_history=True
     assert len(notifier._history())==200
+
+
+def test_image_upload_contract_and_caption_filename(tmp_path):
+    session = FakeSession()
+    notifier, _ = make_notifier(tmp_path, session)
+    notifier.deliver(make_item())
+    assert session.posts[0][1]['params'] == {'type': 'image'}
+    assert set(session.posts[1][1]['files']) == {'data'}
+    assert session.posts[1][1]['files']['data'] == (FILENAME, make_item().png_bytes, 'image/png')
+    payload = session.posts[2][1]['json']
+    assert payload['attachments'] == [{'type': 'image', 'payload': {'token': 'fixture-image-token'}}]
+    assert f'Файл: {FILENAME}' in payload['text']
+
+
+@pytest.mark.parametrize('value', [
+    {}, {'code': 'upload.error'}, {'photos': {}}, {'photos': []},
+    {'photos': {'a': {'token': ''}}}, {'photos': {'a': {'token': '   '}}},
+    {'photos': {'a': {'token': 'one'}, 'b': {'token': 'two'}}},
+    {'token': 'file-only'}, ['invalid'],
+])
+def test_invalid_image_upload_never_posts_message_and_can_retry(tmp_path, value):
+    session = FakeSession()
+    post = session.post
+    session.post = lambda url, **kw: Response(value=value) if url == MAX_UPLOAD_URL else post(url, **kw)
+    notifier, ledger = make_notifier(tmp_path, session)
+    with pytest.raises(DeliveryUncertain):
+        notifier.deliver(make_item())
+    assert session.message_number == 0
+    assert ledger.get(REPORT, SSCC, CHAT)['state'] == 'UPLOAD_PENDING'
+    session.post = post
+    assert notifier.deliver(make_item())['state'] == 'CONFIRMED'
+
+
+def test_non_json_image_upload_never_posts_message(tmp_path):
+    class BadJSON(Response):
+        def json(self): raise ValueError('bad json')
+    session = FakeSession()
+    post = session.post
+    session.post = lambda url, **kw: BadJSON() if url == MAX_UPLOAD_URL else post(url, **kw)
+    notifier, _ = make_notifier(tmp_path, session)
+    with pytest.raises(DeliveryUncertain, match='invalid JSON'):
+        notifier.deliver(make_item())
+    assert session.message_number == 0
+
+
+def test_only_explicit_attachment_not_ready_retries_message(tmp_path):
+    session = FakeSession()
+    post = session.post
+    attempts = []
+    def send(url, **kw):
+        if url.endswith('/messages'):
+            attempts.append(kw['json'])
+            if len(attempts) == 1:
+                return Response(status=400, value={'code': 'attachment.not.ready'})
+        return post(url, **kw)
+    session.post = send
+    notifier, _ = make_notifier(tmp_path, session)
+    assert notifier.deliver(make_item())['state'] == 'CONFIRMED'
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert session.message_number == 1
+
+
+def test_changed_renderer_does_not_repost_confirmed_ledger(tmp_path):
+    from dataclasses import replace
+    session = FakeSession()
+    notifier, ledger = make_notifier(tmp_path, session)
+    notifier.deliver(make_item())
+    session.history.clear()
+    count = len(session.posts)
+    changed = replace(make_item(), png_bytes=b'new renderer', text='new caption')
+    assert notifier.deliver(changed)['state'] == 'ALREADY_CONFIRMED_BY_LEDGER'
+    assert len(session.posts) == count
+    assert ledger.get(REPORT, SSCC, CHAT)['file_sha256'] != __import__('hashlib').sha256(changed.png_bytes).hexdigest()
+
+
+@pytest.mark.parametrize('field,value', [('sender', {'user_id': 'wrong'}), ('recipient', {'chat_id': 'wrong'})])
+def test_wrong_identity_image_does_not_confirm_our_delivery(tmp_path, field, value):
+    session = FakeSession()
+    notifier, _ = make_notifier(tmp_path, session)
+    notifier.deliver(make_item())
+    message = session.history[0]
+    message[field] = value
+    # A fresh ledger cannot confirm another sender/recipient's image.
+    other, _ = make_notifier(tmp_path / 'other', session)
+    assert other._exact_message([message], make_item()) is None
+
+
+def test_file_response_cannot_confirm_new_image_post(tmp_path):
+    session = FakeSession()
+    post = session.post
+    def file_reply(url, **kw):
+        result = post(url, **kw)
+        if url.endswith('/messages'):
+            session.history[0]['body']['attachments'][0]['type'] = 'file'
+        return result
+    session.post = file_reply
+    notifier, ledger = make_notifier(tmp_path, session)
+    with pytest.raises(DeliveryUncertain, match='exact attachment is absent'):
+        notifier.deliver(make_item())
+    assert ledger.get(REPORT, SSCC, CHAT)['state'] == 'POSTED_UNCONFIRMED'
+
+
+@pytest.mark.parametrize('value', [{}, ['invalid'], {'code': 'error', 'url': MAX_UPLOAD_URL}])
+def test_invalid_upload_init_fails_before_binary_upload(tmp_path, value):
+    session = FakeSession()
+    session.post = lambda *args, **kw: Response(value=value)
+    notifier, ledger = make_notifier(tmp_path, session)
+    with pytest.raises(DeliveryUncertain):
+        notifier.deliver(make_item())
+    assert ledger.get(REPORT, SSCC, CHAT)['state'] == 'UPLOAD_PENDING'
+
+
+def test_oversized_caption_is_rejected_before_any_upload(tmp_path):
+    from dataclasses import replace
+    session = FakeSession()
+    notifier, _ = make_notifier(tmp_path, session)
+    with pytest.raises(ValueError, match='4000-character'):
+        notifier.deliver(replace(make_item(), text='x' * 4000))
+    assert session.posts == []
