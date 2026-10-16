@@ -1,2 +1,5 @@
 pytest
 celery>=5,<6
+# Render and independently decode pallet label barcodes in offline tests.
+python-barcode==0.16.1
+zxing-cpp>=2.3,<4

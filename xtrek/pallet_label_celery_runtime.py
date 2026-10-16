@@ -1,6 +1,7 @@
 """VPS Celery entrypoint for validated pallet PNG delivery, with no business POST."""
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -10,7 +11,7 @@ from pathlib import Path
 from datetime import datetime
 
 from .pallet_label_pipeline import prepare_report_label_messages
-from .pallet_label_max_notifier import DeliveryLedger, MaxPalletLabelNotifier
+from .pallet_label_max_notifier import DeliveryConflict, DeliveryUncertain, DeliveryLedger, MaxPalletLabelNotifier
 
 PROTECTED_UUID = '623c20fa-f90c-4478-aeae-9c6635cedc9f'
 
@@ -122,6 +123,20 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
     results = []
     for label in labels:
         output = Path(settings['png_root']) / label.report_id / label.file_name
+        row = ledger.get(label.report_id, label.sscc, str(settings['chat_id']))
+        if row and row['state'] == 'CONFIRMED':
+            if row['source_hash'] != label.source_hash or row['file_name'] != label.file_name:
+                raise DeliveryConflict('Confirmed delivery source identity changed')
+            results.append({'sscc': label.sscc, 'png_sha256': row['file_sha256'],
+                            'state': 'ALREADY_CONFIRMED_BY_LEDGER', 'message_id': row.get('message_id')})
+            continue
+        if row and row['file_sha256'] != hashlib.sha256(label.png_bytes).hexdigest():
+            if row['source_hash'] != label.source_hash or row['file_name'] != label.file_name:
+                raise DeliveryUncertain('Legacy delivery requires GET reconciliation')
+            if not output.exists() or hashlib.sha256(output.read_bytes()).hexdigest() != row['file_sha256']:
+                raise DeliveryUncertain('Previous PNG unavailable; preserve delivery ledger for reconciliation')
+            # Continue a pre-release upload using its immutable original PNG.
+            label = replace(label, png_bytes=output.read_bytes())
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists() and output.read_bytes() != label.png_bytes:
             raise ValueError('Immutable PNG cache changed')
