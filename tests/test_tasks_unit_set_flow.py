@@ -129,7 +129,7 @@ def test_local_prnsrv_function_is_a_configured_source_event_fanout(monkeypatch, 
                         types.SimpleNamespace(process_local_prnsrv_s3_event=process_generator))
     order = MagicMock(return_value='Order created')
     monkeypatch.setattr(tasks, 'logic_create_order', order)
-    source = {"Quantity": "5", "PasportData": {}}
+    source = {"Gtin": "04670404500000", "Quantity": "5", "PasportData": {}}
     source_storage = MagicMock()
     source_storage.read_text.return_value = json.dumps(source)
     monkeypatch.setattr(tasks, 'get_storage', MagicMock(return_value=source_storage))
@@ -147,7 +147,7 @@ def test_local_prnsrv_function_is_a_configured_source_event_fanout(monkeypatch, 
 def test_blank_quantity_routes_equipment_only_and_skips_prnsrv_and_emission(monkeypatch, quantity, capsys):
     tasks = import_tasks(monkeypatch)
     tasks.config['prnsrv_local_generator_enabled'] = True
-    source = {"PasportData": {}}
+    source = {"Gtin": "04670404500000", "PasportData": {}}
     if quantity is not None:
         source['Quantity'] = quantity
     source_storage = MagicMock()
@@ -958,3 +958,61 @@ def test_terminal_task_failure_records_failure_not_success(monkeypatch):
     monkeypatch.setattr(tasks, "_record_local_event_state", record)
     tasks._finish_token_snapshot(task_id="existing-event", state="FAILURE")
     record.assert_called_once_with("existing-event", "failed")
+
+
+def test_direct_route_never_creates_equipment_or_emission(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    source = {'directMode': True, 'emissionDocumentId':'58835a34-2c28-4397-bb61-8151f9ac1723'}
+    monkeypatch.setattr(tasks, 'process_incoming_task', lambda **_: 'T-direct-test')
+    monkeypatch.setattr(tasks, 'get_production_order_data', lambda _: source)
+    storage = MagicMock(); storage.read_text.return_value = '{"codes":[]}'
+    monkeypatch.setattr(tasks, 'get_storage', lambda *_: storage)
+    publish = MagicMock(return_value=source['emissionDocumentId'])
+    monkeypatch.setattr(tasks, 'publish_direct_codes', publish)
+    equipment = MagicMock(); emission = MagicMock()
+    monkeypatch.setattr(tasks, 'create_equipment_aggregation_task', equipment)
+    monkeypatch.setattr(tasks, 'create_emission_task', emission)
+    tasks.logic_create_order('input-bucket/test/Задания/task.json', source)
+    publish.assert_called_once()
+    equipment.assert_not_called(); emission.assert_not_called()
+    storage.exists.return_value = False
+    with pytest.raises(RuntimeError, match='Waiting for emission'):
+        tasks.logic_create_order('input-bucket/test/Задания/task.json', source)
+
+
+def test_direct_codes_and_status_reuse_common_commands(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    monkeypatch.setattr(tasks, 'direct_context', lambda *_: ('T-direct-test', {'GtinType': 'UNIT'}))
+    calls = {}
+    for name in ('create_utilisation_task', 'sign_and_send_utilisation', 'create_introduce_task',
+                 'sign_and_send_introduce', 'generate_prn_files', 'create_virtual_utilisation_task',
+                 'create_aggregation_report', 'sign_and_send_aggregation'):
+        calls[name] = MagicMock(return_value='ok'); monkeypatch.setattr(tasks, name, calls[name])
+    tasks.logic_kodes('test/kodes/order.json')
+    calls['create_utilisation_task'].assert_called_once_with('order', tasks.PRODUCT_GROUP, production_order_id='T-direct-test')
+    calls['generate_prn_files'].assert_not_called()
+    calls['create_virtual_utilisation_task'].assert_not_called()
+    monkeypatch.setattr(tasks, 'update_utilisation_report_status', lambda _: tasks.UtilisationReportStatus(
+        omsId='oms', reportId='report', reportStatus='SUCCESS', productionOrderId='T-direct-test'))
+    tasks.logic_utilisationReceipt('test/utilisationReceipts/order.json')
+    calls['create_introduce_task'].assert_called_once_with('order', tasks.PRODUCT_GROUP, production_order_id='T-direct-test')
+    monkeypatch.setattr(tasks, 'update_introduce_status', lambda *_: {'status':'CHECKED_OK', 'productionOrderId':'T-direct-test'})
+    tasks.config['production_orders_path'] = 's3://test/productionOrders'
+    store = MagicMock()
+    monkeypatch.setattr(tasks, 'get_storage', lambda *_: store)
+    assert 'completed' in tasks.logic_update_introduce('test/introduceReceipts/order.json')
+    store.set_tags.assert_called_once_with('s3://test/productionOrders/T-direct-test.json', {'check': 'finished'})
+    calls['create_aggregation_report'].assert_not_called(); calls['sign_and_send_aggregation'].assert_not_called()
+
+
+def test_code_input_is_inert_and_preserves_test_prefix(monkeypatch):
+    tasks = import_tasks(monkeypatch)
+    tasks.config['event_key_prefix'] = 'isolated/'
+    storage = MagicMock()
+    storage.read_text.return_value = json.dumps({'codes':['010467040450000021ABC\x1d93XYZ']})
+    factory = MagicMock(return_value=storage); monkeypatch.setattr(tasks, 'get_storage', factory)
+    create = MagicMock(); monkeypatch.setattr(tasks, 'logic_create_order', create)
+    result = tasks.process_s3_event.apply(args=[{'bucket':'input-bucket', 'key':'isolated/Задания/codes.json'}])
+    assert result.successful()
+    create.assert_not_called()
+    storage.read_text.assert_called_once_with('s3://input-bucket/isolated/Задания/codes.json')

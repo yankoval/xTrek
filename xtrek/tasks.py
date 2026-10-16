@@ -22,12 +22,16 @@ from xtrek.create_emission_task_sample import (
     update_emission_order_status,
     get_emission_kodes,
     create_virtual_utilisation_task,
+    create_utilisation_task,
+    create_introduce_task,
     sign_and_send_utilisation,
     update_utilisation_report_status,
     create_virtual_introduce_task,
     sign_and_send_introduce,
     update_introduce_status,
     create_virtual_tasks_from_equipment_report,
+    create_virtual_production_tasks,
+    create_equipment_set_report,
     create_utilisation_task_from_report,
     create_introduce_task_from_report,
     update_aggregation_status,
@@ -48,6 +52,7 @@ from xtrek.create_emission_task_sample import (
     update_cis_information_change_status,
 )
 from xtrek.prn_util import generate_prn_files
+from xtrek.direct_mode import classify_input, direct_context, publish_direct_codes
 from xtrek.utils import (
     check_aggregation_reports,
     set_ready_check,
@@ -332,13 +337,18 @@ def trigger_set_aggregation_if_ready(parent_id):
     print(f"[*] Проверка готовности набора для {parent_id}...")
     # set_ready_check принимает путь к отчету оборудования.
     # В xtrek/utils.py resolve_file_path достроит его если передать просто ID.
-    ready_status = set_ready_check(parent_id)
+    parent = (get_production_order_data(parent_id) or {}) if parent_id.startswith('T-direct-') else {}
+    direct_set = parent.get('directMode') is True and parent.get('GtinType') == 'SET'
+    ready_path = (config['production_orders_path'].rstrip('/') + '/' + parent_id + '.json'
+                  if direct_set else parent_id)
+    ready_status = set_ready_check(ready_path)
 
     if ready_status == "setReady":
         print(f"[+++] Набор {parent_id} готов к агрегации. Запуск процедур...")
 
         # 1. Создаем отчет об агрегации наборов
-        res1 = create_equipment_set_report_from_report(parent_id)
+        res1 = (create_equipment_set_report(parent_id) if direct_set
+                else create_equipment_set_report_from_report(parent_id))
         if not res1:
             raise RuntimeError(f"create_equipment_set_report_from_report failed for {parent_id}")
 
@@ -400,6 +410,18 @@ def logic_create_order(full_key, source_data=None):
     production_order_id = process_incoming_task(s3_full_key=full_key)
     if not production_order_id:
         return "No production_order_id created"
+
+    task = get_production_order_data(production_order_id) if production_order_id.startswith('T-direct-') else None
+    if task and task.get('directMode') is True:
+        codes_path = 's3://' + full_key.rsplit('/', 1)[0].removeprefix('s3://') + '/' + task['emissionDocumentId'] + '.json'
+        codes_storage = get_storage(codes_path, config.get('s3_config'))
+        if not codes_storage.exists(codes_path):
+            raise RuntimeError('Waiting for emission code block: ' + task['emissionDocumentId'])
+        block = json.loads(codes_storage.read_text(codes_path))
+        order_id = publish_direct_codes(config, production_order_id, task, block)
+        if task.get('GtinType') == 'SET':
+            create_virtual_production_tasks(production_order_id, qty=len(block['codes']))
+        return f'Direct task {production_order_id}: codes {order_id} published'
 
     equipment_task = create_equipment_aggregation_task(production_order_id)
     if not equipment_task:
@@ -491,8 +513,16 @@ def logic_kodes(full_key):
     # Здесь предполагается, что full_key содержит ID эмиссии или путь к нему
     kodes_order_id = full_key.split('/')[-1].replace('.json', '') 
     
-    print(f"[LOGIC-5] печать а так же проверка и запуск создания отчёта о нанесении: {kodes_order_id}")
+    print(f"[LOGIC-5] Обработка файла кодов: {kodes_order_id}")
     
+    context = direct_context(config, kodes_order_id)
+    if context:
+        if not create_utilisation_task(kodes_order_id, PRODUCT_GROUP, production_order_id=context[0]):
+            raise RuntimeError('Direct utilisation preparation failed')
+        if not sign_and_send_utilisation(kodes_order_id, signing_dir, 120):
+            raise RuntimeError('Direct utilisation submission failed')
+        return f'Direct utilisation for {kodes_order_id} submitted'
+
     # Создание задания на печать
     try:
         result = generate_prn_files(kodes_order_id)
@@ -525,11 +555,21 @@ def logic_utilisationReceipt(full_key):
     result = update_utilisation_report_status(utilisationReceipt_id)
     if not result:
         raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id}")
-    print(f"Virtual utilisation task for {utilisationReceipt_id} status is {result}")
+    print(f"Utilisation task for {utilisationReceipt_id} status is {result}")
     if type(result) is not UtilisationReportStatus:
         raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result:{result}")
     if result.reportStatus !="SUCCESS":
         raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result staus:{result.reportStatus}")
+
+    context = direct_context(config, utilisationReceipt_id)
+    if context:
+        if context[1].get('GtinType') == 'SET':
+            return trigger_set_aggregation_if_ready(context[0])
+        if not create_introduce_task(utilisationReceipt_id, PRODUCT_GROUP, production_order_id=context[0]):
+            raise RuntimeError('Direct introduction preparation failed')
+        if not sign_and_send_introduce(utilisationReceipt_id, PRODUCT_GROUP, signing_dir, 120):
+            raise RuntimeError('Direct introduction submission failed')
+        return f'Direct introduction for {utilisationReceipt_id} submitted'
 
     # Если это реальный заказ
     if utilisationReceipt_id.startswith('T-'):
@@ -600,9 +640,15 @@ def logic_utilisationReceipt(full_key):
             #TODO: Create print task if not virtual
             return f"For real production order {utilisationReceipt_id}, skip send introduce task in virtual task flow."
 
-    return f"Virtual utilisation task for {utilisationReceipt_id} status is {result}"
+    return f"Utilisation task for {utilisationReceipt_id} status is {result}"
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 20ab2a0c... / ПАПКА: emissionRecepts ---
+def _finish_direct_production_order(production_order_id):
+    """Persist completion before acknowledging the route; tag failures must retry."""
+    path = config['production_orders_path'].rstrip('/') + '/' + production_order_id + '.json'
+    get_storage(path, config.get('s3_config')).set_tags(path, {'check': 'finished'})
+
+
 def logic_update_introduce(full_key):
     # Здесь предполагается, что full_key содержит ID заказа или путь к нему
     # ВАЖНО: Если update_introduce_status нужен ID, извлеките его из ключа
@@ -624,6 +670,13 @@ def logic_update_introduce(full_key):
         prod_id = result.get('productionOrderId') or _find_production_order_id_by_suz_order_id(introduceReceipt_id)
         if not prod_id:
             return f"introduce status for {introduceReceipt_id} is CHECKED_OK, but prod_id not found"
+
+        context = direct_context(config, introduceReceipt_id)
+        if context:
+            if context[1].get('GtinType') != 'UNIT' or context[0] != prod_id:
+                raise TerminalBusinessError('Direct introduction does not match its UNIT task')
+            _finish_direct_production_order(prod_id)
+            return f'Direct introduction for {introduceReceipt_id} completed (CHECKED_OK)'
 
         # Если это виртуальный компонент, пробуем запустить агрегацию набора
         if prod_id.startswith('V-'):
@@ -959,6 +1012,12 @@ def logic_update_agg_set(full_key):
 
     result = update_aggregation_set_status(production_order_id, group)
     result = _require_checked_aggregation_status(result, production_order_id, "aggregation-set")
+    production = ((get_production_order_data(production_order_id) or {})
+                  if production_order_id.startswith('T-direct-') else {})
+    if production.get('directMode') is True and production.get('GtinType') == 'SET':
+        _finish_direct_production_order(production_order_id)
+        return f'Direct set {production_order_id} completed (CHECKED_OK)'
+
     print(f"[+++] Агрегация наборов для {production_order_id} успешна. Запуск стандартной агрегации...")
 
     # 1. Создаем отчет об агрегации (стандартный для ЛК)
@@ -1056,10 +1115,12 @@ def process_s3_event(self, data, terminal_failure=None):
         # Условие №1: Создание заказа
         if bucket == INPUT_BUCKET and key.startswith("Задания/"):
             prnsrv_result = None
-            source_storage = get_storage(f"s3://{bucket}/{key}", config.get('s3_config'))
-            source = json.loads(source_storage.read_text(f"s3://{bucket}/{key}"))
+            source_storage = get_storage(f"s3://{full_key}", config.get('s3_config'))
+            source = json.loads(source_storage.read_text(f"s3://{full_key}"))
+            if classify_input(source) == 'codes':
+                return 'Emission block received; awaiting its production task'
             unlimited_quantity = is_unlimited_equipment_quantity(source.get('Quantity'))
-            if config.get('prnsrv_local_generator_enabled') is True and not unlimited_quantity:
+            if config.get('prnsrv_local_generator_enabled') is True and not unlimited_quantity and not source.get('directMode'):
                 from xtrek.prnsrv_local_runtime import process_local_prnsrv_s3_event
                 prnsrv_result = process_local_prnsrv_s3_event(
                     bucket=bucket,

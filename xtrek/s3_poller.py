@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from .direct_mode import classify_input, validate_direct_task
 
 
 LOG = logging.getLogger("xtrek.s3_poller")
@@ -35,6 +36,16 @@ ROUTED_PREFIXES = {
         "cisInformationChangeReceipts/", "aggSetReceipts/",
     ),
 }
+
+
+def configured_routes(input_bucket, internal_bucket, prefix=''):
+    if prefix and (prefix.startswith('/') or not prefix.endswith('/') or '..' in prefix.split('/')):
+        raise ValueError('S3 event prefix must be relative and end with /')
+    routes = {}
+    for bucket, prefixes in ((input_bucket, ('Задания/',)),
+                             (internal_bucket, ROUTED_PREFIXES[INTERNAL_BUCKET])):
+        routes.setdefault(bucket, []).extend(prefix + p for p in prefixes)
+    return {bucket: tuple(dict.fromkeys(prefixes)) for bucket, prefixes in routes.items()}
 
 
 def _utc(value) -> str:
@@ -275,6 +286,9 @@ class S3EventPoller:
     max_gets: int = 100
     retry_limit: int = 20
     cycle_seconds: float = 30
+    input_bucket: str = INPUT_BUCKET
+    event_prefix: str = ''
+    routed_prefixes: dict | None = None
     metrics: dict = field(default_factory=dict, init=False)
 
     def __post_init__(self):
@@ -294,7 +308,7 @@ class S3EventPoller:
         self.sdk_measurable = events is not None
 
     def _source_inn_allowed(self, bucket: str, key: str, obj: dict) -> bool:
-        if bucket != INPUT_BUCKET or not key.startswith('Задания/') or not self.allowed_inns:
+        if bucket != self.input_bucket or not key.startswith(self.event_prefix + 'Задания/') or not self.allowed_inns:
             return True
         request = {'Bucket': bucket, 'Key': key}
         if obj.get('ETag'):
@@ -334,6 +348,14 @@ class S3EventPoller:
         if not isinstance(source, dict) or (source.get('PasportData') is not None
                                            and not isinstance(source['PasportData'], dict)):
             raise ValueError('Invalid source shape')
+        if 'codes' in source:
+            if classify_input(source) == 'codes':
+                return True  # Inert input; only the paired task authorizes processing.
+        if source.get('directMode') is not None:
+            classify_input(source)
+            if source.get('directMode'):
+                validate_direct_task(source)
+                return str(source['PasportData']['Manufacturer_inn']).strip() in self.allowed_inns
         quantity = source.get('Quantity')
         if quantity is None or (isinstance(quantity, str) and not quantity.strip()):
             return True
@@ -352,7 +374,7 @@ class S3EventPoller:
             # the retry queue. A repeated LIST must not bypass its backoff.
             self.metrics['retry_skips'] += 1
             return
-        needs_get = bucket == INPUT_BUCKET and key.startswith('Задания/') and self.allowed_inns
+        needs_get = bucket == self.input_bucket and key.startswith(self.event_prefix + 'Задания/') and self.allowed_inns
         if needs_get and (self.metrics['get_calls'] >= self.max_gets or time.monotonic() >= self.deadline):
             if not retry:
                 self.ledger.defer(event_id, bucket, key, obj, 'budget', attempted=False)
@@ -401,7 +423,7 @@ class S3EventPoller:
                 if time.monotonic() >= retry_deadline:
                     break
                 self._discover(event_id, bucket, key, json.loads(meta), retry=True)
-            flattened = [(b, p) for b, prefixes in ROUTED_PREFIXES.items() for p in prefixes]
+            flattened = [(b, p) for b, prefixes in (self.routed_prefixes if self.routed_prefixes is not None else ROUTED_PREFIXES).items() for p in prefixes]
             prefix_index = self.ledger.scan_cursor() % len(flattened)
             for page_number in range(max_pages):
                 # One page slot is guaranteed even if a retry overran the soft
@@ -599,6 +621,12 @@ def main():
                                   config=Config(connect_timeout=5, read_timeout=10,
                                                 retries={'mode': 'standard', 'total_max_attempts': 1}))
                 poller = S3EventPoller(s3, ledger, cutoff, frozenset(allowlist), allowed_inns,
+                                     input_bucket=os.environ.get('XTREK_S3_INPUT_BUCKET', INPUT_BUCKET),
+                                     event_prefix=os.environ.get('XTREK_S3_EVENT_PREFIX', ''),
+                                     routed_prefixes=configured_routes(
+                                         os.environ.get('XTREK_S3_INPUT_BUCKET', INPUT_BUCKET),
+                                         os.environ.get('XTREK_S3_INTERNAL_BUCKET', INTERNAL_BUCKET),
+                                         os.environ.get('XTREK_S3_EVENT_PREFIX', '')),
                                      max_gets=int(os.environ.get('XTREK_S3_MAX_GETS', '100')),
                                      retry_limit=int(os.environ.get('XTREK_S3_RETRY_LIMIT', '20')),
                                      cycle_seconds=float(os.environ.get('XTREK_S3_CYCLE_SECONDS', '30')))

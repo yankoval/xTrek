@@ -37,6 +37,7 @@ from .config_loader import load_config
 from .equipment_task_contract import unlimited_aggregation_source
 from .utilisation_attributes import build_utilisation_attributes
 from .production_order_identity import safe_production_order_component
+from .direct_mode import validate_direct_document
 from .sign import DocumentSigner, SigningError
 from .aggregation_builder import (
     AggregationBuildError,
@@ -476,6 +477,10 @@ def create_virtual_production_tasks(production_order_id: str, qty: int = 0):
                 }
             }
 
+            if source_data.get('directMode') is True:
+                # Preserve the participant of the direct parent, including linked GTINs.
+                virtual_data['PasportData']['Manufacturer_inn'] = source_pasport['Manufacturer_inn']
+
             # Название файла задания создаем по следующей маске
             safe_source_stem = safe_production_order_component(source_stem)
             safe_comp_gtin = safe_production_order_component(comp_gtin)
@@ -550,6 +555,10 @@ def process_incoming_task(s3_full_key: str):
                 # Для ошибок валидации в задании не указан тег, но логично поставить error
                 storage.set_tags(s3_path, {'status': 'error', 'error': 'validation'})
                 raise ValueError(f"Missing mandatory field: {field}")
+
+        if prod_data.get('directMode') is True:
+            from .direct_mode import validate_direct_task
+            validate_direct_task(prod_data)
 
         # 4. Нормализация GTIN
         gtin = str(prod_data.get('Gtin', '')).strip()
@@ -632,6 +641,23 @@ def process_incoming_task(s3_full_key: str):
 
         gtin_type = "SET" if is_set else "UNIT"
         task_type = "agg-set-virtual" if is_set else "agg-unit"
+
+        if prod_data.get('directMode') is True:
+            from .direct_mode import validate_direct_task, uuid_key, validate_document_size
+            validate_direct_task(prod_data)
+            if type(f_res.get('is_set')) is not bool:
+                raise ValueError('NK did not confirm UNIT/SET type')
+            prod_data['GtinType'] = gtin_type
+            prod_data['TaskType'] = task_type
+            prod_data['emissionDocumentId'] = uuid_key(prod_data['emissionDocumentId'])
+            task_uuid = uuid_key(original_filename[:-5])
+            if task_uuid == uuid_key(prod_data['emissionDocumentId']):
+                raise ValueError('Task and emission must have distinct filenames')
+            production_order_id = 'T-direct-' + task_uuid
+            target_path = production_orders_path.rstrip('/') + '/' + production_order_id + '.json'
+            publish_once(get_storage(target_path, s3_config), target_path,
+                         validate_document_size(prod_data))
+            return production_order_id
 
         if not is_set:
             if normalized_gtin in allowed_gtins:
@@ -982,6 +1008,13 @@ def sign_and_send_emission(production_order_id: str, signing_dir: str, timeout: 
         logger.error(f"[!] Ошибка в sign_and_send_emission: {e}")
         raise
 
+def _local_emission_files(directory, order_id):
+    # LocalStorage may rename data to status suffixes; never read its sidecars.
+    suffixes = ('.json', '.processing', '.finished', '.error', '.ACTIVE', '.CLOSED', '.EXHAUSTED')
+    return [directory / (order_id + suffix) for suffix in suffixes
+            if (directory / (order_id + suffix)).is_file()]
+
+
 def get_emission_kodes(order_id: str):
     """
     Получает коды маркировки для заказа, если он в статусе ACTIVE и еще не обрабатывался.
@@ -1006,7 +1039,7 @@ def get_emission_kodes(order_id: str):
             if not p.exists():
                 logger.error(f"[!] Директория {emissions_path} не существует.")
                 return None
-            matches = list(p.glob(f"{order_id}.*"))
+            matches = _local_emission_files(p, order_id)
             if matches:
                 target_path = str(matches[0])
         else:
@@ -1190,8 +1223,14 @@ def get_emission_kodes(order_id: str):
 
 def _find_production_order_id_by_suz_order_id(order_id: str):
     """
-    Вспомогательная функция для поиска productionOrderId по orderId из файлов статуса эмиссии.
+    Находит productionOrderId по привязке directMode в kodes либо статусу эмиссии.
     """
+    config = load_config('suz_worker_config')
+    if config.get('kodes'):
+        from .direct_mode import direct_context
+        context = direct_context(config, order_id, get_storage)
+        if context:
+            return context[0]
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
@@ -1208,8 +1247,8 @@ def _find_production_order_id_by_suz_order_id(order_id: str):
         if isinstance(storage_emissions, LocalStorage):
             p = Path(emissions_path)
             if p.exists():
-                # Ищем по маске, так как могут быть суффиксы .processing / .finished
-                matches = list(p.glob(f"{order_id}.*"))
+                # Читаем JSON, исключая служебные sidecar-файлы LocalStorage.
+                matches = _local_emission_files(p, order_id)
                 if matches:
                     target_path = str(matches[0])
         else:
@@ -1264,6 +1303,19 @@ def _get_order_id_from_receipt(production_order_id: str):
     try:
         config = load_config('suz_worker_config')
         s3_config = config.get('s3_config')
+        production_path = config.get('production_orders_path')
+        if production_path:
+            path = production_path.rstrip('/') + '/' + production_order_id + '.json'
+            store = get_storage(production_path, s3_config)
+            if store.exists(path):
+                production = json.loads(store.read_text(path))
+                if production.get('directMode') is True:
+                    from .direct_mode import direct_context
+                    order_id = production['emissionDocumentId']
+                    context = direct_context(config, order_id, get_storage)
+                    if not context or context[0] != production_order_id:
+                        raise ValueError('Direct emission binding is missing or inconsistent')
+                    return order_id
         emission_receipts_path = config.get('emission_receipts')
 
         if not emission_receipts_path:
@@ -1803,6 +1855,8 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         storage_util = get_storage(utilisation_tasks_path, s3_config)
         remote_path = f"{utilisation_tasks_path.rstrip('/')}/{order_id}.json"
         if storage_util.exists(remote_path):
+            validate_direct_document(config, order_id,
+                json.loads(storage_util.read_text(remote_path)), 'utilisation', get_storage)
             logger.info("[*] Существующее задание на нанесение сохранено без изменений: %s", remote_path)
             return order_id
 
@@ -1871,12 +1925,16 @@ def create_utilisation_task(order_id: str, group: str, production_date: str = No
         )
 
         # Сохраняем в S3
+        is_direct = validate_direct_document(config, order_id, json.loads(report.to_json()), 'utilisation', get_storage)
         temp_local = Path(f"temp_util_{order_id}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
             f.write(report.to_json())
 
         logger.info(f"[*] Выгрузка задачи на отчет о нанесении в S3: {remote_path}")
-        _publish_json_result(storage_util, temp_local, remote_path)
+        if is_direct:
+            publish_once(storage_util, remote_path, temp_local.read_text(encoding='utf-8'))
+        else:
+            _publish_json_result(storage_util, temp_local, remote_path)
 
         try: temp_local.unlink()
         except: pass
@@ -1924,6 +1982,7 @@ def sign_and_send_utilisation(order_id: str, signing_dir: str, timeout: int,
 
         task_content = storage_tasks.read_text(task_path)
         task_data = json.loads(task_content)
+        validate_direct_document(config, order_id, task_data, 'utilisation', get_storage)
         production_order_id = task_data.pop('productionOrderId', None)
 
         # Получаем ИНН участника для подписи отчета о нанесении. В linked GTIN
@@ -2608,7 +2667,7 @@ def update_utilisation_report_status(order_id: str):
         return None
 
 
-def create_introduce_task(order_id: str, group: str = None, production_date: str = None):
+def create_introduce_task(order_id: str, group: str = None, production_date: str = None, production_order_id: str = None):
     """
     Создает сообщение о вводе в оборот на основании выгруженных кодов.
     """
@@ -2651,15 +2710,15 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
             logger.error(f"[!] Не удалось определить GTIN из кода: {first_code}")
             return None
 
-        production_order_id = _find_production_order_id_by_suz_order_id(order_id)
+        production_order_id = production_order_id or _find_production_order_id_by_suz_order_id(order_id)
         found_group = group
         producer_inn = None
 
         if production_order_id:
             # Пытаемся получить группу из заказа на эмиссию
-            storage_em_orders = get_storage(emission_orders_path, s3_config)
-            em_order_path = f"{emission_orders_path.rstrip('/')}/{production_order_id}.json"
-            if storage_em_orders.exists(em_order_path):
+            storage_em_orders = get_storage(emission_orders_path, s3_config) if emission_orders_path else None
+            em_order_path = f"{emission_orders_path.rstrip('/')}/{production_order_id}.json" if emission_orders_path else None
+            if storage_em_orders and storage_em_orders.exists(em_order_path):
                 em_data = json.loads(storage_em_orders.read_text(em_order_path))
                 found_group = em_data.get('productGroup') or found_group
                 logger.debug(f"[*] Определена товарная группа из заказа: {found_group}")
@@ -2797,12 +2856,16 @@ def create_introduce_task(order_id: str, group: str = None, production_date: str
         storage_intro = get_storage(introduce_tasks_path, s3_config)
         remote_path = f"{introduce_tasks_path.rstrip('/')}/{order_id}.json"
 
+        is_direct = validate_direct_document(config, order_id, json.loads(message.to_json()), 'introduce', get_storage)
         temp_local = Path(f"temp_intro_{order_id}.json")
         with open(temp_local, 'w', encoding='utf-8') as f:
             f.write(message.to_json())
 
         logger.info(f"[*] Выгрузка задачи на ввод в оборот в S3: {remote_path}")
-        _publish_json_result(storage_intro, temp_local, remote_path)
+        if is_direct:
+            publish_once(storage_intro, remote_path, temp_local.read_text(encoding='utf-8'))
+        else:
+            _publish_json_result(storage_intro, temp_local, remote_path)
 
         try: temp_local.unlink()
         except: pass
@@ -2855,7 +2918,10 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
         # Читаем задачу
         task_content = storage_intro.read_text(task_path)
         task_data = json.loads(task_content)
+        is_direct = validate_direct_document(config, order_id, task_data, 'introduce', get_storage)
         production_order_id = task_data.pop('productionOrderId', None)
+        if is_direct:
+            task_content = json.dumps(task_data, ensure_ascii=True, separators=(',', ':'))
         inn = task_data.get('participant_inn') or task_data.get('owner_inn')
 
         if not inn:
@@ -2889,6 +2955,9 @@ def sign_and_send_introduce(order_id: str, group: str, signing_dir: str, timeout
                 signature=sig_base64
             )
 
+            if is_direct:
+                from .direct_mode import validate_document_size
+                validate_document_size(json.loads(wrapper.to_json()))
             api = HonestSignAPI(token=token)
             before_external_request()
             submission_ambiguous = True
