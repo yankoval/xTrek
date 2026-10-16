@@ -67,7 +67,7 @@ def test_snapshot_storage_has_only_frozen_join():
     assert '"a"' in x.read_text('a')
 
 
-@pytest.mark.parametrize('existing_state,missing_cache', [(None, False), ('CONFIRMED', False), ('CONFIRMED', True), ('UPLOAD_PENDING', False), ('FILE_UPLOADED', False), ('FILE_UPLOADED', True), ('POST_UNCERTAIN', True)])
+@pytest.mark.parametrize('existing_state,missing_cache', [(None, False), ('CONFIRMED', False), ('CONFIRMED', True), ('UPLOAD_PENDING', False), ('FILE_UPLOADED', False), ('FILE_UPLOADED', True), ('POST_UNCERTAIN', True), ('POSTED_UNCONFIRMED', True)])
 def test_celery_delivery_calls_notifier_and_caches_png(tmp_path, monkeypatch, existing_state, missing_cache):
     import json
     import boto3
@@ -104,12 +104,16 @@ def test_celery_delivery_calls_notifier_and_caches_png(tmp_path, monkeypatch, ex
             assert kw['expected_bot_user_id']=='259171708'
         def _verify_bot(self):pass
         def _history(self):return []
-        def deliver(self,label):calls.append(label);return {'state':'CONFIRMED','message_id':'mid.fixture'}
+        def deliver(self,label):
+            if existing_state == 'POST_UNCERTAIN':
+                raise runtime.DeliveryUncertain('Prior message POST is ambiguous; GET only, never auto-repeat')
+            calls.append(label)
+            return {'state':'CONFIRMED','message_id':'mid.fixture'}
     monkeypatch.setattr(runtime,'MaxPalletLabelNotifier',Notifier)
     def deliver():
         return runtime.deliver_pallet_report(report_key='equipment-reports/'+RID+'.json',runtime_config={'s3_config':{}},delivery_config_path=str(tmp_path/'config.json'))
-    if missing_cache and existing_state != 'CONFIRMED':
-        with pytest.raises(runtime.DeliveryUncertain, match='Previous PNG unavailable'):
+    if missing_cache and existing_state not in {'CONFIRMED', 'POSTED_UNCONFIRMED'}:
+        with pytest.raises(runtime.DeliveryUncertain, match='never auto-repeat' if existing_state == 'POST_UNCERTAIN' else 'Previous PNG unavailable'):
             deliver()
         assert not calls
         assert ledger.get(RID, item.sscc, cfg['chat_id'])['state'] == existing_state
@@ -119,7 +123,7 @@ def test_celery_delivery_calls_notifier_and_caches_png(tmp_path, monkeypatch, ex
     assert len(calls)==(0 if existing_state == 'CONFIRMED' else 1)
     if not missing_cache:
         assert (tmp_path/'png'/RID/item.file_name).read_bytes()==original_item.png_bytes
-    if calls:
+    if calls and existing_state != 'POSTED_UNCONFIRMED':
         assert calls[0].png_bytes == original_item.png_bytes
     if existing_state:
         assert out['labels'][0]['png_sha256'] == ledger.get(RID, item.sscc, cfg['chat_id'])['file_sha256']

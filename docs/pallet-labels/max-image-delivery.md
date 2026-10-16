@@ -27,8 +27,9 @@ or message POST, with no silent removal of box ranges.
 - For pending deliveries with an earlier renderer hash, the runtime reuses the
   original cached PNG after verifying its hash and source identity. It sends
   that original image with the expanded caption. It never overwrites that cache.
-- A missing or mismatched legacy PNG fails closed for reconciliation. Ambiguous
-  message POST records never authorize an automatic second message.
+- A missing or mismatched legacy PNG blocks a pending upload for reconciliation.
+  Ambiguous message POST records allow GET-only reconciliation even without the
+  original PNG, and never authorize an automatic second message.
 - `FILE_UPLOADED` remains a compatible ledger state name, including image uploads;
   existing database rows and schemas do not need migration.
 

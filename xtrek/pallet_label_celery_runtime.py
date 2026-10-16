@@ -125,10 +125,17 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
         output = Path(settings['png_root']) / label.report_id / label.file_name
         row = ledger.get(label.report_id, label.sscc, str(settings['chat_id']))
         if row and row['state'] == 'CONFIRMED':
-            if row['source_hash'] != label.source_hash or row['file_name'] != label.file_name:
+            if (row['source_hash'] not in (label.source_hash, 'legacy-uncertain')
+                    or row['file_name'] != label.file_name):
                 raise DeliveryConflict('Confirmed delivery source identity changed')
             results.append({'sscc': label.sscc, 'png_sha256': row['file_sha256'],
                             'state': 'ALREADY_CONFIRMED_BY_LEDGER', 'message_id': row.get('message_id')})
+            continue
+        if row and row['state'] in {'POST_STARTED', 'POST_UNCERTAIN', 'POSTED_UNCONFIRMED'}:
+            # GET-only reconciliation must remain possible even if an old PNG
+            # cache is unavailable. The notifier blocks any ambiguous POST.
+            result = notifier.deliver(label)
+            results.append({'sscc': label.sscc, 'png_sha256': None if row['file_sha256'] == 'legacy-uncertain' else row['file_sha256'], **result})
             continue
         if row and row['file_sha256'] != hashlib.sha256(label.png_bytes).hexdigest():
             if row['source_hash'] != label.source_hash or row['file_name'] != label.file_name:
