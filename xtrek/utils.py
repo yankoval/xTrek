@@ -617,6 +617,8 @@ def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Option
                     data = json.loads(content)
                 ready_boxes = iter_equipment_report_boxes(data)
                 detected_inn = None
+                if isinstance(data, dict) and data.get('directMode') is True and data.get('Gtin'):
+                    detected_inn = data.get('PasportData', {}).get('Manufacturer_inn')
                 for box in ready_boxes:
                     codes_to_check = box.get('productNumbersFull') or []
                     for code in codes_to_check:
@@ -834,7 +836,9 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
 
     # Проверяем статус утилизации
     storage_util = get_storage(utilisation_reports_path, s3_config)
-    util_file = f"{utilisation_reports_path.rstrip('/')}/{production_order_id}.json"
+    utilisation_id = (prod_data['emissionDocumentId'] if prod_data.get('directMode') is True
+                      else production_order_id)
+    util_file = f"{utilisation_reports_path.rstrip('/')}/{utilisation_id}.json"
     if not storage_util.exists(util_file):
         logger.error(f"Отчет об утилизации {util_file} не найден")
         return None
@@ -866,6 +870,7 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
     set_gtins = set_feed['result'][0].get('set_gtins', [])
     if not set_gtins:
         logger.warning(f"Набор {gtin} не содержит вложений")
+        return None
 
     storage_intro = get_storage(introduces_path, s3_config)
 

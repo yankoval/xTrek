@@ -37,6 +37,7 @@ class TestGetEmissionKodes(unittest.TestCase):
 
         # Mock storage for kodes
         mock_storage_kodes = MagicMock()
+        mock_storage_kodes.exists.return_value = False
 
         def side_effect_get_storage(path, config):
             if path == self.config['emissions_path']:

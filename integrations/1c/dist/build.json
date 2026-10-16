@@ -1,0 +1,11 @@
+{
+  "platform": "8.3.27.2214",
+  "version": "ui-v6",
+  "date": "2026-10-16",
+  "files": {
+    "ВыгрузкаЭмиссии/Forms/Форма/Ext/Form/Module.bsl": "c0010fd9c6ca15b1d014b7230d2de24c0faa1ae4972d621cf31510ef8e865500",
+    "ВыгрузкаЭмиссии/Ext/ObjectModule.bsl": "42e6adb6a2a39c1cce37e0b1ade07ab08f434330e2cd3016884e8bfa58ca87cd",
+    "ВыгрузкаЭмиссии.epf": "9142c3717c52fe30f2ded59ea93d34e6fa1aecaebbd407d83d447dda64da08fe"
+  },
+  "interactive_test": "PASS: client AWS write/read/identical repeat/content conflict; independently verified S3 2026-10-16"
+}
