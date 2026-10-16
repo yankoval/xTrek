@@ -144,7 +144,7 @@ def test_serial_ranges_reject_ambiguous_namespaces_and_bad_check_digits():
         compact_box_numbers([{'boxNumber': make_sscc(1)[:-1] + '0'}])
 
 
-def test_each_pallet_caption_and_renderer_get_only_its_boxes_and_source_files():
+def test_each_pallet_caption_and_renderer_get_only_its_boxes_without_source_files():
     calls = []
     labels = prepare_report_label_messages(
         report_storage=FakeStorage({'equipment-reports/report-0001.json': report_v2()}),
@@ -154,8 +154,8 @@ def test_each_pallet_caption_and_renderer_get_only_its_boxes_and_source_files():
     assert [c['box_numbers'] for c in calls] == ['0000002', '0000003']
     for i, label in enumerate(labels):
         assert f"Номера коробов: {calls[i]['box_numbers']}" in label.text
-        assert 'Отчёт-файл: equipment-reports/report-0001.json' in label.text
-        assert 'Задание-файл: equipment-tasks/report-0001.json' in label.text
+        assert 'Отчёт-файл:' not in label.text
+        assert 'Задание-файл:' not in label.text
         assert '93TAIL' not in label.text
 
 

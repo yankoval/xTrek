@@ -273,8 +273,7 @@ def prepare_report_label_messages(*, report_storage: Any, task_storage: Any,
         text = (f'Ярлык паллета {spec.index}/{spec.count}\nОтчёт: {spec.report_id}'
                 f'\nОператор: {spec.operator}\nSSCC: {spec.sscc}'
                 f'\nКоробов: {spec.boxes}\nШтук: {spec.products}'
-                f'\nНомера коробов: {spec.box_numbers}'
-                f'\nОтчёт-файл: {report_key}\nЗадание-файл: {task_key}')
+                f'\nНомера коробов: {spec.box_numbers}')
         result.append(LabelMessage(spec.report_id, spec.sscc, file_name, text, png, source_hash))
     return result
 

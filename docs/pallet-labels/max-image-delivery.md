@@ -11,7 +11,8 @@ Both the caption and PNG include **Номера коробов** for that partic
 The formatter validates box SSCCs, removes AI 00 where present, extracts the
 seven-digit serial, preserves leading zeros and merges consecutive serials.
 Different SSCC namespaces are rejected rather than merged into misleading ranges.
-The caption also names the actual source report and equipment-task JSON files.
+The caption omits source JSON filenames; the report ID and PNG filename remain
+available for delivery reconciliation.
 No product marking codes are included in the caption. Long label text wraps at
 measured font widths. Labels exceeding MAX's 7680-pixel image dimensions fail
 validation rather than clipping ranges or shrinking text until it is unreadable.
