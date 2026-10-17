@@ -188,6 +188,20 @@ class SUZ:
         # at workflow level instead of issuing a second POST here.
         response = requests.post(url, headers=headers, data=body_bytes,
                                  verify=False, timeout=(10, 30))
+        if response.status_code >= 400:
+            # Keep the server's diagnostic before HTTPError hides its body.
+            # Do not log credentials even if the server echoes a request header.
+            diagnostic = response.text
+            secrets = {str(value) for name, value in headers.items()
+                       if name.lower() in {'clienttoken', 'authorization', 'x-signature'}
+                       and value}
+            secrets.update(value[7:] for value in tuple(secrets)
+                           if value.lower().startswith('bearer ') and value[7:])
+            for secret in sorted(secrets, key=len, reverse=True):
+                diagnostic = diagnostic.replace(secret, '[REDACTED]')
+            # Encode newlines/control characters so a response stays one log entry.
+            logger.error('SUZ POST failed: status=%s response_body=%s',
+                         response.status_code, json.dumps(diagnostic, ensure_ascii=False))
         response.raise_for_status()
         return response
 
