@@ -52,14 +52,33 @@ identity function: no trimming, case folding, Unicode normalization or fuzzy
 matching. Null, nonstring and whitespace-only values are invalid. Other strings
 match by exact Unicode code points, including leading/trailing spaces.
 
-`operator_routes` explicitly maps allowed operators to route names. Two operators
-can target distinct chats. `$default` resolves to the explicitly configured
-`default_route`; **unknown and empty operators never use it**. A missing mapping,
-null default, unsupported transport or invalid route stays `ROUTE_HELD` with no
-POST. The first resolved order ID and original operator value are preserved as an
-immutable audit snapshot, including when held. Allowlisting that exact value can
-release the hold; changing the source to another operator cannot silently reroute it.
+`operator_routes` maps exact known operators to route names. Unknown, missing,
+null, nonstring and empty operators use the explicitly configured `default_route`;
+`$default` selects the same route for an explicitly mapped operator. Known operators
+keep their own route. A broken known route is an error, never a silent fallback.
+Missing/broken default produces `ROUTE_CONFIGURATION_ERROR`, an operational log
+and nonzero drain exit; the event stays durable and pending. Repairing the route
+lets delivery continue. The original operator is never replaced from PasportData
+or report.operator. The first resolved order ID/operator snapshot is immutable.
 Once selected, recipient, bot identity and message body are frozen in the ledger.
+
+For multiple hosts use `ledger_backend: "s3"` and the same explicit `ledger_path`
+on every worker and sender, in a dedicated coordination prefix. For example:
+`s3://YOUR-COORDINATION-BUCKET/terminal-feedback/v1`. Conditional create preserves
+the first event; ETag CAS freezes routing and reserves POST exactly once across
+hosts. A confirmed event remains a permanent business fence. Only one designated
+host runs the drain timer; CAS also protects against accidental overlapping drains.
+No lease expiry permits another POST. A lost CAS reply or sender crash after
+reservation is reconciled using GET only. Listing failure fails the drain, never
+reports an empty queue. S3 state must not be deleted, expired or restored to an older
+snapshot: that could erase a fence or POST reservation. The dedicated prefix is
+private audit data and must have the same access/lifecycle protection as operation
+state. No existing business object or operation guard is changed.
+
+The default `ledger_backend: "sqlite"` remains available for a single host only;
+independent SQLite ledgers on multiple workers are unsafe. Existing SQLite state
+must be reconciled/migrated with all consumers and senders stopped before switching
+backend. S3 activation on a new installation needs no local ledger initialization.
 
 For equipment reports the exact filename identifies the productionOrder. Other
 receipts must contain `productionOrderId`. Legacy CIS task/receipt payloads lack
@@ -72,7 +91,7 @@ business processing.
 Messages contain the fixed category, stage and action, a canonical trailing task
 UUID when available, the complete SHA-256 productionOrder reference and event key.
 An authorized operator resolves the reference through `terminal_events` in the
-local ledger (exact ID is retained there). Arbitrary identifier text, operator
+selected ledger (exact ID is retained there). Arbitrary identifier text, operator
 values, exception strings, True API payloads, tokens and marking codes never enter
 chat messages. The ledger is private audit data (0600 file; 0700 parent directory).
 No tokens are stored in it: a route stores only the name of a token environment variable.
@@ -137,11 +156,12 @@ After explicit approval of the reviewed head and a separate release/activation:
 2. Finish the active task before a future warm restart. Deploy the entire approved
    main revision, not this branch or a partial patch. Compare actual loaded source
    hashes/paths and worker process command with that full release.
-3. Provision a dedicated persistent 0700 directory and explicitly initialize a new
+3. For single-host SQLite only, provision a dedicated persistent 0700 directory and explicitly initialize a new
    ledger once (O_EXCL refuses to overwrite an existing ledger):
    `python -m xtrek.terminal_feedback_runtime init --ledger /var/lib/xtrek/terminal-feedback/events.sqlite3`.
    This creates schema version 1 in a new file; it does not migrate any old ledger.
-4. Copy `examples/terminal-feedback.json`, replace all placeholders with confirmed
+4. Copy `examples/terminal-feedback.json` (single host) or
+   `examples/terminal-feedback-shared.json` (multiple hosts), replace all placeholders with confirmed
    values and set enabled true. Add `terminal_feedback_config` pointing to that file
    in suz_worker_config. Add the directory to the worker sandbox's approved write
    paths if needed. Supply token/CA through the separate private environment file.
@@ -155,7 +175,7 @@ After explicit approval of the reviewed head and a separate release/activation:
 
 ## Rollback
 
-Stop the new drain/timer first; keep its SQLite ledger and all pending/uncertain
+Stop the new drain/timer first; keep its selected ledger and all pending/uncertain
 rows. While the current full main release remains loaded, leave terminal capture
 and read-before-business fencing active. Do not disable capture as a way to replay
 held work. Finish active tasks and preserve settings and the newest ledger snapshot.

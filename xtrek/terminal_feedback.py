@@ -76,18 +76,22 @@ def normalize_operator(value):
     return value if isinstance(value, str) and value.strip() else None
 
 
+class RouteConfigurationError(ValueError):
+    """Safe operational diagnostic; the event must remain pending."""
+
+
 def select_route(settings, operator):
     value = normalize_operator(operator)
-    if value is None or value not in settings['operator_routes']:
-        return None
-    name = settings['operator_routes'][value]
+    name = settings['operator_routes'].get(value, '$default') if value is not None else '$default'
+    kind = 'operator'
     if name == '$default':
-        name = settings['default_route']
-    route = settings['routes'].get(name)
-    if not route or route.get('transport') != 'max':
-        return None
-    if not all(isinstance(route.get(k), str) and route[k] for k in ('chat_id', 'bot_user_id')):
-        return None
+        name = settings.get('default_route')
+        kind = 'default'
+    route = settings['routes'].get(name) if isinstance(name, str) and name else None
+    if (not isinstance(route, dict) or route.get('transport') != 'max'
+            or not all(isinstance(route.get(k), str) and route[k].strip()
+                       for k in ('chat_id', 'bot_user_id', 'token_env'))):
+        raise RouteConfigurationError('Invalid terminal feedback ' + kind + ' route')
     return dict(route)
 
 

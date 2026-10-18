@@ -40,21 +40,24 @@ def enable(tasks, settings, tmp_path):
 
 
 @pytest.mark.parametrize('operator,chat', [
-    ('Alice', 'chat-a'), ('Bob', 'chat-b'), ('Shared', 'chat-a'), ('alice', None),
-    (' Alice', None), ('Alice ', None), ('unknown', None), ('', None), ('  ', None),
-    (None, None), (42, None), ('Alicе', None),  # last letter is Cyrillic
+    ('Alice', 'chat-a'), ('Bob', 'chat-b'), ('Shared', 'chat-a'), ('alice', 'chat-a'),
+    (' Alice', 'chat-a'), ('Alice ', 'chat-a'), ('unknown', 'chat-a'), ('', 'chat-a'), ('  ', 'chat-a'),
+    (None, 'chat-a'), (42, 'chat-a'), ('Alicе', 'chat-a'),  # last letter is Cyrillic
 ])
 def test_exact_routing(settings, operator, chat):
     route = feedback.select_route(settings, operator)
     assert (route['chat_id'] if route else None) == chat
 
 
-def test_explicit_default_is_not_unknown_fallback(settings):
+def test_invalid_default_is_an_explicit_error_and_known_route_still_works(settings):
     settings['default_route'] = None
-    assert feedback.select_route(settings, 'Shared') is None
-    assert feedback.select_route(settings, 'unknown') is None
+    for operator in ('Shared', 'unknown', None):
+        with pytest.raises(feedback.RouteConfigurationError, match='default route'):
+            feedback.select_route(settings, operator)
+    assert feedback.select_route(settings, 'Bob')['chat_id'] == 'chat-b'
     settings['routes']['line-a']['transport'] = 'unconfigured'
-    assert feedback.select_route(settings, 'Alice') is None
+    with pytest.raises(feedback.RouteConfigurationError, match='operator route'):
+        feedback.select_route(settings, 'Alice')
 
 
 @pytest.mark.parametrize('category', feedback.ACTIONS)
@@ -174,12 +177,8 @@ def test_drain_routes_or_holds_and_preserves_raw_operator(ledger, settings, oper
     runtime.drain(settings, {}, read_json=read, transport_factory=factory)
     saved = ledger.get(row['event_id'])
     assert json.loads(saved['operator_raw']) == operator
-    if operator in {'Alice', 'Bob', 'Shared'}:
-        assert saved['delivery_state'] == 'CONFIRMED'
-        assert factory.call_args.args[0]['chat_id'] == ('chat-b' if operator == 'Bob' else 'chat-a')
-    else:
-        assert saved['delivery_state'] == 'ROUTE_HELD'
-        factory.assert_not_called()
+    assert saved['delivery_state'] == 'CONFIRMED'
+    assert factory.call_args.args[0]['chat_id'] == ('chat-b' if operator == 'Bob' else 'chat-a')
 
 
 def test_s3_failure_is_durable_and_retries_only_delivery(ledger, settings):
@@ -299,13 +298,14 @@ def test_protected_task_does_not_create_feedback(settings, tmp_path):
     assert runtime.worker_ledger(config, 'bucket', 'equipment-reports/T-' + next(iter(runtime.PROTECTED_IDS)) + '.json') is None
 
 
-def test_unknown_operator_snapshot_is_immutable_until_allowlisted(ledger, settings):
+def test_unknown_operator_snapshot_is_immutable_after_default_repaired(ledger, settings):
     row = ledger.record('internal-bucket', 'equipment-reports/order.json', 'report-validation', 'invalid_report')
+    settings['default_route'] = None
     read = MagicMock(return_value={'operator': 'Unknown'})
     factory = MagicMock()
     runtime.drain(settings, {}, read_json=read, transport_factory=factory)
     read.side_effect = AssertionError('Must not silently pick a new operator')
-    settings['operator_routes']['Unknown'] = 'line-b'
+    settings['default_route'] = 'line-b'
     factory.return_value.find.return_value = 'mid'
     runtime.drain(settings, {}, read_json=read, transport_factory=factory)
     row = ledger.get(row['event_id'])

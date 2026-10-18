@@ -1,14 +1,15 @@
-"""Explicitly enabled terminal feedback; S3 reads and a separate drain command.
+"""Explicitly enabled terminal feedback; shared coordination and a separate drain.
 
 No business writes, source discovery, event publication, guard changes or broker
-administration. Configuration and SQLite state are local and single-host only.
+administration. Shared S3 state supports multiple workers; SQLite remains single-host only.
 """
 import argparse
 import json
 import os
+import logging
 from pathlib import Path
 
-from .terminal_feedback import TerminalLedger, select_route, source_stage
+from .terminal_feedback import TerminalLedger, RouteConfigurationError, select_route, source_stage
 
 PROTECTED_IDS = {'623c20fa-f90c-4478-aeae-9c6635cedc9f'}
 
@@ -22,9 +23,14 @@ def read_settings(path):
     for key in ('operator_routes', 'routes', 'production_order_overrides'):
         if not isinstance(settings.get(key), dict):
             raise ValueError('Missing feedback mapping')
-    if 'default_route' not in settings or not isinstance(settings.get('protected_ids'), list):
-        raise ValueError('Explicit default and protection list required')
-    if not Path(settings['ledger_path']).is_absolute():
+    if not isinstance(settings.get('protected_ids'), list):
+        raise ValueError('Explicit protection list required')
+    if settings.get('ledger_backend', 'sqlite') not in {'sqlite', 's3'}:
+        raise ValueError('Unknown feedback ledger backend')
+    if settings.get('ledger_backend') == 's3':
+        if not isinstance(settings.get('ledger_path'), str) or not settings['ledger_path'].startswith('s3://'):
+            raise ValueError('Shared feedback ledger requires S3')
+    elif not Path(settings['ledger_path']).is_absolute():
         raise ValueError('Feedback ledger must use an absolute persistent path')
     return settings
 
@@ -38,6 +44,15 @@ def worker_ledger(config, bucket, key):
         return None
     if any(identity and identity in key for identity in PROTECTED_IDS | set(settings['protected_ids'])):
         return None
+    return open_ledger(settings, config)
+
+
+def open_ledger(settings, config):
+    if settings.get('ledger_backend') == 's3':
+        from .storage import get_storage
+        from .terminal_feedback_s3 import S3TerminalLedger
+        root = settings['ledger_path']
+        return S3TerminalLedger(get_storage(root, config.get('s3_config')), root)
     return TerminalLedger(settings['ledger_path'])
 
 
@@ -87,7 +102,7 @@ def resolve_order(row, settings, config, read_json=_read_s3_json):
 
 def drain(settings, config, *, transport_factory=None, read_json=_read_s3_json):
     from .terminal_feedback_max import MaxTerminalTransport, deliver
-    ledger = TerminalLedger(settings['ledger_path'])
+    ledger = open_ledger(settings, config)
     if transport_factory is None:
         import requests
 
@@ -105,15 +120,22 @@ def drain(settings, config, *, transport_factory=None, read_json=_read_s3_json):
                 if row['production_order_id'] is None:
                     order_id, operator = resolve_order(row, settings, config, read_json)
                 else:
-                    # Freeze the first resolved source/operator for audit. A held
-                    # operator can be allowlisted later without silently changing it.
+                    # Freeze the first resolved source/operator for audit. Route configuration
+                    # can be repaired later without silently changing the source.
                     order_id, operator = row['production_order_id'], json.loads(row['operator_raw'])
-                row = ledger.bind_route(row['event_id'], order_id, operator, select_route(settings, operator))
+                # Freeze the exact source before route validation, including a broken default.
+                row = ledger.bind_route(row['event_id'], order_id, operator, None)
+                route = select_route(settings, json.loads(row['operator_raw']))
+                row = ledger.bind_route(row['event_id'], row['production_order_id'],
+                                        json.loads(row['operator_raw']), route)
             if not row['route_json']:
                 state = 'ROUTE_HELD'
             else:
                 route = json.loads(row['route_json'])
                 state = deliver(ledger, row, transport_factory(route, row))
+        except RouteConfigurationError as error:
+            logging.getLogger(__name__).error('%s; event=%s remains pending', error, row['event_id'])
+            state = 'ROUTE_CONFIGURATION_ERROR'
         except Exception:
             # Pending stays durable. Only safe aggregate state leaves this command.
             state = 'HELD_OR_RETRYABLE'
