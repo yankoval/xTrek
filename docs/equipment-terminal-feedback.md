@@ -228,3 +228,42 @@ A later actual equipment report must still contain physical boxes and nonempty
 code arrays. Missing/empty/malformed report content remains terminal regardless of
 Quantity. A valid unlimited source/task itself produces no terminal error message.
 No historical objects, sources or completed guards are rewritten.
+
+## Confirmed SUZ utilisation rejection (HTTP 400 / 7745)
+
+`SuzUtilisationRejected` recognizes only the demonstrated utilisation POST contract:
+HTTP 400, a JSON object with `success` strictly false, exactly one `fieldErrors`
+entry with integer `errorCode=7745` and `fieldName=attributes.expirationDate`, and
+no report/document acceptance identity. Responses larger than 64 KiB, new/mixed
+codes or fields, HTML, malformed JSON, missing success and contradictory responses
+are not promoted to a confirmed rejection. Other HTTP errors, network failures
+and 5xx retain their existing uncertain/reconciliation behavior; 429 keeps its
+existing rate rejection behavior. Signed SUZ requests do not follow redirects.
+
+The send and enclosing route guards persist the same `rejected` outcome with CAS.
+The checkpoint retains only fixed code/field/status, a validated ISO date from the
+bytes actually sent (or null), and their SHA-256. The input fingerprint is still
+checked: changing the task cannot reopen a rejected operation. Reopening the guard
+on any worker raises the same terminal exception before business work. Successful
+accepted/complete replay is unchanged. MAX is not required for the business stop.
+
+The router records `suz_expiration_date_rejected` in the existing shared terminal
+outbox on the first attempt, without ordinary Celery business backoff. Its message
+names HTTP 400, SUZ 7745 and `attributes.expirationDate`, asks to check the source
+date and states that automatic business resubmission is prohibited. The existing
+UUID/order reference identifies the task. Raw server descriptions, submitted
+marking codes, tokens and signatures are never included in this message/checkpoint.
+Original dates are not changed. Existing frozen notifications are not rewritten.
+
+If a rejection checkpoint write fails, the original typed refusal is preserved
+for terminal-outbox persistence. The guard stays external (or rejected if the CAS
+succeeded but its reply was lost); it never becomes ready. An unavailable outbox
+uses the existing durable persistence-only retry. A process crash before any
+durable evidence reaches storage still requires reconciliation; no claim of
+confirmed rejection is made from an external/uncertain checkpoint alone.
+
+This release changes classification, durable fencing and notifications. It does
+not rewrite historical guards/documents, replay completed reports, change dates,
+or introduce new S3 source-tag projections. Source tags are not the authority for
+terminal state. New SUZ codes and accepted-report FAILED classifications require
+separate verified contracts/tests before being treated as this rejection.

@@ -32,6 +32,7 @@ STAGES = {
     'reaggregationReceipts': 'reaggregation-status',
 }
 ACTIONS = {
+    'suz_expiration_date_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7745. Срок годности (attributes.expirationDate) раньше текущей даты. Проверить дату в задании и согласовать исправление.',
     'cis_rejected': 'Проверить отклонённый документ корректировки в ЧЗ; согласовать исправление.',
     'aggregation_rejected': 'Проверить состав и статус агрегации в ЧЗ; согласовать исправление.',
     'invalid_report': 'Проверить исходный отчёт и сканирование; подготовить корректные исходные данные.',
@@ -49,7 +50,8 @@ class TerminalRecorded(ReconciliationRequired):
 
 
 def classify(error, *, retries, retry_limit):
-    if isinstance(error, TerminalBusinessError):
+    from .suz_rejection import SuzUtilisationRejected
+    if isinstance(error, (TerminalBusinessError, SuzUtilisationRejected)):
         return error.category
     if isinstance(error, (ReconciliationRequired, OperationConflict)):
         return 'reconciliation_required'

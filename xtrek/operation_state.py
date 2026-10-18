@@ -102,6 +102,11 @@ class OperationState:
                     or previous.get('input_hash') != self.input_hash):
                 raise OperationConflict('Operation identity/input conflict: ' + self.path)
             phase = previous.get('phase')
+            if phase == 'rejected':
+                from .suz_rejection import SuzUtilisationRejected
+                # Validate the checkpoint before replaying its typed terminal outcome.
+                # Input identity was checked above; changed input remains a conflict.
+                raise SuzUtilisationRejected(previous.get('last_error'))
             if phase == 'complete':
                 self.value, self.etag, self.cached = previous, etag, True
                 return decode_result(previous['result'])
@@ -186,6 +191,11 @@ class OperationState:
             self.update('ready')
 
     def failed(self, error):
+        from .suz_rejection import SuzUtilisationRejected
+        if isinstance(error, SuzUtilisationRejected):
+            if self.value and self.value['phase'] in {'held', 'external'}:
+                self.update('rejected', last_error=error.evidence)
+            return
         from .document_create_resilience import DocumentCreateDeferred, DocumentCreateUncertain
         if self.value and isinstance(error, (DocumentCreateDeferred, DocumentCreateUncertain)):
             self.update(self.value['phase'], last_error=error.safety_metadata,
@@ -277,7 +287,18 @@ def guarded(operation, *, input_path=None, resume=None, cache_none=False, config
                     guard.release_safe()
                 return result
             except BaseException as error:
-                guard.failed(error)
+                try:
+                    guard.failed(error)
+                except Exception:
+                    from .suz_rejection import SuzUtilisationRejected
+                    if isinstance(error, SuzUtilisationRejected):
+                        # Preserve the observed terminal outcome for the shared
+                        # outbox / persistence-only retry. A failed checkpoint is
+                        # still external (never safe to POST again). Do not turn
+                        # evidence into an ordinary retryable storage exception.
+                        logger.error('[OPERATION] rejection checkpoint unconfirmed; terminal persistence required')
+                        raise error from None
+                    raise
                 raise
             finally:
                 _current.reset(token)
