@@ -77,7 +77,10 @@ def test_durable_category_identity_and_redaction(ledger, settings, category):
     assert 'TOKEN-secret' not in other['message_text']
     assert 'PRIVATE' not in other['message_text']
     assert json.loads(other['operator_raw']) == sensitive
-    assert category in other['message_text'] and other['event_id'] in other['message_text']
+    assert feedback.ACTIONS[category] in other['message_text']
+    assert other['event_id'] in other['message_text']
+    assert 'Артикул:' in other['message_text'] and 'Партия:' in other['message_text']
+    assert 'ID отчёта:' in other['message_text']
 
 
 def test_frozen_destination_and_message(ledger, settings):
@@ -214,7 +217,6 @@ def test_receipt_uses_explicit_production_order_not_filename(ledger, settings):
     ('aggregation', 'aggReceipts', 'logic_update_agg', 'aggregation_rejected'),
     ('aggregation', 'aggSetReceipts', 'logic_update_agg_set', 'aggregation_rejected'),
     ('invalid', 'equipment-reports', 'logic_start_equipment_reports', 'invalid_report'),
-    ('exhausted', 'equipment-reports', 'logic_start_equipment_reports', 'retry_exhausted'),
     ('reconciliation', 'equipment-reports', 'logic_start_equipment_reports', 'reconciliation_required'),
 ])
 def test_real_celery_terminal_capture_restart_and_no_business_replay(
@@ -246,13 +248,14 @@ def test_real_celery_terminal_capture_restart_and_no_business_replay(
 
 @pytest.mark.parametrize('error', [RuntimeError('IN_PROGRESS'), RuntimeError('404 after accepted'),
                                    TimeoutError('network'), RuntimeError('S3'), RuntimeError('registry')])
-def test_retryable_failures_do_not_create_terminal_event(router, monkeypatch, settings, ledger, tmp_path, error):
+@pytest.mark.parametrize('retries', [0, 199, 200, 1200])
+def test_retryable_failures_do_not_create_terminal_event(router, monkeypatch, settings, ledger, tmp_path, error, retries):
     tasks, task, _ = router
     enable(tasks, settings, tmp_path)
     monkeypatch.setattr(tasks, 'logic_start_equipment_reports', MagicMock(side_effect=error))
     retry = MagicMock(side_effect=Retry())
     monkeypatch.setattr(task, 'retry', retry)
-    result = task.apply(args=[{'bucket': 'internal-bucket', 'key': 'equipment-reports/order.json'}], retries=199)
+    result = task.apply(args=[{'bucket': 'internal-bucket', 'key': 'equipment-reports/order.json'}], retries=retries)
     assert result.state == 'RETRY'
     retry.assert_called_once()
     assert not ledger.pending()

@@ -70,7 +70,7 @@ def _identifier(value):
     return value
 
 
-def resolve_order(row, settings, config, read_json=_read_s3_json):
+def resolve_order(row, settings, config, read_json=_read_s3_json, *, with_context=False):
     key = row['source_key']
     prefix = config.get('event_key_prefix', '').strip('/')
     if prefix:
@@ -97,7 +97,21 @@ def resolve_order(row, settings, config, read_json=_read_s3_json):
     order_root = config.get('production_orders_path') or root + 'productionOrders/'
     order = read_json(config, order_root.rstrip('/') + '/' + order_id + '.json')
     # Read only the exact field requested. No fallback to report.operator or aliases.
-    return order_id, order.get('operator')
+    if not with_context:
+        return order_id, order.get('operator')
+    report_id = order_id
+    context_order = order
+    if order_id.startswith('V-T-'):
+        # The virtual ID contract is V-<full parent ID>-<14-digit GTIN>. Verify
+        # both stored orders instead of stripping an arbitrary filename suffix.
+        parent, separator, gtin = order_id[2:].rpartition('-')
+        if separator and len(gtin) == 14 and gtin.isdecimal() and str(order.get('Gtin')) == gtin:
+            context_order = read_json(config, order_root.rstrip('/') + '/' + parent + '.json')
+            report_id = parent
+    passport = context_order.get('PasportData') or {}
+    context = {'report_id': report_id, 'article': context_order.get('Article'),
+               'batch': passport.get('Batch_number') if isinstance(passport, dict) else None}
+    return order_id, order.get('operator'), context
 
 
 def drain(settings, config, *, transport_factory=None, read_json=_read_s3_json):
@@ -118,13 +132,14 @@ def drain(settings, config, *, transport_factory=None, read_json=_read_s3_json):
         try:
             if not row['route_json']:
                 if row['production_order_id'] is None:
-                    order_id, operator = resolve_order(row, settings, config, read_json)
+                    order_id, operator, context = resolve_order(row, settings, config, read_json, with_context=True)
                 else:
                     # Freeze the first resolved source/operator for audit. Route configuration
                     # can be repaired later without silently changing the source.
                     order_id, operator = row['production_order_id'], json.loads(row['operator_raw'])
+                    context = json.loads(row.get('context_json') or '{}')
                 # Freeze the exact source before route validation, including a broken default.
-                row = ledger.bind_route(row['event_id'], order_id, operator, None)
+                row = ledger.bind_route(row['event_id'], order_id, operator, None, context=context)
                 route = select_route(settings, json.loads(row['operator_raw']))
                 row = ledger.bind_route(row['event_id'], row['production_order_id'],
                                         json.loads(row['operator_raw']), route)

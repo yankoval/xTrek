@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 import sqlite3
 import time
@@ -33,6 +34,11 @@ STAGES = {
 }
 ACTIONS = {
     'suz_expiration_date_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7745. Срок годности (attributes.expirationDate) раньше текущей даты. Проверить дату в задании и согласовать исправление.',
+    'report_status_rejected': 'Коды находятся в недопустимом состоянии. Сверить их состояние в ЧЗ и фактический состав отчёта.',
+    'report_aggregate_conflict': 'Короб или паллета уже зарегистрированы. Сверить SSCC и вложения с фактической упаковкой.',
+    'report_access_denied': 'ЧЗ отказал в доступе к проверке отчёта (HTTP 403). Проверить полномочия организации.',
+    'introduction_rejected': 'ЧЗ отклонил ввод в оборот. Проверить ошибки принятого документа и исправить исходные данные.',
+    'utilisation_rejected': 'СУЗ отклонил принятый отчёт о нанесении. Проверить ошибки отчёта и исправить исходные данные.',
     'cis_rejected': 'Проверить отклонённый документ корректировки в ЧЗ; согласовать исправление.',
     'aggregation_rejected': 'Проверить состав и статус агрегации в ЧЗ; согласовать исправление.',
     'invalid_report': 'Проверить исходный отчёт и сканирование; подготовить корректные исходные данные.',
@@ -45,6 +51,10 @@ class TerminalBusinessError(ReconciliationRequired):
     category = 'reconciliation_required'
 
 
+class WorkflowPending(RuntimeError):
+    """Unconfirmed progress; continue durable polling without a terminal fence."""
+
+
 class TerminalRecorded(ReconciliationRequired):
     """The event is durable; never execute this business route again automatically."""
 
@@ -55,8 +65,6 @@ def classify(error, *, retries, retry_limit):
         return error.category
     if isinstance(error, (ReconciliationRequired, OperationConflict)):
         return 'reconciliation_required'
-    if retries >= retry_limit:
-        return 'retry_exhausted'
     return None
 
 
@@ -97,18 +105,49 @@ def select_route(settings, operator):
     return dict(route)
 
 
+STAGE_LABELS = {
+    'report-validation': 'Проверка отчёта оборудования',
+    'disaggregation-validation': 'Проверка отчёта расформирования',
+    'reaggregation-validation': 'Проверка отчёта изъятия',
+    'cis-submit': 'Отправка корректировки кодов', 'cis-status': 'Проверка корректировки кодов',
+    'aggregation-status': 'Транспортная агрегация', 'set-aggregation-status': 'Агрегация в набор',
+    'utilisation-status': 'Нанесение кодов', 'introduce-status': 'Ввод в оборот',
+    'disaggregation-submit': 'Отправка расформирования', 'disaggregation-status': 'Расформирование',
+    'reaggregation-submit': 'Отправка изъятия', 'reaggregation-status': 'Изъятие из агрегата',
+}
+
+
+def display_value(value, limit=256):
+    # MAX receives plain text (no format/HTML). Preserve Unicode and slashes;
+    # escape line/control characters so source data cannot forge message fields.
+    if not isinstance(value, (str, int)) or isinstance(value, bool) or not str(value).strip():
+        return 'не указан'
+    value = str(value)
+    if (re.search(r'01\d{14}21', value) or '\x1d' in value
+            or re.search(r'(?i)(token|bearer|secret|password)[\s:=_-]', value)):
+        return '[скрыто: чувствительные данные]'
+    escaped = ''.join(c if unicodedata.category(c)[0] != 'C' and c not in '\r\n'
+                      else '\\u%04x' % ord(c) for c in value)
+    # Report IDs use the S3 object-key bound and are never silently shortened.
+    if len(escaped) > limit:
+        if limit == 1500:
+            raise ValueError('Feedback report ID exceeds safe message limit')
+        escaped = escaped[:limit - 1] + '…'
+    return escaped
+
+
 def message_text(row):
-    # Untrusted identifiers/operators/errors never enter the outbound body.
-    # Full SHA-256 references resolve unambiguously through the local audit ledger.
-    po_ref = hashlib.sha256(row['production_order_id'].encode()).hexdigest()
-    uuid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-                     row['production_order_id'])
-    task_line = f"UUID задания: {uuid.group()}\n" if uuid else ''
-    return (f"xTrek: обработка остановлена, требуется сверка.\n{task_line}"
-            f"productionOrder ref: {po_ref}\n"
-            f"Стадия: {row['stage']}\nКатегория: {row['category']}\n"
-            f"Действие: {ACTIONS[row['category']]}\n"
-            f"Автоматическая повторная отправка бизнес-документа запрещена.\n"
+    context = json.loads(row.get('context_json') or '{}')
+    report_id = context.get('report_id', row['production_order_id'])
+    stage = ('Отправка отчёта о нанесении' if row['category'] == 'suz_expiration_date_rejected'
+             else STAGE_LABELS[row['stage']])
+    return (f"xTrek: требуется ручное действие.\n"
+            f"Артикул: {display_value(context.get('article'))}\n"
+            f"Партия: {display_value(context.get('batch'))}\n"
+            f"ID отчёта: {display_value(report_id, 1500)}\n"
+            f"Стадия: {stage}\n"
+            f"Причина и действие: {ACTIONS[row['category']]}\n"
+            f"Дальнейшая автоматическая обработка остановлена до сверки.\n"
             f"Событие: {row['event_id']}")
 
 
@@ -118,8 +157,11 @@ class TerminalLedger:
             raise RuntimeError('Terminal ledger requires explicit initialization')
         self.path = str(Path(path).resolve())
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             if db.execute('PRAGMA user_version').fetchone()[0] != 1:
                 raise RuntimeError('Unsupported terminal ledger schema')
+            if 'context_json' not in {r[1] for r in db.execute('PRAGMA table_info(terminal_events)')}:
+                db.execute('ALTER TABLE terminal_events ADD COLUMN context_json TEXT')
 
     def connect(self):
         # mode=rw prevents silently replacing a missing ledger after rollback/mount loss.
@@ -167,7 +209,7 @@ class TerminalLedger:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM terminal_events WHERE delivery_state != 'CONFIRMED' ORDER BY created_at")]
 
-    def bind_route(self, event_id, production_order_id, operator, route):
+    def bind_route(self, event_id, production_order_id, operator, route, context=None):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = dict(db.execute('SELECT * FROM terminal_events WHERE event_id=?', (event_id,)).fetchone())
@@ -178,12 +220,13 @@ class TerminalLedger:
                          or row['operator_raw'] != json.dumps(operator, ensure_ascii=False))):
                 return row  # A concurrent resolver cannot replace the first audit snapshot.
             row.update(production_order_id=production_order_id)
+            row['context_json'] = row.get('context_json') or json.dumps(context or {}, ensure_ascii=False)
             body = message_text(row) if route else None
             db.execute('''UPDATE terminal_events SET production_order_id=?,operator_raw=?,
-                route_json=?,message_text=?,delivery_state=? WHERE event_id=?''',
+                route_json=?,message_text=?,delivery_state=?,context_json=? WHERE event_id=?''',
                 (production_order_id, json.dumps(operator, ensure_ascii=False),
                  json.dumps(route, sort_keys=True) if route else None, body,
-                 'READY' if route else 'ROUTE_HELD', event_id))
+                 'READY' if route else 'ROUTE_HELD', row['context_json'], event_id))
         return self.get(event_id)
 
     def claim_post(self, event_id):

@@ -84,9 +84,10 @@ def test_direct_set_chain_from_emission(monkeypatch, tmp_path, parent_first):
     assert not Path(config['emission_receipts'],pid+'.json').exists()
     tasks.logic_kodes('kodes/'+order+'.json')
     if parent_first:
-        tasks.logic_utilisationReceipt('utilisationReceipts/'+order+'.json')
+        with pytest.raises(tasks.WorkflowPending):
+            tasks.logic_utilisationReceipt('utilisationReceipts/'+order+'.json')
     assert not any(x[0]=='set' for x in calls), 'Must await components'
-    for gtin,qty in components:
+    for component_index, (gtin,qty) in enumerate(components):
         child='V-'+pid+'-'+gtin;value=read('production_orders_path',child)
         assert int(value['Quantity'])==3*qty and value['virtual'] is True
         assert value['PasportData']['Manufacturer_inn']==task['PasportData']['Manufacturer_inn']
@@ -101,7 +102,11 @@ def test_direct_set_chain_from_emission(monkeypatch, tmp_path, parent_first):
         put('kodes',child_order,{'orderId':child_order,'codes':codes(gtin,3*qty)})
         tasks.logic_kodes('kodes/'+child_order+'.json')
         tasks.logic_utilisationReceipt('utilisationReceipts/'+child_order+'.json')
-        tasks.logic_update_introduce('introduceReceipts/'+child_order+'.json')
+        if not parent_first or component_index < len(components) - 1:
+            with pytest.raises(tasks.WorkflowPending):
+                tasks.logic_update_introduce('introduceReceipts/'+child_order+'.json')
+        else:
+            tasks.logic_update_introduce('introduceReceipts/'+child_order+'.json')
     if not parent_first:
         assert not any(x[0]=='set' for x in calls)
         tasks.logic_utilisationReceipt('utilisationReceipts/'+order+'.json')
