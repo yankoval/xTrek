@@ -1,6 +1,7 @@
 {
   "version": 1,
   "enabled": false,
+  "ledger_backend": "sqlite",
   "ledger_path": "/var/lib/xtrek/terminal-feedback/events.sqlite3",
   "operator_routes": {
     "EXACT_OPERATOR_A": "line-a",
