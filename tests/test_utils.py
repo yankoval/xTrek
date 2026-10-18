@@ -264,11 +264,11 @@ def test_status_logic(analyzer, tmp_path):
     assert "alreadyregistered" in errors
     assert any("BOX_EXISTING" in e for e in errors["alreadyregistered"])
     # 2. SET bad status error
-    assert "wrongsetstatus" in errors
-    assert any("SET_BAD" in e for e in errors["wrongsetstatus"])
+    assert "waitingstatus" in errors
+    assert any("SET_BAD" in e for e in errors["waitingstatus"])
     # 3. PROD bad status error
-    assert "wrongunitstatus" in errors
-    assert any("PROD_BAD" in e for e in errors["wrongunitstatus"])
+    assert "waitingstatus" in errors
+    assert any("PROD_BAD" in e for e in errors["waitingstatus"])
 
     # Verify OK statuses didn't cause errors
     for err_list in errors.values():

@@ -312,7 +312,11 @@ def create_virtual_tasks_from_equipment_report(production_order_id: str):
             logger.warning(f"[*] Отчет {production_order_id} не содержит кодов. Виртуальные задания не будут созданы.")
             return
 
-        return create_virtual_production_tasks(production_order_id, qty=total_qty)
+        # This producer historically returns None after successful publication;
+        # its complete durable guards also cache None. Do not mistake that for
+        # failure and rerun the equipment precheck after utilisation is APPLIED.
+        create_virtual_production_tasks(production_order_id, qty=total_qty)
+        return True
 
     except Exception as e:
         logger.error(f"[!] Ошибка в create_virtual_tasks_from_equipment_report: {e}")

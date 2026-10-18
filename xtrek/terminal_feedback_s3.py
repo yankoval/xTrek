@@ -77,7 +77,7 @@ class S3TerminalLedger:
                 rows.append(row)
         return sorted(rows, key=lambda row: row['created_at'])
 
-    def bind_route(self, event_id, production_order_id, operator, route):
+    def bind_route(self, event_id, production_order_id, operator, route, context=None):
         def change(row):
             if row['route_json'] is not None:
                 return row
@@ -85,6 +85,7 @@ class S3TerminalLedger:
             if row['production_order_id'] is not None and (
                     row['production_order_id'] != production_order_id or row['operator_raw'] != raw):
                 return row
+            row['context_json'] = row.get('context_json') or json.dumps(context or {}, ensure_ascii=False)
             row.update(production_order_id=production_order_id, operator_raw=raw,
                        route_json=json.dumps(route, sort_keys=True) if route else None,
                        delivery_state='READY' if route else 'ROUTE_HELD')

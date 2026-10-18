@@ -107,6 +107,7 @@ def test_set_ready_check_preserves_finished_tag(mock_resources):
 
 
 def test_set_ready_check_fail_util_not_success(mock_resources):
+    from xtrek.terminal_feedback import TerminalBusinessError
     api, nk, config = mock_resources
     path = "reports/PROD123.json"
 
@@ -123,5 +124,6 @@ def test_set_ready_check_fail_util_not_success(mock_resources):
             ]
 
             with patch('xtrek.utils.AggregationAnalyzer.is_set', return_value=True):
-                result = set_ready_check(path)
-                assert result is None
+                with pytest.raises(TerminalBusinessError) as error:
+                    set_ready_check(path)
+                assert error.value.category == "utilisation_rejected"

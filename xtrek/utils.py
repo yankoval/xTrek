@@ -238,7 +238,10 @@ class AggregationAnalyzer:
                     continue
 
                 if status != 'EMITTED':
-                    err_key = 'wrongsetstatus' if is_set_flag else 'wrongunitstatus'
+                    if status not in {'WRITTEN_OFF', 'RETIRED', 'DISAGGREGATED'}:
+                        err_key = 'waitingstatus'
+                    else:
+                        err_key = 'wrongsetstatus' if is_set_flag else 'wrongunitstatus'
                     status_desc = status or "Не найден"
                     errors[err_key].append(f"{child} (Статус: {status_desc})")
 
@@ -845,9 +848,17 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
 
     try:
         util_data = json.loads(storage_util.read_text(util_file))
+        if not isinstance(util_data, dict) or 'error' in util_data:
+            return None
+        if util_data.get('reportStatus') in {'FAILED', 'REJECTED'}:
+            error = TerminalBusinessError('Set utilisation rejected')
+            error.category = 'utilisation_rejected'
+            raise error
         if util_data.get('reportStatus') != 'SUCCESS':
             logger.error(f"Статус утилизации для {production_order_id}: {util_data.get('reportStatus')} (ожидалось SUCCESS)")
             return None
+    except TerminalBusinessError:
+        raise
     except Exception as e:
         logger.error(f"Ошибка чтения отчета об утилизации {util_file}: {e}")
         return None
@@ -903,10 +914,18 @@ def set_ready_check(path: str, api: Optional[HonestSignAPI] = None, nk: Optional
 
         try:
             intro_data = json.loads(storage_intro.read_text(intro_file))
-            target_obj = intro_data[0] if isinstance(intro_data, list) and len(intro_data) > 0 else intro_data
+            target_obj = intro_data[0] if isinstance(intro_data, list) and len(intro_data) == 1 else intro_data
+            if not isinstance(target_obj, dict) or 'error' in target_obj:
+                return None
+            if target_obj.get('status') == 'CHECKED_NOT_OK':
+                error = TerminalBusinessError('Set component introduction rejected')
+                error.category = 'introduction_rejected'
+                raise error
             if target_obj.get('status') != 'CHECKED_OK':
                 logger.error(f"Статус ввода в оборот для компонента {comp_order_id}: {target_obj.get('status')} (ожидалось CHECKED_OK)")
                 return None
+        except TerminalBusinessError:
+            raise
         except Exception as e:
             logger.error(f"Ошибка чтения документа ввода в оборот {intro_file}: {e}")
             return None

@@ -105,5 +105,6 @@ def test_create_virtual_tasks_from_equipment_report_two_step(mock_create_virtual
     report = {"readyBox": boxes} if schema_version == 1 else {"schemaVersion": 2, "readyPallet": [{"readyBox": boxes}]}
     mock_storage_reports.read_text.return_value = json.dumps(report)
 
-    create_virtual_tasks_from_equipment_report("order_123")
+    mock_create_virtual.return_value = None  # Historical complete guard result.
+    assert create_virtual_tasks_from_equipment_report("order_123") is True
     mock_create_virtual.assert_called_with("order_123", qty=2)

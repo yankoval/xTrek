@@ -70,9 +70,10 @@ from xtrek.suz_api_models import (
     EquipmentAggBox, DocumentWrapper, IntroduceMessage, IntroduceProduct, GtinDocument
 )
 from .operation_state import guarded, OperationConflict, ReconciliationRequired
-from .terminal_feedback import (TerminalBusinessError, TerminalRecorded, classify,
+from .terminal_feedback import (TerminalBusinessError, TerminalRecorded, WorkflowPending, classify,
                                 event_identity, source_stage)
 from .terminal_feedback_runtime import worker_ledger
+from .equipment_progress import applied_checkpoint
 
 # 2. Настройки доступа
 ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
@@ -343,6 +344,8 @@ def trigger_set_aggregation_if_ready(parent_id):
                   if direct_set else parent_id)
     ready_status = set_ready_check(ready_path)
 
+    if ready_status == "finished":
+        return f"Set {parent_id} already finished"
     if ready_status == "setReady":
         print(f"[+++] Набор {parent_id} готов к агрегации. Запуск процедур...")
 
@@ -365,7 +368,7 @@ def trigger_set_aggregation_if_ready(parent_id):
         return f"Set aggregation for {parent_id} started successfully"
     else:
         print(f"[*] Набор {parent_id} еще не готов к агрегации.")
-        return f"Set {parent_id} not ready yet"
+        raise WorkflowPending("Waiting for set aggregation prerequisites")
 
 # --- ЛОГИКА ДЛЯ БАКЕТА: 1bf11148... / ПАПКА: Задания ---
 class CisInformationChangeRejected(TerminalBusinessError):
@@ -558,8 +561,12 @@ def logic_utilisationReceipt(full_key):
     print(f"Utilisation task for {utilisationReceipt_id} status is {result}")
     if type(result) is not UtilisationReportStatus:
         raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result:{result}")
+    if result.reportStatus in {'FAILED', 'REJECTED'}:
+        failure = TerminalBusinessError('Utilisation document rejected')
+        failure.category = 'utilisation_rejected'
+        raise failure
     if result.reportStatus !="SUCCESS":
-        raise RuntimeError(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result staus:{result.reportStatus}")
+        raise WorkflowPending(f"logic_utilisationReceipt failed for {utilisationReceipt_id} result status:{result.reportStatus}")
 
     context = direct_context(config, utilisationReceipt_id)
     if context:
@@ -665,7 +672,9 @@ def logic_update_introduce(full_key):
         raise RuntimeError(f"update_introduce_status failed for {introduceReceipt_id}  result:{result}")
     result = result[0] if isinstance(result, list) and len(result) == 1 else result
     if isinstance(result, dict) and "error" not in result and result.get('status') == 'CHECKED_NOT_OK':
-        raise TerminalBusinessError("Introduction document rejected")
+        failure = TerminalBusinessError('Introduction document rejected')
+        failure.category = 'introduction_rejected'
+        raise failure
     if isinstance(result, dict) and "error" not in result and result.get('status') == 'CHECKED_OK':
         prod_id = result.get('productionOrderId') or _find_production_order_id_by_suz_order_id(introduceReceipt_id)
         if not prod_id:
@@ -726,6 +735,22 @@ def logic_start_equipment_reports(full_key):
         )
 
     error = next(iter(result.values()))
+    if isinstance(error, dict) and set(error) == {'finished'}:
+        return 'Equipment report already finished'
+    if isinstance(error, dict) and 'waitingstatus' in error and set(error) <= {'waitingstatus', 'alreadyregistered'}:
+        # An APPLIED code is progress, not a rejection. Resume only from the
+        # exact durable accepted request; this path never calls utilisation POST.
+        kind = applied_checkpoint(report_id, config)
+        if kind == 'SET':
+            if not create_virtual_tasks_from_equipment_report(report_id):
+                raise WorkflowPending('Waiting for set component tasks')
+            return trigger_set_aggregation_if_ready(report_id)
+        if not create_introduce_task_from_report(report_id, group):
+            raise WorkflowPending('Waiting for UNIT introduction prerequisites')
+        sent = sign_and_send_introduce(report_id, group, signing_dir, 120)
+        if _is_failed_send_result(sent):
+            raise WorkflowPending('Waiting for UNIT introduction receipt')
+        return 'Accepted UNIT utilisation continued to introduction'
     if error:
         if isinstance(error, dict) and error.get("api_error"):
             _, status_codes = _equipment_report_api_error_details(
@@ -742,12 +767,26 @@ def logic_start_equipment_reports(full_key):
                     report_path,
                     "true-api-403-forbidden",
                 )
-                raise TerminalBusinessError("Report authorization requires reconciliation")
+                failure = TerminalBusinessError('Report access denied')
+                failure.category = 'report_access_denied'
+                raise failure
             raise RuntimeError(
                 f"equipment report precheck True API failure for "
                 f"{production_order_id}: {api_error}"
             )
-        raise TerminalBusinessError("Report business validation requires reconciliation")
+        if isinstance(error, dict) and set(error) <= {'gtinnotfound', 'waitingstatus'}:
+            raise WorkflowPending('Waiting for verified product information')
+        failure = TerminalBusinessError('Report business validation requires reconciliation')
+        if isinstance(error, dict):
+            if set(error) & {'duplicateaggregation', 'duplicateattachment', 'invalidreport', 'minssccinaggrep'}:
+                failure.category = 'invalid_report'
+            elif 'alreadyregistered' in error:
+                failure.category = 'report_aggregate_conflict'
+            elif set(error) & {'wrongsetstatus', 'wrongunitstatus'}:
+                failure.category = 'report_status_rejected'
+            else:
+                raise WorkflowPending('Waiting for confirmed validation outcome')
+        raise failure
     
     # Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство
     print(f"Запускаем процедуру создания/подписания/отправки отчета об утилизации по емиссии связаной с заказом на производство")
@@ -804,7 +843,9 @@ def _aggregate_operation_precheck(result, report_id, operation):
                     report_path,
                     "true-api-403-forbidden",
                 )
-                raise TerminalBusinessError("Report authorization requires reconciliation")
+                failure = TerminalBusinessError('Report access denied')
+                failure.category = 'report_access_denied'
+                raise failure
             raise RuntimeError(
                 f"{operation} report precheck True API failure for "
                 f"{report_id}: {api_error}"
@@ -1075,7 +1116,7 @@ def _retry_terminal_persistence(task, data, category):
     autoretry_for=(Exception,),
     dont_autoretry_for=(OperationConflict, ReconciliationRequired, CisInformationChangeRejected, Reject),
     max_retries=None,  # Persistence-only retries must not lose a terminal event.
-    retry_kwargs={'max_retries': 200}, # Увеличено до 200 для ожидания до 12+ часов
+    retry_kwargs={'max_retries': None}, # Waiting/outages are not business rejections.
     retry_backoff=60,                 # 60, 120, 240, 300...
     retry_backoff_max=300,
     retry_jitter=True
