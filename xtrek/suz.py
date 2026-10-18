@@ -147,7 +147,7 @@ class SUZ:
         url = f"{self.base_url}/api/v3/providers?omsId={self.omsId}"
         return self._get(url)
 
-    def _send_signed_request(self, url: str, body_file: str, signature_file: str, max_retries: int = 3, extra_headers: dict = None) -> requests.Response:
+    def _send_signed_request(self, url: str, body_file: str, signature_file: str, max_retries: int = 3, extra_headers: dict = None, *, utilisation_rejection: bool = False) -> requests.Response:
         """
         Вспомогательный метод для отправки подписанного POST запроса в СУЗ
         """
@@ -187,7 +187,12 @@ class SUZ:
         # or a transport failure may happen AFTER acceptance: reserve/reconcile
         # at workflow level instead of issuing a second POST here.
         response = requests.post(url, headers=headers, data=body_bytes,
-                                 verify=False, timeout=(10, 30))
+                                 verify=False, timeout=(10, 30), allow_redirects=False)
+        if utilisation_rejection:
+            from .suz_rejection import classify_utilisation_rejection
+            rejection = classify_utilisation_rejection(response, body_bytes)
+            if rejection is not None:
+                raise rejection
         response.raise_for_status()
         return response
 
@@ -200,12 +205,17 @@ class SUZ:
             url += f"&orderId={quote(orderId)}"
 
         try:
-            response = self._send_signed_request(url, body_file, signature_file, max_retries)
+            response = self._send_signed_request(url, body_file, signature_file, max_retries,
+                                                 utilisation_rejection=True)
             if response and response.status_code == 200:
                 data = response.json()
                 return data.get('reportId', '')
             return ""
         except Exception as error:
+            from .suz_rejection import SuzUtilisationRejected
+            if isinstance(error, SuzUtilisationRejected):
+                logger.error('%s', error)
+                raise
             if getattr(error, 'response', None) is not None:
                 _log_utilisation_error(error.response, self.headers)
             logger.exception("Ошибка отправки нанесения; исход требует сверки")

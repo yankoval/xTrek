@@ -40,7 +40,7 @@ def send_error(tmp_path, monkeypatch, caplog):
     return send
 
 
-@pytest.mark.parametrize('status', [400, 429, 500])
+@pytest.mark.parametrize('status', [429, 500])
 def test_short_error_is_visible_and_http_error_is_preserved(send_error, caplog, tmp_path, status):
     text = json.dumps({'fieldErrors': [{'errorCode': 7745,
         'fieldError': 'Дата истечения срока годности должна быть равна или больше текущей даты',
