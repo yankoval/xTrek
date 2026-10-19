@@ -549,6 +549,11 @@ class EquipmentReportValidationError(TerminalBusinessError):
     category = "invalid_report"
 
 
+class EmptyEquipmentReportError(EquipmentReportValidationError):
+    """A report without scanned boxes or full marking codes needs a fresh scan."""
+    category = "empty_report"
+
+
 class EquipmentReportResourceError(RuntimeError):
     """An unverified prerequisite must remain retryable, never a successful skip."""
 
@@ -560,14 +565,16 @@ def _validate_equipment_report_input(data):
     except AggregationBuildError:
         raise EquipmentReportValidationError("Invalid equipment report structure") from None
     if not boxes:
-        raise EquipmentReportValidationError("Equipment report has no ready boxes")
+        raise EmptyEquipmentReportError("Equipment report has no ready boxes")
     if any(not pallet.get("readyBox") for pallet in pallets):
-        raise EquipmentReportValidationError("Equipment report has an empty pallet")
+        raise EmptyEquipmentReportError("Equipment report has an empty pallet")
     for box in boxes:
         codes = box.get("productNumbersFull")
-        if (not isinstance(codes, list) or not codes
+        if codes is None or codes == []:
+            raise EmptyEquipmentReportError("Equipment report has empty or invalid full codes")
+        if (not isinstance(codes, list)
                 or any(not isinstance(code, str) or not code.strip() for code in codes)):
-            raise EquipmentReportValidationError("Equipment report has empty or invalid full codes")
+            raise EquipmentReportValidationError("Equipment report has invalid full codes")
 
 
 def _ensure_resources(path: str, api: Optional[HonestSignAPI] = None, nk: Optional[NK] = None,
