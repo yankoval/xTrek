@@ -91,7 +91,7 @@ def test_cli_groups_by_operator(monkeypatch, capsys, period, output_format):
     assert "Оператор" in content
     assert "Иван" in content
     assert "A-100" not in content and "A\\-100" not in content
-    assert "Итого" in content
+    assert ("ИТОГО" if output_format == "html" else "Итого") in content
     assert "Расшифровка по файлам" not in content
 
 
@@ -134,6 +134,6 @@ def test_cli_supports_grouped_minute_range(monkeypatch, capsys):
 
     content = capsys.readouterr().out
     assert code == 0
-    assert "<b>Дата и время от:</b> 25.08.2026 12:59\n" in content
-    assert "<b>Дата и время до:</b> 25.08.2026 13:00\n" in content
+    assert "С 25.08.2026 12:59\n" in content
+    assert "По 25.08.2026 13:00\n" in content
     assert "A-100" in content

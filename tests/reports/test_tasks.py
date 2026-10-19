@@ -113,12 +113,12 @@ def test_build_and_render_approved_tasks_report():
         "right",
         "right",
     ]
-    assert message.startswith("<b>Отчёт о полученных заданиях</b>")
+    assert message.startswith("<b>ЗАДАНИЯ</b>")
     assert "<table" not in message
     assert "style=" not in message
     assert "<b>Дата:</b> 25.08.2026\n" in message
     assert "<b>Заданий:</b> 1\n" in message
-    assert "<b>Паспортов (ярлыков):</b> 1 640\n" in message
+    assert "<b>Ярлыков:</b> 1 640\n" in message
     assert "<b>Кодов:</b> 9 840\n" in message
     assert "<br" not in message
     assert "border:" not in message
@@ -163,7 +163,7 @@ def test_collects_inclusive_minute_range_and_renders_period():
     assert data.labels == Decimal(6)
     assert data.codes == Decimal(26)
     assert document.pages[0].blocks[0].columns[0].title == "Период"
-    assert "<b>Период:</b> 25.08.2026 09:00 — 25.08.2026 10:15\n" in message
+    assert "Период:\nС 25.08.2026 09:00\nПо 25.08.2026 10:15\n" in message
 
 
 def test_range_rejects_seconds_and_reverse_boundaries():

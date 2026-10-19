@@ -8,6 +8,7 @@ from ..model import Report
 from ..options import RenderOptions
 from .resources import load_styles
 from .values import effective_alignment, format_value
+from .compact_message import REPORT_TITLES, render_compact_message
 
 
 def _border_css(border) -> str:
@@ -47,6 +48,8 @@ def _column_css(column, value=None, *, header=False) -> str:
 
 
 def render_html(report: Report, options: RenderOptions) -> str:
+    if options.profile.value == "messenger" and report.metadata.get("report") in REPORT_TITLES:
+        return render_compact_message(report)
     environment = Environment(
         loader=PackageLoader("xtrek.reports", "templates/html"),
         autoescape=True,

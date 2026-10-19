@@ -1,5 +1,9 @@
 # Pallet label image delivery
 
+Mobile-first caption guidance (20 visible characters per line, with intact
+identifiers): [Messenger message layout](../messenger-message-layout.md).
+Apply it to future caption changes; do not resend confirmed labels for layout.
+
 New pallet labels use the same MAX image contract as the former cloud sender:
 `POST /uploads?type=image`, multipart `data` with PNG bytes, the single token
 from the upload response's `photos` map, then an `image` message attachment.
