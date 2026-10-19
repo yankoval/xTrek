@@ -90,6 +90,8 @@ class LocalNotifierTests(unittest.TestCase):
         [t.start() for t in threads]; [t.join() for t in threads]
         self.assertEqual(self.post_count, 1)
         self.assertEqual(sum(r.state == "delivered" for r in results), 2)
+        self.assertEqual(post.call_args.kwargs['json']['text'],
+                         f'<a href="{URL}">Задание: {Path(KEY).name}</a>')
 
     @patch("xtrek.task_notifier.requests.get")
     @patch("xtrek.task_notifier.requests.post")

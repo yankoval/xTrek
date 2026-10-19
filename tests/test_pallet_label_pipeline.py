@@ -67,6 +67,8 @@ def test_entrypoint_joins_report_and_task_renders_each_assigned_pallet():
     assert [call['products_count'] for call in rendered] == [1, 2]
     assert len({label.source_hash for label in labels}) == 1
     assert all(label.report_id == REPORT_ID for label in labels)
+    assert 'Коробов: 1 · Штук: 1' in labels[0].text.splitlines()
+    assert 'Коробов: 1 · Штук: 2' in labels[1].text.splitlines()
 
 
 @pytest.mark.parametrize('change, message', [

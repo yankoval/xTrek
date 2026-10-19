@@ -53,8 +53,9 @@ actual end. A partial scan cannot authorize a historical missing attachment.
 The completed snapshot is bound to bot/chat, a SHA256 in root-owned config, and
 `through_ms`. Celery merges its old attachment records with fresh overlapping
 GET history (`history_start_ms <= through_ms`), so messages received while the
-snapshot was being built are covered. Filename-ambiguous attachment candidates
-are held for reconciliation. No raw history or historical SSCC export is needed.
+snapshot was being built are covered. Attachment candidates without exact compact
+image-caption or legacy filename proof are held for reconciliation.
+No raw history or historical SSCC export is needed.
 
 The human-authorized bounded policy sets `allow_truncated_history: true`: absence
 from the available 100 MAX pages permits delivery. An accepted truncated snapshot
@@ -62,4 +63,4 @@ must record exactly 100 pages and `policy: user-approved-100-pages`; its checksu
 bot/chat and fresh overlap remain mandatory. This is an available-history window,
 not proof of global historical absence. Known previously GET-confirmed reports
 are excluded independently of window coverage; uncertain POST ledger rows and
-unnamed attachment candidates still never auto-repeat.
+unconfirmed attachment candidates still never auto-repeat.
