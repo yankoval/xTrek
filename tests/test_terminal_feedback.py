@@ -89,6 +89,13 @@ def test_frozen_destination_and_message(ledger, settings):
     assert rebound == row
 
 
+def test_empty_report_message_explains_cause_and_rescan(ledger, settings):
+    row = ready(ledger, settings, category='empty_report')
+    assert 'Причина и действие: Отчёт пуст или' in row['message_text']
+    assert 'Повторно выгрузите задание' in row['message_text']
+    assert 'отсканируйте продукцию заново' in row['message_text']
+
+
 def test_missing_ledger_never_recreated(tmp_path, ledger):
     from pathlib import Path
     Path(ledger.path).unlink()
