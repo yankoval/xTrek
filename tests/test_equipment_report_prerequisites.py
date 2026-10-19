@@ -70,6 +70,19 @@ def test_explicit_clients_do_not_bypass_empty_report_validation(prerequisites):
                                         config=config)
 
 
+@pytest.mark.parametrize("report", [
+    {}, {"readyBox": []}, {"readyBox": [{"productNumbersFull": []}]},
+    {"schemaVersion": 2, "readyPallet": [{"readyBox": []}]},
+])
+def test_empty_report_has_specific_terminal_category(prerequisites, report):
+    config, storage, *_ = prerequisites
+    storage.read_text.return_value = json.dumps(report)
+    with pytest.raises(utils.EquipmentReportValidationError) as error:
+        utils.check_aggregation_reports(["report.json"], config=config)
+    assert error.value.category == "empty_report"
+    assert isinstance(error.value, utils.TerminalBusinessError)
+
+
 @pytest.mark.parametrize("version", [1, 2])
 def test_valid_report_keeps_analyzer_flow(prerequisites, monkeypatch, version):
     config, storage, token, *_ = prerequisites
