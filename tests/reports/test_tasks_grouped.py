@@ -121,9 +121,9 @@ def test_builds_aligned_table_with_totals_and_messenger_cards():
     assert document.pages[1].blocks[0].text == "Расшифровка по файлам"
     detail_table = document.pages[1].blocks[2]
     assert detail_table.rows == (("10:00", Decimal(1640), Decimal(9840), "task.json"),)
-    assert message.startswith("<b>Отчет о заданиях с группировкой по артикулам</b>")
-    assert "<b>Дата и время создания отчёта:</b> 25.08.2026 19:30:45\n" in message
-    assert message.index("Дата и время создания отчёта") < message.index("<b>Дата:</b>")
+    assert message.startswith("<b>ЗАДАНИЯ</b>")
+    assert "<b>Сформирован:</b>\n25.08.2026 19:30:45\n" in message
+    assert message.index("Сформирован") < message.index("<b>Дата:</b>")
     assert "<b>Дата:</b> 25.08.2026\n" in message
     assert "<b>Артикул:</b> A-100\n" in message
     assert "<b>Кодов:</b> 9 840\n" in message

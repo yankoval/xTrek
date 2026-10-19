@@ -75,6 +75,7 @@ def test_two_level_order_and_mandatory_subtotals(source, grouping, prefix, rows,
         )
     assert summary[-1].rows == (("Итого", 4, 14, 42),)
     text = render(doc, output_format=fmt, profile="messenger")
+    text = text.replace("</b>\n<b>", " ")
     assert text.count(prefix) == 2
     assert ("Расшифровка по файлам" in text) == details
     if details:

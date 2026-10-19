@@ -57,7 +57,7 @@ def test_operator_totals_details_and_period_filters(period):
     assert document.pages[1].blocks[2].text == "A"
     html = render(document, output_format="html", profile="messenger")
     assert "оператор → артикул" in html
-    assert "Оператор: Иван" in html
+    assert "<b>Оператор:</b> Иван" in html
     assert "zero" not in html
     assert "outside" not in html
     assert "Пётр" not in html
@@ -112,6 +112,8 @@ def test_operator_subtotals_are_mandatory_in_all_detail_modes(include_details, o
     assert document.pages[0].blocks[3].rows[-1] == ("Итого по оператору: Иван", 2, 5, 15)
     assert document.pages[0].blocks[-1].rows == (("Итого", 3, 9, 27),)
     content = render(document, output_format=output_format, profile="messenger")
+    # Mobile HTML wraps long headings; semantic subtotal text must survive intact.
+    content = content.replace("</b>\n<b>", " ")
     assert "Итого по оператору: Иван" in content
     assert "Итого по оператору: Без оператора" in content
     assert ("Расшифровка по файлам" in content) == include_details
