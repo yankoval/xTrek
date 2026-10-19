@@ -34,6 +34,8 @@ STAGES = {
 }
 ACTIONS = {
     'suz_expiration_date_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7745. Срок годности (attributes.expirationDate) раньше текущей даты. Проверить дату в задании и согласовать исправление.',
+    'suz_production_date_range_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7570. Дата производства (attributes.productionDate) вне разрешённого диапазона 1970-01-01 — 2100-01-01. Сверить фактическую дату производства и исправить её в исходном задании; проверить год и формат YYYY-MM-DD. Дата должна попадать в разрешённый диапазон и не быть позже текущей. Повторную отправку согласовать отдельно.',
+    'suz_production_date_future_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7580. Дата производства (attributes.productionDate) позже текущей даты. Сверить фактическую дату производства и исправить её в исходном задании; проверить год, месяц и день. Не подставлять текущую дату вместо фактической. Повторную отправку согласовать отдельно.',
     'report_status_rejected': 'Коды находятся в недопустимом состоянии. Сверить их состояние в ЧЗ и фактический состав отчёта.',
     'report_aggregate_conflict': 'Короб или паллета уже зарегистрированы. Сверить SSCC и вложения с фактической упаковкой.',
     'report_access_denied': 'ЧЗ отказал в доступе к проверке отчёта (HTTP 403). Проверить полномочия организации.',
@@ -139,7 +141,8 @@ def display_value(value, limit=256):
 def message_text(row):
     context = json.loads(row.get('context_json') or '{}')
     report_id = context.get('report_id', row['production_order_id'])
-    stage = ('Отправка отчёта о нанесении' if row['category'] == 'suz_expiration_date_rejected'
+    from .suz_rejection import DATE_REJECTIONS
+    stage = ('Отправка отчёта о нанесении' if row['category'] in {v[1] for v in DATE_REJECTIONS.values()}
              else STAGE_LABELS[row['stage']])
     return (f"xTrek: требуется ручное действие.\n"
             f"Артикул: {display_value(context.get('article'))}\n"
