@@ -28,9 +28,24 @@ def response(payload=REFUSAL, status=400):
     return result
 
 
-def api_send(tmp_path, monkeypatch, reply=None):
+@pytest.fixture(params=[7745, 7570, 7580])
+def date_refusal(request):
+    code = request.param
+    field, category = {
+        7745: ('attributes.expirationDate', 'suz_expiration_date_rejected'),
+        7570: ('attributes.productionDate', 'suz_production_date_range_rejected'),
+        7580: ('attributes.productionDate', 'suz_production_date_future_rejected'),
+    }[code]
+    value = {7745: '2020-09-01', 7570: '0001-09-07', 7580: '2027-09-01'}[code]
+    body = json.dumps({'attributes': {field.split('.')[1]: value}, 'sntins': ['PRIVATE-CODE']}).encode()
+    payload = {'success': False, 'fieldErrors': [{'errorCode': code, 'fieldName': field,
+                                                'fieldError': 'PRIVATE arbitrary server text'}]}
+    return code, field, category, value, body, payload
+
+
+def api_send(tmp_path, monkeypatch, reply=None, body_bytes=BODY):
     body, signature = tmp_path / 'body.json', tmp_path / 'body.sig'
-    body.write_bytes(BODY)
+    body.write_bytes(body_bytes)
     signature.write_text('PRIVATE-SIGNATURE')
     api = SUZ(token='PRIVATE-TOKEN', omsId='synthetic-oms', clientToken='synthetic-client')
     post = Mock(return_value=response() if reply is None else reply)
@@ -59,7 +74,7 @@ def test_confirmed_7745_uses_actual_submitted_bytes_and_redacts(tmp_path, monkey
     (dict(REFUSAL, reportId='already-accepted'), 400), (dict(REFUSAL, reportId=None), 400), (dict(REFUSAL, unknownEnvelope={}), 400),
     (dict(REFUSAL, fieldErrors=[]), 400), (dict(REFUSAL, fieldErrors=REFUSAL['fieldErrors'] * 2), 400),
     ({'success': False, 'fieldErrors': [{'errorCode': '7745', 'fieldName': 'attributes.expirationDate'}]}, 400),
-    ({'success': False, 'fieldErrors': [{'errorCode': 7580, 'fieldName': 'attributes.productionDate'}]}, 400),
+    ({'success': False, 'fieldErrors': [{'errorCode': 7571, 'fieldName': 'attributes.productionDate'}]}, 400),
     ({'success': False, 'fieldErrors': [{'errorCode': 7745, 'fieldName': 'unexpected'}]}, 400),
     (b'<html>400 upstream</html>', 400), (b'{', 400), ([], 400), (None, 400),
     (json.dumps(REFUSAL), 400), (b'x' * 65537, 400),
@@ -77,13 +92,19 @@ def guarded_send(tmp_path, send):
     return submit, root
 
 
-def test_rejected_checkpoint_survives_restart_without_feedback_config(tmp_path, monkeypatch):
-    send, post = api_send(tmp_path, monkeypatch)
+def test_rejected_checkpoint_survives_restart_without_feedback_config(tmp_path, monkeypatch, date_refusal):
+    code, field, category, value, body, payload = date_refusal
+    send, post = api_send(tmp_path, monkeypatch, response(payload), body)
     submit, root = guarded_send(tmp_path, send)
     with pytest.raises(SuzUtilisationRejected) as first:
         submit('ORDER-1')
     guard = OperationState(LocalStorage(), root, 'send-utilisation', 'ORDER-1')
     saved = json.loads(guard.storage.read_lock_object(guard.path)[0])
+    assert first.value.evidence['code'] == code
+    assert first.value.evidence['field'] == field
+    assert first.value.evidence['submitted_value'] == value
+    assert first.value.evidence['request_sha256'] == hashlib.sha256(body).hexdigest()
+    assert feedback.classify(first.value, retries=0, retry_limit=200) == category
     assert saved['phase'] == 'rejected' and saved['last_error'] == first.value.evidence
     assert 'PRIVATE' not in json.dumps(saved)
     # A fresh guard on another worker restores the same typed refusal before POST.
@@ -134,10 +155,11 @@ def test_rejection_checkpoint_failure_preserves_terminal_classification(tmp_path
 
 
 def test_router_stops_first_attempt_and_delivers_default_without_business_replay(
-        router, settings, ledger, tmp_path, monkeypatch):
+        router, settings, ledger, tmp_path, monkeypatch, date_refusal):
     tasks, task, _ = router
     enable(tasks, settings, tmp_path)
-    send, post = api_send(tmp_path, monkeypatch)
+    code, field, category, value, body, payload = date_refusal
+    send, post = api_send(tmp_path, monkeypatch, response(payload), body)
     submit, root = guarded_send(tmp_path, send)
     tasks.config['operation_state_path'] = root
     business = Mock(side_effect=lambda key: submit('ORDER-1'))
@@ -148,20 +170,28 @@ def test_router_stops_first_attempt_and_delivers_default_without_business_replay
     assert isinstance(task.apply(args=[data]).result, feedback.TerminalRecorded)
     assert isinstance(task.apply(args=[data]).result, feedback.TerminalRecorded)
     post.assert_called_once(); business.assert_called_once(); retry.assert_not_called()
-    assert ledger.pending()[0]['category'] == 'suz_expiration_date_rejected'
+    assert ledger.pending()[0]['category'] == category
     factory = MagicMock(); factory.return_value.find.return_value = 'mid'
     assert runtime.drain(settings, {}, read_json=lambda *args: {}, transport_factory=factory) == {'CONFIRMED': 1}
     sent = factory.return_value.find.call_args.args[0]
-    assert '7745' in sent['message_text'] and 'attributes.expirationDate' in sent['message_text']
+    assert str(code) in sent['message_text'] and field in sent['message_text']
+    assert 'Стадия: Отправка отчёта о нанесении' in sent['message_text']
+    if code == 7570:
+        assert '1970-01-01 — 2100-01-01' in sent['message_text']
+    if code == 7580:
+        assert 'позже текущей даты' in sent['message_text']
+    if code in (7570, 7580):
+        assert 'исправить' in sent['message_text'] and 'Повторную отправку согласовать отдельно' in sent['message_text']
     assert 'PRIVATE' not in sent['message_text']
     assert json.loads(sent['route_json'])['chat_id'] == 'chat-a'
 
 
 def test_real_equipment_route_rejects_before_downstream_and_freezes_both_guards(
-        router, settings, ledger, tmp_path, monkeypatch):
+        router, settings, ledger, tmp_path, monkeypatch, date_refusal):
     tasks, task, _ = router
     enable(tasks, settings, tmp_path)
-    send, post = api_send(tmp_path, monkeypatch)
+    code, field, category, value, body, payload = date_refusal
+    send, post = api_send(tmp_path, monkeypatch, response(payload), body)
     submit, root = guarded_send(tmp_path, send)
     tasks.config['operation_state_path'] = root
     check = Mock(return_value={'report': None})
@@ -188,10 +218,11 @@ def test_real_equipment_route_rejects_before_downstream_and_freezes_both_guards(
 
 
 def test_failed_notification_record_uses_persistence_only_retry(
-        router, settings, ledger, tmp_path, monkeypatch):
+        router, settings, ledger, tmp_path, monkeypatch, date_refusal):
     tasks, task, _ = router
     enable(tasks, settings, tmp_path)
-    send, post = api_send(tmp_path, monkeypatch)
+    code, field, category, value, body, payload = date_refusal
+    send, post = api_send(tmp_path, monkeypatch, response(payload), body)
     submit, root = guarded_send(tmp_path, send)
     monkeypatch.setattr(tasks, 'logic_start_equipment_reports', lambda key: submit('order'))
     original = feedback.TerminalLedger.record
@@ -200,11 +231,11 @@ def test_failed_notification_record_uses_persistence_only_retry(
     data = {'bucket': 'internal-bucket', 'key': 'equipment-reports/order.json'}
     assert task.apply(args=[data]).state == 'RETRY'
     persisted = retry.call_args.kwargs
-    assert persisted['kwargs'] == {'data': data, 'terminal_failure': 'suz_expiration_date_rejected'}
+    assert persisted['kwargs'] == {'data': data, 'terminal_failure': category}
     assert persisted['max_retries'] is None
     monkeypatch.setattr(feedback.TerminalLedger, 'record', original)
     assert isinstance(task.apply(kwargs=persisted['kwargs']).result, feedback.TerminalRecorded)
-    assert ledger.pending()[0]['category'] == 'suz_expiration_date_rejected'
+    assert ledger.pending()[0]['category'] == category
     post.assert_called_once()
 
 
@@ -270,3 +301,32 @@ def test_competing_processes_share_rejected_fence_and_one_notification_reservati
     assert sum(row[1] for row in results) == 1
     guard = OperationState(store, 's3://synthetic/guards', 'send-utilisation', 'order')
     assert json.loads(store.read_lock_object(guard.path)[0])['phase'] == 'rejected'
+
+
+@pytest.mark.parametrize('code,field', [(7570, 'attributes.productionDate'), (7580, 'attributes.productionDate')])
+@pytest.mark.parametrize('mutation', ['wrong-field', 'string-code', 'mixed-errors', 'accepted-id', 'success', 'server-error'])
+def test_production_rejections_require_exact_confirmed_contract(code, field, mutation):
+    payload = {'success': False, 'fieldErrors': [{'errorCode': code, 'fieldName': field}]}
+    status = 400
+    if mutation == 'wrong-field':
+        payload['fieldErrors'][0]['fieldName'] = 'attributes.expirationDate'
+    elif mutation == 'string-code':
+        payload['fieldErrors'][0]['errorCode'] = str(code)
+    elif mutation == 'mixed-errors':
+        payload['fieldErrors'].append({'errorCode': 9999, 'fieldName': field})
+    elif mutation == 'accepted-id':
+        payload['reportId'] = 'accepted'
+    elif mutation == 'success':
+        payload['success'] = True
+    elif mutation == 'server-error':
+        status = 500
+    assert classify_utilisation_rejection(response(payload, status), BODY) is None
+
+
+@pytest.mark.parametrize('code', [7570, 7580])
+def test_restored_production_evidence_rejects_mismatched_field(code):
+    error = classify_utilisation_rejection(response({'success': False, 'fieldErrors': [
+        {'errorCode': code, 'fieldName': 'attributes.productionDate'}]}), BODY)
+    assert error.evidence['submitted_value'] is None
+    with pytest.raises(ValueError):
+        SuzUtilisationRejected(dict(error.evidence, field='attributes.expirationDate'))

@@ -11,23 +11,30 @@ import re
 from .operation_state import ReconciliationRequired
 
 
-class SuzUtilisationRejected(ReconciliationRequired):
-    category = 'suz_expiration_date_rejected'
+# Only code/field pairs demonstrated by actual SUZ refusal envelopes.
+DATE_REJECTIONS = {
+    7745: ('attributes.expirationDate', 'suz_expiration_date_rejected'),
+    7570: ('attributes.productionDate', 'suz_production_date_range_rejected'),
+    7580: ('attributes.productionDate', 'suz_production_date_future_rejected'),
+}
 
+
+class SuzUtilisationRejected(ReconciliationRequired):
     def __init__(self, evidence):
         required = {'kind', 'http_status', 'code', 'field', 'submitted_value', 'request_sha256'}
         if (not isinstance(evidence, dict) or set(evidence) != required
                 or evidence['kind'] != 'suz-utilisation-rejected-v1'
                 or type(evidence['http_status']) is not int or evidence['http_status'] != 400
-                or type(evidence['code']) is not int or evidence['code'] != 7745
-                or evidence['field'] != 'attributes.expirationDate'
+                or type(evidence['code']) is not int or evidence['code'] not in DATE_REJECTIONS
+                or evidence['field'] != DATE_REJECTIONS[evidence['code']][0]
                 or not isinstance(evidence['request_sha256'], str)
                 or not re.fullmatch(r'[0-9a-f]{64}', evidence['request_sha256'])
                 or (evidence['submitted_value'] is not None
                     and _iso_date(evidence['submitted_value']) is None)):
             raise ValueError('Invalid SUZ rejection evidence')
         self.evidence = dict(evidence)
-        super().__init__('SUZ rejected utilisation: HTTP 400, code 7745, attributes.expirationDate')
+        self.category = DATE_REJECTIONS[evidence['code']][1]
+        super().__init__(f"SUZ rejected utilisation: HTTP 400, code {evidence['code']}, {evidence['field']}")
 
 
 def _iso_date(value):
@@ -56,18 +63,20 @@ def classify_utilisation_rejection(response, submitted_bytes):
         return None
     error = errors[0]
     if (not isinstance(error, dict) or type(error.get('errorCode')) is not int
-            or error['errorCode'] != 7745 or error.get('fieldName') != 'attributes.expirationDate'):
+            or error['errorCode'] not in DATE_REJECTIONS
+            or error.get('fieldName') != DATE_REJECTIONS[error['errorCode']][0]):
         return None
+    field = DATE_REJECTIONS[error['errorCode']][0]
     submitted_value = None
     try:
         request = json.loads(submitted_bytes)
         attributes = request.get('attributes')
         if isinstance(attributes, dict):
-            submitted_value = _iso_date(attributes.get('expirationDate'))
+            submitted_value = _iso_date(attributes.get(field.split('.')[1]))
     except (ValueError, TypeError, AttributeError):
         pass
     return SuzUtilisationRejected({
-        'kind': 'suz-utilisation-rejected-v1', 'http_status': 400, 'code': 7745,
-        'field': 'attributes.expirationDate', 'submitted_value': submitted_value,
+        'kind': 'suz-utilisation-rejected-v1', 'http_status': 400, 'code': error['errorCode'],
+        'field': field, 'submitted_value': submitted_value,
         'request_sha256': hashlib.sha256(submitted_bytes).hexdigest(),
     })
