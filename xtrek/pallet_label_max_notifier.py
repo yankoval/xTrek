@@ -198,7 +198,12 @@ class MaxPalletLabelNotifier:
             has_attachment = any(a.get('type') in allowed_types for a in attachments)
             filename_proven = (item.file_name in self._attachment_names(message)
                                or item.file_name in text)
-            if (has_attachment and filename_proven and item.report_id in text and item.sscc in text):
+            # MAX images may omit the upload filename. The complete caption
+            # identifies the validated report/pallet without exposing that name.
+            caption_proven = (text == item.text
+                              and any(a.get('type') == 'image' for a in attachments))
+            if (has_attachment and (filename_proven or caption_proven)
+                    and item.report_id in text and item.sscc in text):
                 return message
         return None
 
@@ -232,7 +237,7 @@ class MaxPalletLabelNotifier:
                     and body.get('attachments')):
                 self.ledger.reserve(item, self.chat_id)
                 self.ledger.set_state(item, self.chat_id, 'POST_UNCERTAIN')
-                raise DeliveryUncertain('Prior attachment candidate lacks exact filename proof; GET reconciliation required')
+                raise DeliveryUncertain('Prior attachment candidate lacks exact filename or caption proof; GET reconciliation required')
 
         row = self.ledger.reserve(item, self.chat_id)
         if row['state'] == 'CONFIRMED':
@@ -241,7 +246,7 @@ class MaxPalletLabelNotifier:
             self.ledger.set_state(item, self.chat_id, 'POST_UNCERTAIN')
             raise DeliveryUncertain('Prior message POST is ambiguous; GET only, never auto-repeat')
 
-        caption = f'{item.text}\nФайл: {item.file_name}'
+        caption = item.text
         if len(caption) > 4000:
             raise ValueError('Complete pallet caption exceeds MAX 4000-character limit')
 
@@ -280,8 +285,6 @@ class MaxPalletLabelNotifier:
         self.ledger.set_state(item, self.chat_id, 'FILE_UPLOADED')
 
         body = {
-            # GET schemas do not promise that image attachments retain their
-            # original upload filename, so include it in message text too.
             'text': caption,
             'attachments': [{'type': 'image', 'payload': {'token': file_token}}],
             'notify': True,
@@ -316,7 +319,7 @@ class MaxPalletLabelNotifier:
             self.ledger.set_state(item, self.chat_id, 'POST_UNCERTAIN')
             raise DeliveryUncertain('Message POST outcome is ambiguous; reconcile by GET') from exc
 
-        # Confirm the exact sender, recipient, report, SSCC, and filename by GET.
+        # Confirm sender, recipient, report, SSCC, and caption/filename by GET.
         confirmed = self._exact_message(self._history(), item, image_only=True)
         if not confirmed:
             raise DeliveryUncertain('MAX returned success but exact attachment is absent in GET history')

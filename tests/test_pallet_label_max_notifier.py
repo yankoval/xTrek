@@ -85,7 +85,7 @@ def make_item():
         report_id=REPORT,
         sscc=SSCC,
         file_name=FILENAME,
-        text=f'Ярлык паллета 1/1\nОтчёт: {REPORT}\nSSCC: {SSCC}\nКоробов: 2\nШтук: 10',
+        text=f'Ярлык паллета 1/1\nОтчёт: {REPORT}\nSSCC: {SSCC}\nКоробов: 2 · Штук: 10',
         png_bytes=b'PNG fixture',
         source_hash='a' * 64,
     )
@@ -123,6 +123,26 @@ def test_exact_existing_file_in_get_prevents_any_post(tmp_path):
     result = notifier.deliver(make_item())
     assert result == {'state': 'LEGACY_FILE_CONFIRMED_BY_GET', 'message_id': 'already-there'}
     assert session.posts == []
+    assert ledger.get(REPORT, SSCC, CHAT)['state'] == 'CONFIRMED'
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_existing_image_with_compact_or_legacy_caption_prevents_post(tmp_path, legacy):
+    item = make_item()
+    text = (item.text.replace(' · Штук:', '\nШтук:') + f'\nФайл: {FILENAME}'
+            if legacy else item.text)
+    existing = {
+        'timestamp': NOW_MS,
+        'sender': {'user_id': BOT},
+        'recipient': {'chat_id': int(CHAT)},
+        'body': {'mid': 'existing-image', 'text': text,
+                 'attachments': [{'type': 'image', 'payload': {}}]},
+    }
+    session = FakeSession(history=[existing])
+    notifier, ledger = make_notifier(tmp_path, session)
+    assert notifier.deliver(item) == {
+        'state': 'ALREADY_CONFIRMED_BY_GET', 'message_id': 'existing-image'}
+    assert not session.posts
     assert ledger.get(REPORT, SSCC, CHAT)['state'] == 'CONFIRMED'
 
 
@@ -200,7 +220,7 @@ def test_prior_unnamed_attachment_is_held(tmp_path):
     session=FakeSession(history=[{'timestamp':NOW_MS,'sender':{'user_id':BOT},'recipient':{'chat_id':int(CHAT)},
         'body':{'mid':'unknown','text':REPORT+' '+SSCC,'attachments':[{'type':'image','payload':{}}]}}])
     notifier,ledger=make_notifier(tmp_path,session)
-    with pytest.raises(DeliveryUncertain,match='filename proof'):
+    with pytest.raises(DeliveryUncertain,match='filename or caption proof'):
         notifier.deliver(make_item())
     assert not session.posts
     assert ledger.get(REPORT,SSCC,CHAT)['state']=='POST_UNCERTAIN'
@@ -233,7 +253,7 @@ def test_explicit_approved_bounded_history_accepts_page_limit(tmp_path):
     assert len(notifier._history())==200
 
 
-def test_image_upload_contract_and_caption_filename(tmp_path):
+def test_image_upload_contract_and_compact_caption(tmp_path):
     session = FakeSession()
     notifier, _ = make_notifier(tmp_path, session)
     notifier.deliver(make_item())
@@ -242,7 +262,8 @@ def test_image_upload_contract_and_caption_filename(tmp_path):
     assert session.posts[1][1]['files']['data'] == (FILENAME, make_item().png_bytes, 'image/png')
     payload = session.posts[2][1]['json']
     assert payload['attachments'] == [{'type': 'image', 'payload': {'token': 'fixture-image-token'}}]
-    assert f'Файл: {FILENAME}' in payload['text']
+    assert payload['text'] == make_item().text
+    assert 'Файл:' not in payload['text']
 
 
 @pytest.mark.parametrize('value', [
@@ -348,5 +369,5 @@ def test_oversized_caption_is_rejected_before_any_upload(tmp_path):
     session = FakeSession()
     notifier, _ = make_notifier(tmp_path, session)
     with pytest.raises(ValueError, match='4000-character'):
-        notifier.deliver(replace(make_item(), text='x' * 4000))
+        notifier.deliver(replace(make_item(), text='x' * 4001))
     assert session.posts == []

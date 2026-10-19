@@ -288,8 +288,8 @@ class TaskNotifier:
                 latest=self.s3.head_object(Bucket=bucket_id,Key=object_key)
                 if self._etag(latest)!=etag or self._version_id(latest)!=version_id:
                     raise RuntimeError("object overwritten before send")
-                text=("<b>Задание оборудования</b>\n"+escape(task_id)+"\n\n"+
-                      f'<a href="{escape(url,quote=True)}">📄 Скачать JSON</a>')
+                text=(f'<a href="{escape(url,quote=True)}">'
+                      f'Задание: {escape(Path(object_key).name)}</a>')
             except Exception as exc:
                 self._transition(bucket_id,task_id,("discovered","deferred","failed_before_send"),"failed_before_send",detail=type(exc).__name__)
                 return DeliveryResult("failed_before_send",object_key,detail=type(exc).__name__)

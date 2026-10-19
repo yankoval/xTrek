@@ -117,9 +117,10 @@ receiver has no print, share, or watched-folder operation.
 `xtrek/pallet_label_max_notifier.py` provides a local, explicitly invoked MAX
 sender for already validated pallet-label PNG bytes. It checks `/me`, reads
 complete chat history before upload, and confirms delivery through GET using
-sender, chat, report UUID, SSCC, and a file attachment. Since MAX GET does not
-guarantee the original upload filename is returned, the sender includes the
-filename in message text too. The SQLite ledger is explicitly initialized and
+sender, chat, report UUID, SSCC, and an image attachment. Since MAX GET does not
+guarantee the original upload filename is returned, the complete compact caption
+is matched exactly. Old image/file messages still support filename proof.
+The SQLite ledger is explicitly initialized and
 durable across restarts. After an ambiguous message POST, the next invocation
 performs GET reconciliation only and never automatically repeats the POST.
 Before enabling it, import any uncertain rows from the prior delivery ledger.
