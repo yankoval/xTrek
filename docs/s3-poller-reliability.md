@@ -107,6 +107,19 @@ Only an explicit `InvalidContinuationToken`, or `InvalidArgument` naming the
 continuation-token argument, resets that prefix. An ambiguous stale token needs
 operator review; it is intentionally not guessed from arbitrary error messages.
 
+Transport exceptions may expose `response=None` (for example botocore
+`ReadTimeoutError` and `ConnectionClosedError`). Error fields are read only from
+mapping-shaped responses and `Error` sections, with string `Code`/`ArgumentName`
+values. Missing or malformed fields cannot crash classification or reset a
+cursor. Network exceptions remain transient: failed GETs enter the object retry
+ledger, while failed LISTs retain the page token and enter prefix backoff.
+Warnings record the operation, original exception class and safe reason only;
+they omit exception text, response bodies, endpoints, keys and cursor values.
+
+The proposed next step for discovery cost is described in
+[the historical scan reduction plan](s3-discovery-reduction-plan.md).
+That plan is not enabled by the classifier fix.
+
 If a retry write, enqueue or checkpoint fails, the current page does not advance.
 SQLite transactions roll back failed writes. Already committed discoveries and
 retries remain usable. The failed-cycle log survives a health persistence error.
