@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+from collections.abc import Mapping
 from contextlib import contextmanager
 import sqlite3
 import time
@@ -258,8 +259,20 @@ def retry_delay(attempts, reason):
     return min(cap, base * 2 ** min(max(attempts - 1, 0), 10)) * random.uniform(0.8, 1.0)
 
 
+def _s3_error_fields(exc):
+    # Transport exceptions (including botocore ReadTimeoutError) can have
+    # response=None. Only structured string fields may affect retry/cursor policy.
+    response = getattr(exc, 'response', None)
+    details = response.get('Error') if isinstance(response, Mapping) else None
+    if not isinstance(details, Mapping):
+        return None, None
+    code, argument = details.get('Code'), details.get('ArgumentName')
+    return (code if isinstance(code, str) else None,
+            argument if isinstance(argument, str) else None)
+
+
 def error_kind(exc):
-    code = getattr(exc, 'response', {}).get('Error', {}).get('Code', '')
+    code, _ = _s3_error_fields(exc)
     if code in {'AccessDenied', 'SignatureDoesNotMatch', 'InvalidAccessKeyId', 'ExpiredToken',
                 'InvalidToken', 'TokenRefreshRequired', 'Unauthorized', '403', '401'}:
         return 'auth'
@@ -388,6 +401,8 @@ class S3EventPoller:
             # SQLite writes are outside this handler: a disk error must abort
             # the page, never be reclassified as a recoverable S3 error.
             reason = error_kind(exc)
+            LOG.warning('S3 discovery request failed operation=GetObject error_type=%s reason=%s',
+                        type(exc).__name__, reason)
             self.metrics['object_errors'] += 1
             self.metrics['errors_' + reason] = self.metrics.get('errors_' + reason, 0) + 1
             self.ledger.defer(event_id, bucket, key, obj, reason)
@@ -447,11 +462,12 @@ class S3EventPoller:
                 except Exception as exc:
                     self.metrics['list_errors'] += 1
                     reason = error_kind(exc)
+                    LOG.warning('S3 discovery request failed operation=ListObjectsV2 error_type=%s reason=%s',
+                                type(exc).__name__, reason)
                     self.metrics['errors_' + reason] = self.metrics.get('errors_' + reason, 0) + 1
-                    code = getattr(exc, 'response', {}).get('Error', {}).get('Code')
+                    code, argument = _s3_error_fields(exc)
                     # ExpiredToken is an authentication failure, not a page token.
                     # InvalidArgument is ambiguous: preserve the token and alert.
-                    argument = getattr(exc, 'response', {}).get('Error', {}).get('ArgumentName')
                     invalid_cursor = code == 'InvalidContinuationToken' or (
                         code == 'InvalidArgument' and argument in {'continuation-token', 'ContinuationToken'})
                     if token and invalid_cursor:

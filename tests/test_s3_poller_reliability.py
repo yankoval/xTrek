@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from unittest.mock import Mock
 
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError
 import pytest
 
 import xtrek.s3_poller as poller
@@ -94,11 +94,13 @@ def test_581_known_inputs_use_zero_gets_and_no_writes_to_outbox(case):
     assert not any(q.startswith(('INSERT INTO s3_outbox', 'INSERT OR IGNORE INTO s3_outbox', 'UPDATE discovery_retry')) for q in queries)
 
 
-def test_get_failure_does_not_block_receipt_or_publisher_and_survives_restart(case):
+@pytest.mark.parametrize('failure', [error('InternalError'),
+                                   ReadTimeoutError(endpoint_url='https://secret.invalid')])
+def test_get_failure_does_not_block_receipt_or_publisher_and_survives_restart(case, failure):
     ledger, s3, scanner = case
     bad, good, receipt = obj(), obj('Задания/good.json'), obj('receipts/ready.json')
     add(s3, bad, good, receipt)
-    s3.failures[bad['Key']] = error('InternalError')
+    s3.failures[bad['Key']] = failure
     ledger.enqueue('already-pending', BUCKET, 'receipts/earlier.json')
     assert scanner.scan(max_pages=2) == 2
     assert scanner.metrics['get_calls'] == len(s3.gets) == 2
@@ -181,10 +183,11 @@ def test_overwrite_between_list_and_get_cannot_authorize_old_identity(case, same
     assert ledger.known(event_identity(BUCKET, current['Key'], current, ()))
 
 
-def test_list_outage_retains_page_tokens_and_delivers_existing_outbox(case):
+@pytest.mark.parametrize('exception_type', [EndpointConnectionError, ReadTimeoutError, ConnectionClosedError])
+def test_list_outage_retains_page_tokens_and_delivers_existing_outbox(case, exception_type, caplog):
     ledger, s3, scanner = case
     ledger.save_scan_cursor(0, BUCKET, 'Задания/', 'page-2')
-    s3.list_failures = {p: EndpointConnectionError(endpoint_url='https://secret.invalid')
+    s3.list_failures = {p: exception_type(endpoint_url='https://secret.invalid')
                         for p in ('Задания/', 'receipts/')}
     ledger.enqueue('ready', BUCKET, 'receipts/ready.json')
     assert scanner.scan() == 0
@@ -195,6 +198,76 @@ def test_list_outage_retains_page_tokens_and_delivers_existing_outbox(case):
     reopened = EventLedger(str(ledger.path))
     assert not reopened.prefix_ready(BUCKET, 'Задания/')
     reopened.close()
+    assert 'error_type=' + exception_type.__name__ in caplog.text
+    assert 'secret.invalid' not in caplog.text
+    assert 'page-2' not in caplog.text
+
+
+@pytest.mark.parametrize('response', [None, 'not-a-mapping', [], {}, {'Error': None},
+                                    {'Error': []}, {'Error': 'not-a-mapping'},
+                                    {'Error': {'Code': [], 'ArgumentName': []}}])
+def test_malformed_error_response_is_transient(response):
+    exc = RuntimeError('DO-NOT-LOG-secret-business-body')
+    exc.response = response
+    assert poller.error_kind(exc) == 'transient'
+
+
+def test_list_read_timeout_resumes_saved_page_once_after_restart(case, caplog):
+    ledger, s3, scanner = case
+    source, receipt = obj(), obj('receipts/ready.json')
+    add(s3, source, receipt)
+    ledger.save_scan_cursor(0, BUCKET, 'Задания/', 'resume-this-page')
+    s3.list_failures['Задания/'] = ReadTimeoutError(endpoint_url='https://secret.invalid')
+    before = time.time()
+    assert scanner.scan(max_pages=2) == 1  # The other prefix still progresses.
+    assert scanner.metrics['status'] == 'degraded'
+    assert scanner.metrics['errors_transient'] == 1
+    assert ledger.page_token(BUCKET, 'Задания/') == 'resume-this-page'
+    reason, attempts, next_retry = ledger.db.execute(
+        'SELECT reason,attempts,next_retry FROM discovery_prefix_retry').fetchone()
+    assert (reason, attempts) == ('transient', 1)
+    assert next_retry > before + 3
+    sender = Mock()
+    assert publish_pending(ledger, sender) == 1
+
+    reopened = EventLedger(str(ledger.path))
+    try:
+        recovered = S3EventPoller(s3, reopened, CUTOFF, allowed_inns=frozenset({'allowed'}))
+        s3.list_failures.clear()
+        make_due(reopened)
+        s3.lists.clear()
+        assert recovered.scan(max_pages=2) == 1
+        assert s3.lists[0]['ContinuationToken'] == 'resume-this-page'
+        assert recovered.metrics['status'] == 'ok'
+        assert reopened.db.execute('SELECT COUNT(*) FROM discovery_prefix_retry').fetchone()[0] == 0
+        assert publish_pending(reopened, sender) == 1
+        assert recovered.scan(max_pages=2) == 0
+        assert publish_pending(reopened, sender) == 0
+        expected = {event_identity(BUCKET, o['Key'], o, ()) for o in (source, receipt)}
+        assert {c.kwargs['task_id'] for c in sender.send_task.call_args_list} == expected
+        assert sender.send_task.call_count == 2
+    finally:
+        reopened.close()
+    assert 'operation=ListObjectsV2 error_type=ReadTimeoutError reason=transient' in caplog.text
+    assert 'secret.invalid' not in caplog.text
+    assert 'resume-this-page' not in caplog.text
+
+
+@pytest.mark.parametrize('details,expected_token', [
+    ({'Code': 'InvalidContinuationToken'}, None),
+    ({'Code': 'InvalidArgument', 'ArgumentName': 'continuation-token'}, None),
+    ({'Code': 'InvalidArgument', 'ArgumentName': 'ContinuationToken'}, None),
+    ({'Code': 'InvalidArgument'}, 'keep-me'),
+    ({'Code': 'InvalidArgument', 'ArgumentName': []}, 'keep-me'),
+    ({'Code': 'ExpiredToken'}, 'keep-me'),
+])
+def test_only_explicit_invalid_cursor_clears_saved_token(case, details, expected_token):
+    ledger, s3, scanner = case
+    ledger.save_scan_cursor(0, BUCKET, 'Задания/', 'keep-me')
+    s3.list_failures['Задания/'] = ClientError({'Error': details}, 'ListObjectsV2')
+    assert scanner.scan(max_pages=1) == 0
+    assert ledger.page_token(BUCKET, 'Задания/') == expected_token
+    assert scanner.metrics['status'] == 'degraded'
 
 
 def test_failed_source_does_not_starve_receipts(case):
