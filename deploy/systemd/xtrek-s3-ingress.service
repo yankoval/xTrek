@@ -1,0 +1,32 @@
+[Unit]
+Description=xTrek authenticated S3 notification intake
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/xtrek/s3-ingress.env
+
+[Service]
+Type=simple
+User=xtrek
+Group=xtrek
+EnvironmentFile=/etc/xtrek/worker.env
+EnvironmentFile=/etc/xtrek/local-s3-mode.env
+EnvironmentFile=/etc/xtrek/s3-ingress.env
+WorkingDirectory=/var/lib/xtrek
+ExecStart=/srv/xtrek/venv/bin/python -m xtrek.s3_ingress
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/xtrek
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

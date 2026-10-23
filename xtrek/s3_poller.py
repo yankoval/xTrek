@@ -289,6 +289,73 @@ class ObjectReplaced(Exception):
     pass
 
 
+def source_inn_allowed(s3, bucket, key, obj, *, input_bucket, event_prefix, allowed_inns):
+    if bucket != input_bucket or not key.startswith(event_prefix + 'Задания/') or not allowed_inns:
+        return True
+    request = {'Bucket': bucket, 'Key': key}
+    if obj.get('ETag'):
+        request['IfMatch'] = obj['ETag']
+    if obj.get('VersionId'):
+        request['VersionId'] = obj['VersionId']
+    response = s3.get_object(**request)
+    try:
+        # Never authorize a LIST identity using bytes belonging to an overwrite.
+        actual = {'ETag': response.get('ETag'), 'Size': response.get('ContentLength'),
+                  'LastModified': response.get('LastModified'),
+                  'VersionId': response.get('VersionId') if obj.get('VersionId') else None}
+        if any(actual[field] is None for field in ('ETag', 'Size', 'LastModified')):
+            raise RuntimeError('Incomplete GET metadata')
+        # LIST may preserve milliseconds, whereas GET's HTTP-date has only
+        # whole seconds. Normalize only this comparison, never the LIST
+        # metadata used by the durable event identity or retry record.
+        expected = dict(obj)
+        listed_modified = obj.get('LastModified')
+        returned_modified = actual['LastModified']
+        if isinstance(listed_modified, str):
+            listed_modified = datetime.fromisoformat(listed_modified.replace('Z', '+00:00'))
+        if isinstance(returned_modified, str):
+            returned_modified = datetime.fromisoformat(returned_modified.replace('Z', '+00:00'))
+        if (not isinstance(listed_modified, datetime) or listed_modified.tzinfo is None
+                or not isinstance(returned_modified, datetime) or returned_modified.tzinfo is None):
+            raise RuntimeError('Invalid GET or LIST modification time')
+        expected['LastModified'] = (listed_modified.replace(microsecond=0)
+                                    if returned_modified.microsecond == 0 else listed_modified)
+        actual['LastModified'] = returned_modified
+        if event_identity(bucket, key, actual, ()) != event_identity(bucket, key, expected, ()):
+            raise ObjectReplaced()
+        source = json.loads(response['Body'].read())
+    finally:
+        response['Body'].close()
+    if not isinstance(source, dict) or (source.get('PasportData') is not None
+                                       and not isinstance(source['PasportData'], dict)):
+        raise ValueError('Invalid source shape')
+    if 'codes' in source:
+        if classify_input(source) == 'codes':
+            return True  # Inert input; only the paired task authorizes processing.
+    if source.get('directMode') is not None:
+        classify_input(source)
+        if source.get('directMode'):
+            validate_direct_task(source)
+            return str(source['PasportData']['Manufacturer_inn']).strip() in allowed_inns
+    quantity = source.get('Quantity')
+    if quantity is None or (isinstance(quantity, str) and not quantity.strip()):
+        return True
+    inn = str((source.get('PasportData') or {}).get('Manufacturer_inn') or '')
+    return inn in allowed_inns
+
+
+def eligible_object(bucket, key, obj, cutoff, allowlist=frozenset()):
+    """Identical historical admission for scanning and HTTPS notifications."""
+    if key.endswith("/"):
+        return False
+    if (bucket, key) in allowlist:
+        return True
+    modified = obj.get("LastModified")
+    if isinstance(modified, str):
+        modified = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+    return modified is not None and modified >= cutoff
+
+
 @dataclass
 class S3EventPoller:
     s3: object
@@ -320,60 +387,11 @@ class S3EventPoller:
                 events.register('before-send.s3.' + operation, count_attempt)
         self.sdk_measurable = events is not None
 
-    def _source_inn_allowed(self, bucket: str, key: str, obj: dict) -> bool:
-        if bucket != self.input_bucket or not key.startswith(self.event_prefix + 'Задания/') or not self.allowed_inns:
-            return True
-        request = {'Bucket': bucket, 'Key': key}
-        if obj.get('ETag'):
-            request['IfMatch'] = obj['ETag']
-        if obj.get('VersionId'):
-            request['VersionId'] = obj['VersionId']
-        self.metrics['get_calls'] += 1
-        response = self.s3.get_object(**request)
-        try:
-            # Never authorize a LIST identity using bytes belonging to an overwrite.
-            actual = {'ETag': response.get('ETag'), 'Size': response.get('ContentLength'),
-                      'LastModified': response.get('LastModified'),
-                      'VersionId': response.get('VersionId') if obj.get('VersionId') else None}
-            if any(actual[field] is None for field in ('ETag', 'Size', 'LastModified')):
-                raise RuntimeError('Incomplete GET metadata')
-            # LIST may preserve milliseconds, whereas GET's HTTP-date has only
-            # whole seconds. Normalize only this comparison, never the LIST
-            # metadata used by the durable event identity or retry record.
-            expected = dict(obj)
-            listed_modified = obj.get('LastModified')
-            returned_modified = actual['LastModified']
-            if isinstance(listed_modified, str):
-                listed_modified = datetime.fromisoformat(listed_modified.replace('Z', '+00:00'))
-            if isinstance(returned_modified, str):
-                returned_modified = datetime.fromisoformat(returned_modified.replace('Z', '+00:00'))
-            if (not isinstance(listed_modified, datetime) or listed_modified.tzinfo is None
-                    or not isinstance(returned_modified, datetime) or returned_modified.tzinfo is None):
-                raise RuntimeError('Invalid GET or LIST modification time')
-            expected['LastModified'] = (listed_modified.replace(microsecond=0)
-                                        if returned_modified.microsecond == 0 else listed_modified)
-            actual['LastModified'] = returned_modified
-            if event_identity(bucket, key, actual, ()) != event_identity(bucket, key, expected, ()):
-                raise ObjectReplaced()
-            source = json.loads(response['Body'].read())
-        finally:
-            response['Body'].close()
-        if not isinstance(source, dict) or (source.get('PasportData') is not None
-                                           and not isinstance(source['PasportData'], dict)):
-            raise ValueError('Invalid source shape')
-        if 'codes' in source:
-            if classify_input(source) == 'codes':
-                return True  # Inert input; only the paired task authorizes processing.
-        if source.get('directMode') is not None:
-            classify_input(source)
-            if source.get('directMode'):
-                validate_direct_task(source)
-                return str(source['PasportData']['Manufacturer_inn']).strip() in self.allowed_inns
-        quantity = source.get('Quantity')
-        if quantity is None or (isinstance(quantity, str) and not quantity.strip()):
-            return True
-        inn = str((source.get('PasportData') or {}).get('Manufacturer_inn') or '')
-        return inn in self.allowed_inns
+    def _source_inn_allowed(self, bucket, key, obj):
+        if bucket == self.input_bucket and key.startswith(self.event_prefix + 'Задания/') and self.allowed_inns:
+            self.metrics['get_calls'] += 1
+        return source_inn_allowed(self.s3, bucket, key, obj, input_bucket=self.input_bucket,
+                                  event_prefix=self.event_prefix, allowed_inns=self.allowed_inns)
 
     def _discover(self, event_id, bucket, key, obj, *, retry=False):
         if self.ledger.known(event_id):
@@ -484,10 +502,7 @@ class S3EventPoller:
                     key = obj['Key']
                     if key.endswith('/') or not key.startswith(prefix):
                         continue
-                    modified = obj.get('LastModified')
-                    if isinstance(modified, str):
-                        modified = datetime.fromisoformat(modified.replace('Z', '+00:00'))
-                    if (bucket, key) not in self.allowlist and (modified is None or modified < self.cutoff_utc):
+                    if not eligible_object(bucket, key, obj, self.cutoff_utc, self.allowlist):
                         continue
                     self._discover(event_identity(bucket, key, obj, ()), bucket, key, obj)
                 token = page.get('NextContinuationToken') if page.get('IsTruncated') else None
