@@ -71,3 +71,24 @@ def applied_checkpoint(report_id, config):
     if status.get('reportStatus') != 'SUCCESS':
         raise WorkflowPending('Waiting for utilisation SUCCESS')
     return order['GtinType']
+
+
+def has_report_progress(report_id, config):
+    """Distinguish a new scan from this report's own progress, without writes.
+
+    Missing configuration/unavailable storage is unknown, never proof that the
+    equipment scan is a duplicate. Existing evidence retains the old guarded
+    continuation path; this helper does not establish acceptance or success.
+    """
+    for name in ('utilisation_tasks_path', 'utilisation_receipts', 'utilisation_reports'):
+        root = config.get(name)
+        if not root:
+            raise WorkflowPending('Waiting for repeat-scan progress sources')
+        path = root.rstrip('/') + '/' + report_id + '.json'
+        if get_storage(path, config.get('s3_config')).exists(path):
+            return True
+    root = config.get('operation_state_path')
+    if not root:
+        raise WorkflowPending('Waiting for repeat-scan submission evidence')
+    path = root.rstrip('/') + '/send-utilisation/' + hashlib.sha256(report_id.encode()).hexdigest() + '.json'
+    return get_storage(root, config.get('s3_config')).read_lock_object(path) is not None

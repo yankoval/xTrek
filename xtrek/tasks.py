@@ -735,6 +735,21 @@ def logic_start_equipment_reports(full_key):
         )
 
     error = next(iter(result.values()))
+    facts = getattr(error, 'feedback_facts', None)
+    from .equipment_progress import has_report_progress
+    if facts and facts.get('scan_case') and not has_report_progress(report_id, config):
+        if facts['scan_case'] == 'pending':
+            # Missing composition must not hide an independently proven input
+            # error or rejected code; let the existing classifier handle it.
+            if not set(error) & {'duplicateaggregation', 'duplicateattachment', 'invalidreport',
+                                 'minssccinaggrep', 'wrongsetstatus', 'wrongunitstatus'}:
+                raise WorkflowPending('Waiting for repeat-scan status or composition evidence')
+        else:
+            failure = TerminalBusinessError('Repeat scan requires operator review')
+            failure.category = {'full_repeat': 'report_repeat_scan', 'partial_repeat': 'report_partial_repeat',
+                                'mixed': 'report_scan_conflict'}[facts['scan_case']]
+            failure.feedback_facts = facts
+            raise failure
     if isinstance(error, dict) and set(error) == {'finished'}:
         return 'Equipment report already finished'
     if isinstance(error, dict) and 'waitingstatus' in error and set(error) <= {'waitingstatus', 'alreadyregistered'}:
@@ -777,6 +792,7 @@ def logic_start_equipment_reports(full_key):
         if isinstance(error, dict) and set(error) <= {'gtinnotfound', 'waitingstatus'}:
             raise WorkflowPending('Waiting for verified product information')
         failure = TerminalBusinessError('Report business validation requires reconciliation')
+        failure.feedback_facts = getattr(error, 'feedback_facts', None)
         if isinstance(error, dict):
             if set(error) & {'duplicateaggregation', 'duplicateattachment', 'invalidreport', 'minssccinaggrep'}:
                 failure.category = 'invalid_report'
@@ -1096,9 +1112,12 @@ for _route_name in tuple(name for name in globals() if name.startswith('logic_')
     globals()[_route_name] = guarded('route-' + _route_name, cache_none=True,
                                      config_loader=lambda name: config)(globals()[_route_name])
 
-def _retry_terminal_persistence(task, data, category):
+def _retry_terminal_persistence(task, data, category, facts=None):
+    kwargs = {'data': data, 'terminal_failure': category}
+    if facts is not None:
+        kwargs['terminal_facts'] = facts
     try:
-        raise task.retry(args=(), kwargs={'data': data, 'terminal_failure': category},
+        raise task.retry(args=(), kwargs=kwargs,
                          exc=RuntimeError('Terminal ledger unavailable'), countdown=60,
                          max_retries=None)
     except Retry:
@@ -1121,7 +1140,7 @@ def _retry_terminal_persistence(task, data, category):
     retry_backoff_max=300,
     retry_jitter=True
 )
-def process_s3_event(self, data, terminal_failure=None):
+def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
     bucket = data.get('bucket')
     key = data.get('key') or ""
 
@@ -1142,12 +1161,12 @@ def process_s3_event(self, data, terminal_failure=None):
         if terminal_failure is not None:
             if feedback_ledger is None:
                 raise RuntimeError('Terminal persistence requires enabled configuration')
-            feedback_ledger.record(bucket, data['key'], source_stage(key), terminal_failure)
+            feedback_ledger.record(bucket, data['key'], source_stage(key), terminal_failure, facts=terminal_facts)
         recorded = feedback_ledger and feedback_ledger.get(event_identity(bucket, data['key']))
     except Exception:
         # Celery preserves this intent in the durable retry message. No business
         # route is entered while the ledger cannot be read/written.
-        return _retry_terminal_persistence(self, data, terminal_failure)
+        return _retry_terminal_persistence(self, data, terminal_failure, terminal_facts)
     if recorded:
         raise TerminalRecorded('Equipment processing requires reconciliation')
     print(f"\n[ROUTER] Новое событие S3: {full_key}")
@@ -1260,9 +1279,10 @@ def process_s3_event(self, data, terminal_failure=None):
                             retry_limit=200)
         if category and feedback_ledger:
             try:
-                feedback_ledger.record(bucket, data['key'], source_stage(key), category)
+                feedback_ledger.record(bucket, data['key'], source_stage(key), category,
+                                       facts=getattr(e, 'feedback_facts', None))
             except Exception:
-                return _retry_terminal_persistence(self, data, category)
+                return _retry_terminal_persistence(self, data, category, getattr(e, 'feedback_facts', None))
             raise TerminalRecorded('Equipment processing requires reconciliation') from None
         print(f"[ERROR] Processing failed: {type(e).__name__}")
         raise

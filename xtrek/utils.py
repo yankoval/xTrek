@@ -12,6 +12,7 @@ from .nkapi import NK
 from .tokens import TokenProcessor
 from .gs1_processor import get_inn_by_gtin
 from .config_loader import load_config
+from .terminal_feedback_facts import ReportValidationResult, report_facts
 from .operation_state import ReconciliationRequired
 from .aggregation_builder import (
     AggregationBuildError,
@@ -185,6 +186,7 @@ class AggregationAnalyzer:
         # 3. Запрос статусов в ГИС МТ
         all_codes = list(set(aggregate_codes + child_codes))
         status_map = {}
+        inconsistent_statuses = set()
 
         if all_codes:
             status_results = self.check_statuses(all_codes)
@@ -196,7 +198,21 @@ class AggregationAnalyzer:
                 cis_info = res.get('cisInfo', {})
                 code = cis_info.get('cis') or res.get('requestedCis')
                 if code:
+                    requested = res.get('requestedCis') or cis_info.get('requestedCis')
+                    if ((requested and requested != code) or
+                            (code in status_map and status_map[code] != cis_info)):
+                        inconsistent_statuses.add(code)
                     status_map[code] = cis_info
+
+        from .terminal_feedback_scan import diagnose_scan
+        own_progress = False
+        if strict_prerequisites and any(status_map.get(c, {}).get('status') == 'INTRODUCED' for c in child_codes):
+            from .equipment_progress import has_report_progress
+            report_id = path.rsplit('/', 1)[-1].removesuffix('.json')
+            own_progress = has_report_progress(report_id, self.config)
+        scan = None if own_progress else diagnose_scan(
+            ready_boxes, ready_pallets,
+            status_map, errors, self.api, statuses_consistent=not inconsistent_statuses)
 
         # 4. Проверка на финальное состояние (все товары INTRODUCED)
         # Мы проверяем только товары (child_codes), так как SSCC не всегда переходят в INTRODUCED
@@ -210,7 +226,9 @@ class AggregationAnalyzer:
                     break
 
         if all_introduced:
-            result = {'finished': ['All codes are INTRODUCED']}
+            result = ReportValidationResult({'finished': ['All codes are INTRODUCED']},
+                report_facts(errors, ready_boxes, ready_pallets, status_map, child_counter, aggregate_counter, content, scan, not inconsistent_statuses)
+            )
         else:
             # 5. Проверка начального состояния (эквивалентно готовности к агрегации)
 
@@ -245,7 +263,14 @@ class AggregationAnalyzer:
                     status_desc = status or "Не найден"
                     errors[err_key].append(f"{child} (Статус: {status_desc})")
 
-            result = dict(errors) if errors else None
+            result = ReportValidationResult(dict(errors), report_facts(
+                errors, ready_boxes, ready_pallets, status_map, child_counter, aggregate_counter, content, scan, not inconsistent_statuses
+            )) if errors else None
+
+        # Repeat-scan evidence belongs to the terminal outbox, not a premature
+        # finished tag. The router will persist it (or wait for complete facts).
+        if scan and strict_prerequisites:
+            return result
 
         # 6. Установка тега check
         tag_value = ""

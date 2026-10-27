@@ -1,6 +1,6 @@
 """Transport-independent terminal events and single-host, prefork-safe outbox.
 
-No API payloads, exception strings or codes belong in this module's events.
+Only allowlisted diagnostic facts belong in events; never raw API payloads.
 The SQLite file is provisioned explicitly, on a persistent local filesystem.
 """
 from __future__ import annotations
@@ -33,6 +33,9 @@ STAGES = {
     'reaggregationReceipts': 'reaggregation-status',
 }
 ACTIONS = {
+    'report_repeat_scan': 'Все SSCC и вложения уже в обороте; зарегистрированный состав совпадает. Повторное сканирование по ошибке.',
+    'report_partial_repeat': 'Часть коробов и все их вложения уже в обороте; состав совпадает. Частичное повторное сканирование.',
+    'report_scan_conflict': 'Состояния или состав SSCC и вложений не позволяют подтвердить безопасное повторное сканирование.',
     'suz_expiration_date_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7745. Срок годности (attributes.expirationDate) раньше текущей даты. Проверить дату в задании и согласовать исправление.',
     'suz_production_date_range_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7570. Дата производства (attributes.productionDate) вне разрешённого диапазона 1970-01-01 — 2100-01-01. Сверить фактическую дату производства и исправить её в исходном задании; проверить год и формат YYYY-MM-DD. Дата должна попадать в разрешённый диапазон и не быть позже текущей. Повторную отправку согласовать отдельно.',
     'suz_production_date_future_rejected': 'СУЗ отклонил нанесение: HTTP 400, код 7580. Дата производства (attributes.productionDate) позже текущей даты. Сверить фактическую дату производства и исправить её в исходном задании; проверить год, месяц и день. Не подставлять текущую дату вместо фактической. Повторную отправку согласовать отдельно.',
@@ -140,19 +143,8 @@ def display_value(value, limit=256):
 
 
 def message_text(row):
-    context = json.loads(row.get('context_json') or '{}')
-    report_id = context.get('report_id', row['production_order_id'])
-    from .suz_rejection import DATE_REJECTIONS
-    stage = ('Отправка отчёта о нанесении' if row['category'] in {v[1] for v in DATE_REJECTIONS.values()}
-             else STAGE_LABELS[row['stage']])
-    return (f"xTrek: требуется ручное действие.\n"
-            f"Артикул: {display_value(context.get('article'))}\n"
-            f"Партия: {display_value(context.get('batch'))}\n"
-            f"ID отчёта: {display_value(report_id, 1500)}\n"
-            f"Стадия: {stage}\n"
-            f"Причина и действие: {ACTIONS[row['category']]}\n"
-            f"Дальнейшая автоматическая обработка остановлена до сверки.\n"
-            f"Событие: {row['event_id']}")
+    from .terminal_feedback_messages import compact_message
+    return compact_message(row)
 
 
 class TerminalLedger:
@@ -166,6 +158,10 @@ class TerminalLedger:
                 raise RuntimeError('Unsupported terminal ledger schema')
             if 'context_json' not in {r[1] for r in db.execute('PRAGMA table_info(terminal_events)')}:
                 db.execute('ALTER TABLE terminal_events ADD COLUMN context_json TEXT')
+            if 'facts_json' not in {r[1] for r in db.execute('PRAGMA table_info(terminal_events)')}:
+                db.execute('ALTER TABLE terminal_events ADD COLUMN facts_json TEXT')
+            if 'attachment_json' not in {r[1] for r in db.execute('PRAGMA table_info(terminal_events)')}:
+                db.execute('ALTER TABLE terminal_events ADD COLUMN attachment_json TEXT')
 
     def connect(self):
         # mode=rw prevents silently replacing a missing ledger after rollback/mount loss.
@@ -197,15 +193,17 @@ class TerminalLedger:
             row = db.execute('SELECT * FROM terminal_events WHERE event_id=?', (event_id,)).fetchone()
             return dict(row) if row else None
 
-    def record(self, bucket, key, stage, category):
+    def record(self, bucket, key, stage, category, *, facts=None):
         if category not in ACTIONS or stage not in STAGES.values():
             raise ValueError('Unknown terminal classification')
+        from .terminal_feedback_facts import validated_facts
+        facts = validated_facts(facts)
         event_id = event_identity(bucket, key)
         with self.connect() as db:
             db.execute('''INSERT OR IGNORE INTO terminal_events
-                (event_id,bucket,source_key,stage,category,terminal_state,delivery_state,created_at)
-                VALUES (?,?,?,?,?,'RECONCILIATION_REQUIRED','ROUTE_PENDING',?)''',
-                       (event_id, bucket, key, stage, category, time.time()))
+                (event_id,bucket,source_key,stage,category,terminal_state,delivery_state,created_at,facts_json)
+                VALUES (?,?,?,?,?,'RECONCILIATION_REQUIRED','ROUTE_PENDING',?,?)''',
+                       (event_id, bucket, key, stage, category, time.time(), json.dumps(facts) if facts else None))
         return self.get(event_id)
 
     def pending(self):
@@ -225,12 +223,15 @@ class TerminalLedger:
                 return row  # A concurrent resolver cannot replace the first audit snapshot.
             row.update(production_order_id=production_order_id)
             row['context_json'] = row.get('context_json') or json.dumps(context or {}, ensure_ascii=False)
+            from .terminal_feedback_messages import make_attachment
+            attachment = make_attachment(row) if route else None
             body = message_text(row) if route else None
             db.execute('''UPDATE terminal_events SET production_order_id=?,operator_raw=?,
-                route_json=?,message_text=?,delivery_state=?,context_json=? WHERE event_id=?''',
+                route_json=?,message_text=?,delivery_state=?,context_json=?,attachment_json=? WHERE event_id=?''',
                 (production_order_id, json.dumps(operator, ensure_ascii=False),
                  json.dumps(route, sort_keys=True) if route else None, body,
-                 'READY' if route else 'ROUTE_HELD', row['context_json'], event_id))
+                 'READY' if route else 'ROUTE_HELD', row['context_json'],
+                 json.dumps(attachment, ensure_ascii=False) if attachment else None, event_id))
         return self.get(event_id)
 
     def claim_post(self, event_id):

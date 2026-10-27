@@ -55,14 +55,17 @@ class S3TerminalLedger:
                 return updated
         raise OperationBusy('Shared terminal event changed during CAS')
 
-    def record(self, bucket, key, stage, category):
+    def record(self, bucket, key, stage, category, *, facts=None):
         if category not in ACTIONS or stage not in STAGES.values():
             raise ValueError('Unknown terminal classification')
+        from .terminal_feedback_facts import validated_facts
+        facts = validated_facts(facts)
         event_id = event_identity(bucket, key)
         row = dict(version=1, event_id=event_id, bucket=bucket, source_key=key,
                    stage=stage, category=category, terminal_state='RECONCILIATION_REQUIRED',
                    delivery_state='ROUTE_PENDING', production_order_id=None, operator_raw=None,
-                   route_json=None, message_text=None, created_at=time.time(), message_id=None)
+                   route_json=None, message_text=None, created_at=time.time(), message_id=None,
+                   facts_json=json.dumps(facts) if facts else None)
         self.storage.write_lock_object(self._path(event_id), json.dumps(row), None)
         return self.get(event_id)
 
@@ -89,6 +92,9 @@ class S3TerminalLedger:
             row.update(production_order_id=production_order_id, operator_raw=raw,
                        route_json=json.dumps(route, sort_keys=True) if route else None,
                        delivery_state='READY' if route else 'ROUTE_HELD')
+            from .terminal_feedback_messages import make_attachment
+            attachment = make_attachment(row) if route else None
+            row['attachment_json'] = json.dumps(attachment, ensure_ascii=False) if attachment else None
             row['message_text'] = message_text(row) if route else None
             return row
         return self._update(event_id, change)
