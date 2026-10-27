@@ -174,14 +174,16 @@ def test_router_stops_first_attempt_and_delivers_default_without_business_replay
     factory = MagicMock(); factory.return_value.find.return_value = 'mid'
     assert runtime.drain(settings, {}, read_json=lambda *args: {}, transport_factory=factory) == {'CONFIRMED': 1}
     sent = factory.return_value.find.call_args.args[0]
-    assert str(code) in sent['message_text'] and field in sent['message_text']
-    assert 'Стадия: Отправка отчёта о нанесении' in sent['message_text']
+    from xtrek.terminal_feedback_messages import details_text
+    details = details_text(sent)
+    assert str(code) in details and field in details
+    assert 'СУЗ отклонил нанесение' in sent['message_text']
     if code == 7570:
         assert '1970-01-01 — 2100-01-01' in sent['message_text']
     if code == 7580:
         assert 'позже текущей даты' in sent['message_text']
     if code in (7570, 7580):
-        assert 'исправить' in sent['message_text'] and 'Повторную отправку согласовать отдельно' in sent['message_text']
+        assert 'исправление фактической даты' in sent['message_text'] and 'Повторную отправку согласовать отдельно' in details
     assert 'PRIVATE' not in sent['message_text']
     assert json.loads(sent['route_json'])['chat_id'] == 'chat-a'
 

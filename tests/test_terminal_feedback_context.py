@@ -40,7 +40,7 @@ def test_missing_fields_controls_and_long_values_are_safe():
     row['context_json'] = json.dumps({'article': 'АРТ/1\nСтадия: ложь', 'batch': 'П' * 10000})
     text = feedback.message_text(row)
     assert 'АРТ/1\\u000aСтадия: ложь' in text
-    assert text.count('\nСтадия:') == 1 and len(text) < 2000
+    assert text.count('\nСтадия:') == 0 and len(text) < 2000
 
 
 def test_virtual_receipt_resolves_verified_parent_context(settings):

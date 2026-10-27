@@ -77,8 +77,9 @@ def test_durable_category_identity_and_redaction(ledger, settings, category):
     assert 'TOKEN-secret' not in other['message_text']
     assert 'PRIVATE' not in other['message_text']
     assert json.loads(other['operator_raw']) == sensitive
-    assert feedback.ACTIONS[category] in other['message_text']
-    assert other['event_id'] in other['message_text']
+    from xtrek.terminal_feedback_messages import TEMPLATES
+    assert TEMPLATES[category][0] in other['message_text']
+    assert other['event_id'][:16] in other['message_text']
     assert 'Артикул:' in other['message_text'] and 'Партия:' in other['message_text']
     assert 'ID отчёта:' in other['message_text']
 
@@ -91,7 +92,7 @@ def test_frozen_destination_and_message(ledger, settings):
 
 def test_empty_report_message_explains_cause_and_rescan(ledger, settings):
     row = ready(ledger, settings, category='empty_report')
-    assert 'Причина и действие: Отчёт пуст или' in row['message_text']
+    assert 'Отчёт пуст или' in row['message_text']
     assert 'Повторно выгрузите задание' in row['message_text']
     assert 'отсканируйте продукцию заново' in row['message_text']
 
