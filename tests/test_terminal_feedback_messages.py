@@ -359,3 +359,78 @@ def test_invalid_contents_counts_are_rejected(tmp_path, counts):
     facts['issues'][0]['items'][0]['contents'] = counts
     assert validated_facts(facts) is None
     assert RESCAN_BOX not in compact_message(row_for(facts))
+
+
+@pytest.mark.parametrize('box_state', ['missing', None, '', 'UNKNOWN', 'NEW_STATUS'])
+@pytest.mark.parametrize('contents_state', ['INTRODUCED', 'EMITTED'])
+def test_unknown_box_status_waits_for_evidence(tmp_path, monkeypatch, box_state, contents_state):
+    # The first box is a verified repeat; the second lacks a usable SSCC status.
+    _, api, path = analyze(tmp_path, states=('INTRODUCED', contents_state),
+                           box_states=('INTRODUCED', 'NOT_FOUND'))
+    target = '00' + f'{1:018d}'
+    responses = api.get_list_cis_info.return_value
+    if box_state == 'missing':
+        responses[:] = [r for r in responses if r['cisInfo']['cis'] != target]
+    else:
+        next(r['cisInfo'] for r in responses if r['cisInfo']['cis'] == target)['status'] = box_state
+    monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', lambda *a: False)
+    store = MagicMock()
+    store.read_text.return_value = path.read_text()
+    monkeypatch.setattr('xtrek.utils.get_storage', lambda *a: store)
+    nk = MagicMock()
+    nk.product_info.return_value = {'isSet': True}
+    checked = AggregationAnalyzer(api, nk).check_report(str(path), strict_prerequisites=True)
+    assert checked.feedback_facts['scan_case'] == 'pending'
+    unknown = next(i for i in checked.feedback_facts['issues'] if i['kind'] == 'unconfirmedbox')
+    assert unknown['items'][0]['position'] == 2
+    store.set_tags.assert_not_called()
+
+
+def test_missing_sscc_retries_then_uses_restored_evidence(tmp_path, router, settings, monkeypatch):
+    tasks, task, _ = router
+    enable(tasks, settings, tmp_path)
+    _, api, path = analyze(tmp_path, states=('INTRODUCED',))
+    complete_responses = list(api.get_list_cis_info.return_value)
+    api.get_list_cis_info.return_value = [r for r in complete_responses if r['cisInfo']['cis'] != '00' + SSCC]
+    monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', lambda *a: False)
+    nk = MagicMock()
+    nk.product_info.return_value = {'isSet': True}
+    analyzer = AggregationAnalyzer(api, nk)
+    check = MagicMock(side_effect=lambda *a: {'path': analyzer.check_report(str(path), strict_prerequisites=True)})
+    monkeypatch.setattr(tasks, 'check_aggregation_reports', check)
+    monkeypatch.setattr(task, 'retry', MagicMock(side_effect=Retry()))
+    post = MagicMock(side_effect=AssertionError('No business POST'))
+    monkeypatch.setattr(tasks, 'sign_and_send_utilisation', post)
+    data = {'bucket': 'internal-bucket', 'key': 'equipment-reports/T.json'}
+    ledger = feedback.TerminalLedger(settings['ledger_path'])
+    assert task.apply(args=[data]).state == 'RETRY'
+    assert not ledger.pending()
+    api.get_list_cis_info.return_value = complete_responses
+    assert isinstance(task.apply(args=[data]).result, feedback.TerminalRecorded)
+    assert check.call_count == 2
+    assert ledger.pending()[0]['category'] == 'report_repeat_scan'
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize('parent', [None, '', '00999999999999999999', '00' + f'{1:018d}'])
+def test_partial_repeat_requires_unaggregated_ready_contents(tmp_path, monkeypatch, parent):
+    _, api, path = analyze(tmp_path, states=('INTRODUCED', 'EMITTED'),
+                           box_states=('INTRODUCED', 'NOT_FOUND'))
+    for response in api.get_list_cis_info.return_value:
+        if response['cisInfo']['status'] == 'EMITTED':
+            response['cisInfo']['parent'] = parent
+    monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', lambda *a: False)
+    nk = MagicMock()
+    nk.product_info.return_value = {'isSet': True}
+    checked = AggregationAnalyzer(api, nk).check_report(str(path), strict_prerequisites=True)
+    facts = checked.feedback_facts
+    expected = 'mixed' if parent else 'partial_repeat'
+    assert facts['scan_case'] == expected
+    category = 'report_scan_conflict' if parent else 'report_partial_repeat'
+    text = compact_message(row_for(facts, category))
+    if parent:
+        assert all(issue['kind'] != 'readybox' for issue in facts['issues'])
+        assert RESCAN_REMAINDER not in text and RESCAN_BOX not in text
+        assert 'Передайте отчёт ответственному для сверки кодов и состава упаковки.' in text
+    else:
+        assert RESCAN_REMAINDER in text

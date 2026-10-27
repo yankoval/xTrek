@@ -49,6 +49,9 @@ def diagnose_scan(boxes, pallets, statuses, structural_errors, api, *, statuses_
         state = statuses.get(sscc, {}).get('status')
         if not codes or not safe_identifier(sscc, 'box') or any(not safe_identifier(c, 'product') for c in codes):
             kind = 'unconfirmedbox'
+        elif state not in STATE_LABELS:
+            # A missing/unknown SSCC response is not a confirmed conflict.
+            kind = 'unconfirmedbox'
         elif state == 'INTRODUCED' and all(s == 'INTRODUCED' for s in states):
             if sscc not in composition:
                 kind = 'unconfirmedbox'
@@ -57,7 +60,8 @@ def diagnose_scan(boxes, pallets, statuses, structural_errors, api, *, statuses_
             else:
                 kind = 'repeatedbox'
                 repeated += 1
-        elif all(s == 'EMITTED' for s in states) and state == 'NOT_FOUND':
+        elif (all(s == 'EMITTED' for s in states) and state == 'NOT_FOUND'
+              and all(not statuses.get(c, {}).get('parent') for c in codes)):
             kind = 'readybox'
             ready += 1
         elif all(s == 'INTRODUCED' for s in states):
