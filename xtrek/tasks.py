@@ -1167,7 +1167,12 @@ def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
         # Celery preserves this intent in the durable retry message. No business
         # route is entered while the ledger cannot be read/written.
         return _retry_terminal_persistence(self, data, terminal_failure, terminal_facts)
-    if recorded:
+    if recorded and (
+        terminal_failure is not None
+        or not callable(getattr(feedback_ledger, 'permits_reconciled_utilisation', None))
+        or not feedback_ledger.permits_reconciled_utilisation(
+            event_identity(bucket, data['key']))
+    ):
         raise TerminalRecorded('Equipment processing requires reconciliation')
     print(f"\n[ROUTER] Новое событие S3: {full_key}")
 

@@ -1,5 +1,6 @@
 """Cross-worker CAS and restart tests: synthetic storage and fake MAX only."""
 import json
+import hashlib
 import multiprocessing
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor
@@ -123,3 +124,92 @@ def test_lost_cas_response_never_grants_another_post(tmp_path, settings):
         deliver(ledger, row, fake)
     assert deliver(S3TerminalLedger(Store(store.path), ROOT), row, fake) == 'GET_RECONCILIATION_REQUIRED'
     fake.post.assert_not_called()
+
+
+def _approved_utilisation(store, ledger, *, status='SENT'):
+    bucket = 'internal-bucket'
+    report = 'T-GB-6937-test'
+    key = f'utilisationReceipts/{report}.json'
+    row = ledger.record(bucket, key, 'utilisation-status', 'utilisation_rejected')
+    row = ledger.bind_route(row['event_id'], report, None, {'transport': 'max',
+                                                           'chat_id': 'chat',
+                                                           'bot_user_id': 'bot',
+                                                           'token_env': 'TEST_TOKEN'})
+    assert ledger.claim_post(row['event_id'])
+    ledger.confirmed(row['event_id'], 'old-notice-id')
+    receipt_path = f's3://{bucket}/{key}'
+    receipt = {'reportId': '12345678-1234-1234-1234-123456789abc',
+               'productionOrderId': report, 'orderId': report}
+    receipt_etag = store.write_lock_object(receipt_path, json.dumps(receipt), None)
+    status_path = f's3://{bucket}/utilisationReports/{report}.json'
+    store.write_lock_object(status_path, json.dumps({
+        'reportId': receipt['reportId'], 'productionOrderId': report,
+        'reportStatus': status}), None)
+    task_path = f's3://{bucket}/utilisationTasks/{report}.json'
+    task_text = json.dumps({'productionOrderId': report, 'sntins': ['code']})
+    store.write_lock_object(task_path, task_text, None)
+    terminal_etag = store.read_lock_object(ledger._path(row['event_id']))[1]
+    resolution = {'version': 1, 'event_id': row['event_id'],
+                  'terminal_etag': terminal_etag, 'bucket': bucket,
+                  'source_key': key, 'new_report_id': receipt['reportId'],
+                  'receipt_etag': receipt_etag,
+                  'task_sha256': hashlib.sha256(task_text.encode()).hexdigest(),
+                  'approval_reference': 'user-confirmed-two-report-recovery'}
+    store.write_lock_object(ledger.resolution_root + '/' + row['event_id'] + '.json',
+                            json.dumps(resolution), None)
+    return row, receipt_path, status_path, resolution
+
+
+def test_exact_reconciliation_allows_new_receipt_without_erasing_old_notice(tmp_path):
+    store = Store(str(tmp_path / 'fake-s3.db'))
+    ledger = S3TerminalLedger(store, ROOT)
+    row, receipt_path, status_path, resolution = _approved_utilisation(store, ledger)
+    event_id = row['event_id']
+    assert ledger.permits_reconciled_utilisation(event_id)
+    assert ledger.get(event_id)['terminal_state'] == 'RECONCILIATION_REQUIRED'
+    assert ledger.get(event_id)['delivery_state'] == 'CONFIRMED'
+    assert ledger.pending() == []  # Resolution objects stay outside the pending prefix.
+
+    old_status, etag = store.read_lock_object(status_path)
+    store.write_lock_object(status_path, json.dumps({**json.loads(old_status),
+                                                     'reportStatus': 'FAILED'}), etag)
+    assert not ledger.permits_reconciled_utilisation(event_id)
+    store.write_lock_object(status_path, old_status,
+                            store.read_lock_object(status_path)[1])
+    old_receipt, etag = store.read_lock_object(receipt_path)
+    store.write_lock_object(receipt_path, json.dumps({**json.loads(old_receipt),
+                                                      'changed': True}), etag)
+    assert not ledger.permits_reconciled_utilisation(event_id)  # ETag changed.
+    assert resolution['receipt_etag'] != store.read_lock_object(receipt_path)[1]
+
+
+def test_reconciliation_only_bypasses_matching_utilisation_terminal(tmp_path, settings,
+                                                                    monkeypatch, router):
+    from test_terminal_feedback import enable
+    tasks, task, _ = router
+    store = Store(str(tmp_path / 'fake-s3.db'))
+    settings.update(ledger_backend='s3', ledger_path=ROOT)
+    enable(tasks, settings, tmp_path)
+    monkeypatch.setattr('xtrek.storage.get_storage', lambda *args: store)
+    ledger = S3TerminalLedger(store, ROOT)
+    row, _, _, _ = _approved_utilisation(store, ledger)
+    business = MagicMock(return_value='started')
+    monkeypatch.setattr(tasks, 'logic_utilisationReceipt', business)
+    data = {'bucket': 'internal-bucket', 'key': row['source_key']}
+    assert task.apply(args=[data]).successful()
+    business.assert_called_once()
+    assert isinstance(task.apply(kwargs={'data': data,
+                                         'terminal_failure': 'utilisation_rejected'}).result,
+                      feedback.TerminalRecorded)
+    business.assert_called_once()
+
+
+def test_corrupt_reconciliation_record_keeps_terminal_fence(tmp_path):
+    store = Store(str(tmp_path / 'fake-s3.db'))
+    ledger = S3TerminalLedger(store, ROOT)
+    row, _, _, _ = _approved_utilisation(store, ledger)
+    path = ledger.resolution_root + '/' + row['event_id'] + '.json'
+    _, etag = store.read_lock_object(path)
+    store.write_lock_object(path, '{broken', etag)
+    assert not ledger.permits_reconciled_utilisation(row['event_id'])
+    assert ledger.get(row['event_id'])['delivery_state'] == 'CONFIRMED'

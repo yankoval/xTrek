@@ -5,6 +5,7 @@ failover may only reconcile an ambiguous attempt through GET, never resend it.
 No business object or operation guard is modified by this ledger.
 """
 import json
+import hashlib
 import re
 import time
 from urllib.parse import urlparse
@@ -21,6 +22,8 @@ class S3TerminalLedger:
             raise ValueError('Shared feedback ledger requires an explicit S3 prefix')
         self.storage = storage
         self.root = root.rstrip('/')
+        # Sibling prefix: pending() lists the terminal root recursively.
+        self.resolution_root = self.root.rsplit('/', 1)[0] + '/resolutions-v1'
 
     def _path(self, event_id):
         if not re.fullmatch(r'[0-9a-f]{64}', event_id):
@@ -42,6 +45,79 @@ class S3TerminalLedger:
 
     def get(self, event_id):
         return self._read(event_id)[0]
+
+    def permits_reconciled_utilisation(self, event_id):
+        """Allow only a separately approved replacement receipt; retain the old event.
+
+        An immutable resolution object is scoped to the terminal event, its
+        current ETag, and the replacement receipt's ETag and reportId. The
+        business route still obtains live SUZ SUCCESS before any introduction.
+        """
+        row, terminal_etag = self._read(event_id)
+        if (not row or row.get('stage') != 'utilisation-status'
+                or row.get('category') != 'utilisation_rejected'
+                or row.get('delivery_state') != 'CONFIRMED'):
+            return False
+        key = row['source_key']
+        if (not re.fullmatch(r'utilisationReceipts/T-[^/]+\.json', key)
+                or event_identity(row['bucket'], key) != event_id):
+            return False
+        resolution_path = self.resolution_root + '/' + event_id + '.json'
+        stored = self.storage.read_lock_object(resolution_path)
+        if stored is None:
+            return False
+        try:
+            resolution = json.loads(stored[0])
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(resolution, dict):
+            return False
+        if (resolution.get('version') != 1
+                or resolution.get('event_id') != event_id
+                or resolution.get('terminal_etag') != terminal_etag
+                or resolution.get('source_key') != key
+                or resolution.get('bucket') != row['bucket']
+                or not re.fullmatch(r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}',
+                                    str(resolution.get('new_report_id', '')))
+                or not isinstance(resolution.get('approval_reference'), str)
+                or not resolution['approval_reference'].strip()):
+            return False
+        receipt_path = 's3://' + row['bucket'] + '/' + key
+        receipt = self.storage.read_lock_object(receipt_path)
+        if receipt is None or receipt[1] != resolution.get('receipt_etag'):
+            return False
+        try:
+            receipt_body = json.loads(receipt[0])
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(receipt_body, dict):
+            return False
+        report_id = key.removeprefix('utilisationReceipts/').removesuffix('.json')
+        if (receipt_body.get('reportId') != resolution['new_report_id']
+                or receipt_body.get('productionOrderId') != report_id
+                or receipt_body.get('orderId') != report_id):
+            return False
+        status_path = 's3://' + row['bucket'] + '/utilisationReports/' + report_id + '.json'
+        status = self.storage.read_lock_object(status_path)
+        if status is None:
+            return False
+        try:
+            status_body = json.loads(status[0])
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(status_body, dict):
+            return False
+        if (status_body.get('reportId') != resolution['new_report_id']
+                or status_body.get('productionOrderId') != report_id
+                or status_body.get('reportStatus') not in
+                {'READY_TO_SEND', 'SENT', 'IN_PROGRESS', 'SUCCESS'}):
+            return False
+        task_path = 's3://' + row['bucket'] + '/utilisationTasks/' + report_id + '.json'
+        task = self.storage.read_lock_object(task_path)
+        if (task is None
+                or hashlib.sha256(task[0].encode()).hexdigest() != resolution.get('task_sha256')):
+            return False
+        return True
 
     def _update(self, event_id, change):
         for _ in range(8):
