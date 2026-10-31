@@ -8,25 +8,69 @@ import time
 from urllib.parse import urlparse
 
 from .terminal_feedback_messages import frozen_attachment
-from .pallet_label_max_notifier import MAX_API, MaxPalletLabelNotifier, DeliveryUncertain, HistoryIncomplete
+from .pallet_label_max_notifier import MAX_API, DeliveryConflict, DeliveryUncertain, HistoryIncomplete
 
 
-class TerminalHistoryReader(MaxPalletLabelNotifier):
+class TerminalHistoryReader:
+    """GET-only reader: terminal deliveries use their own ledger and fresh history.
+
+    Do not inherit pallet delivery state or its preflight cache: find() is also
+    called immediately after a terminal POST and must observe new messages.
+    """
+    def __init__(self, *, token, chat_id, expected_bot_user_id, session,
+                 history_start_ms, max_history_pages=100):
+        self.token = token
+        self.chat_id = str(chat_id)
+        self.expected_bot_user_id = str(expected_bot_user_id)
+        self.session = session
+        self.history_start_ms = int(history_start_ms)
+        self.max_history_pages = int(max_history_pages)
+        if not 1 <= self.max_history_pages <= 10000:
+            raise ValueError('Invalid MAX history page limit')
+
     def _get(self, path, params=None):
-        payload = super()._get(path, params)
+        response = self.session.get(MAX_API + path, params=params,
+                                    headers={'Authorization': self.token}, timeout=20)
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HistoryIncomplete('Malformed MAX response; delivery held') from exc
+        if not isinstance(payload, dict):
+            raise HistoryIncomplete('Malformed MAX response; delivery held')
         if path == '/messages':
-            if (not isinstance(payload, dict) or not isinstance(payload.get('messages'), list)
+            if (not isinstance(payload.get('messages'), list)
                     or any(not isinstance(item, dict) or not isinstance(item.get('timestamp'), (int, float))
                            for item in payload['messages'])):
                 raise HistoryIncomplete('Malformed MAX history; delivery held')
         return payload
+
+    def _verify_bot(self):
+        if str(self._get('/me').get('user_id')) != self.expected_bot_user_id:
+            raise DeliveryConflict('Configured MAX token belongs to a different bot')
+
+    def _history(self):
+        messages, cursor = [], None
+        for _ in range(self.max_history_pages):
+            params = {'chat_id': self.chat_id, 'count': 100}
+            if cursor is not None:
+                params['from'] = cursor - 1
+            batch = self._get('/messages', params)['messages']
+            messages.extend(m for m in batch if int(m['timestamp']) >= self.history_start_ms)
+            stamps = [int(m['timestamp']) for m in batch]
+            if len(batch) < 100 or (stamps and min(stamps) < self.history_start_ms):
+                return messages
+            if not stamps or (cursor is not None and min(stamps) >= cursor):
+                raise HistoryIncomplete('MAX history pagination cursor did not advance')
+            cursor = min(stamps)
+        raise HistoryIncomplete('MAX history page limit exceeded; delivery is held')
 
 
 class MaxTerminalTransport:
     def __init__(self, *, session, token, route, created_at, max_history_pages=100):
         self.reader = TerminalHistoryReader(
             token=token, chat_id=route['chat_id'], expected_bot_user_id=route['bot_user_id'],
-            ledger=None, session=session, history_start_ms=int(created_at * 1000) - 60000,
+            session=session, history_start_ms=int(created_at * 1000) - 60000,
             max_history_pages=max_history_pages)
 
     @staticmethod
