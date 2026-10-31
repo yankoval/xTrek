@@ -47,3 +47,8 @@ rollback; never restore an older ledger that would forget those deliveries.
 Existing conflict flags are not cleared automatically by a code update. Repair
 false flags only after a complete history audit confirms the original MID and
 exact task link and finds no competing task delivery. Back up the ledger first.
+
+When an operator reports a manual delivery but exact evidence is still missing,
+use `manual_review` with an explicit reason rather than marking it delivered.
+That state survives restarts, is excluded from routine history/MID batches, and
+cannot authorize a POST; release it only after the operator's review.

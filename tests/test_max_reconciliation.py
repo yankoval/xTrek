@@ -691,3 +691,18 @@ def test_task_batches_real_mids_below_gateway_limit(tmp_path, monkeypatch):
     notifier._reconcile_mids()
     assert batches == [20, 20, 5]
     assert not notifier._pending()
+
+
+def test_operator_hold_survives_restart_and_never_checks_or_posts(tmp_path, monkeypatch):
+    from xtrek.task_notifier import TASK_BUCKET, TaskNotifier
+    notifier = make_task_notifier(tmp_path)
+    task_id, key, link = task_message(1)
+    notifier._ensure_row(TASK_BUCKET, key, 'etag', None, 1)
+    notifier._transition(TASK_BUCKET, task_id, ('discovered',), 'manual_review', detail='operator reports manual delivery; exact proof pending')
+    notifier = TaskNotifier(s3=notifier.s3, settings=notifier.settings)
+    notifier._bot_id = 'bot-1'
+    notifier._apply_history([link])
+    monkeypatch.setattr(notifier, '_get_json', lambda *a, **k: pytest.fail('Held task must not block other checks'))
+    monkeypatch.setattr('xtrek.task_notifier.requests.post', lambda *a, **k: pytest.fail('Held task must not send'))
+    assert not notifier._pending()
+    assert notifier.process_object(bucket_id=TASK_BUCKET, object_key=key).state == 'manual_review'

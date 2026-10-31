@@ -241,7 +241,7 @@ class TaskNotifier:
     def _pending(self, *, include_confirmed=False):
         with self._db() as db:
             return list(db.execute("""SELECT d.* FROM logical_deliveries d
-                WHERE recipient=? AND mode='json-link' AND (? OR state!='delivered')
+                WHERE recipient=? AND mode='json-link' AND state!='manual_review' AND (? OR state!='delivered')
                 AND NOT EXISTS (SELECT 1 FROM task_manual_deliveries m
                     WHERE m.bucket_id=d.bucket_id AND m.task_id=d.task_id AND m.recipient=d.recipient)
                 AND (? OR NOT EXISTS (SELECT 1 FROM task_history_conflicts c
@@ -406,6 +406,8 @@ class TaskNotifier:
             first_ms=int(head["LastModified"].timestamp()*1000)
             row=self._ensure_row(bucket_id,object_key,etag,version_id,first_ms)
             state=row["state"]
+            if state=="manual_review":
+                return DeliveryResult("manual_review",object_key,row["message_id"],row["detail"])
             if state=="delivered": return DeliveryResult("delivered",object_key,row["message_id"],"logical task already delivered")
             if state in ("sending","uncertain"):
                 complete,mid,conflict=self._reconcile(task_id=task_id,bucket=bucket_id,key=object_key,created_ms=row["first_seen_ms"])
