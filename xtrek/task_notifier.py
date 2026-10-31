@@ -121,6 +121,22 @@ class TaskNotifier:
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, first_seen_ms INTEGER NOT NULL,
                 etag TEXT, version_id TEXT, message_id TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
                 detail TEXT, PRIMARY KEY(bucket_id,task_id,recipient,mode))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS task_history_conflicts (
+                bucket_id TEXT, task_id TEXT, recipient TEXT,
+                PRIMARY KEY(bucket_id,task_id,recipient))""")
+
+    def _history_conflicted(self, bucket, task_id):
+        with self._db() as db:
+            return db.execute('SELECT 1 FROM task_history_conflicts WHERE bucket_id=? AND task_id=? AND recipient=?',
+                              (bucket, task_id, str(self.settings.max_chat_id))).fetchone() is not None
+
+    def _record_history_conflict(self, row):
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            key = (row['bucket_id'], row['task_id'], row['recipient'])
+            db.execute('INSERT OR IGNORE INTO task_history_conflicts VALUES (?,?,?)', key)
+            db.execute("UPDATE logical_deliveries SET state='uncertain',detail='conflicting MAX history requires review' "
+                       "WHERE bucket_id=? AND task_id=? AND recipient=? AND mode='json-link'", key)
 
     @staticmethod
     def _valid_key(bucket: str, key: str) -> bool:
@@ -171,7 +187,9 @@ class TaskNotifier:
             cur=db.execute(f"""UPDATE logical_deliveries SET state=?,updated_at=?,etag=COALESCE(?,etag),
                 version_id=COALESCE(?,version_id),message_id=COALESCE(?,message_id),detail=?,
                 attempt_count=attempt_count+? WHERE bucket_id=? AND task_id=? AND recipient=?
-                AND mode='json-link' AND state IN ({marks})""",
+                AND mode='json-link' AND state IN ({marks})
+                AND NOT EXISTS (SELECT 1 FROM task_history_conflicts c WHERE c.bucket_id=logical_deliveries.bucket_id
+                    AND c.task_id=logical_deliveries.task_id AND c.recipient=logical_deliveries.recipient)""",
                 (state,self._now(),etag,version_id,message_id,detail,int(attempted),bucket,task_id,
                  str(self.settings.max_chat_id),*expected))
             db.commit()
@@ -216,15 +234,15 @@ class TaskNotifier:
     def _check_scope(row):
         return 'task-check:' + json.dumps([row['bucket_id'], row['task_id'], row['recipient']])
 
-    def _pending(self):
+    def _pending(self, *, include_confirmed=False):
         with self._db() as db:
-            return list(db.execute("SELECT * FROM logical_deliveries WHERE recipient=? AND mode='json-link' AND state!='delivered'",
-                                   (str(self.settings.max_chat_id),)))
+            return list(db.execute("SELECT * FROM logical_deliveries WHERE recipient=? AND mode='json-link' AND (? OR state!='delivered')",
+                                   (str(self.settings.max_chat_id), include_confirmed)))
 
     def _apply_history(self, messages):
         """Commit all exact matches on each page, not just the current task."""
         conflicts = set()
-        for row in self._pending():
+        for row in self._pending(include_confirmed=True):
             matches = set()
             conflict = False
             for message in messages:
@@ -257,7 +275,7 @@ class TaskNotifier:
                 self.retries.clear(self._check_scope(row))
             elif conflict or len(matches) > 1:
                 conflicts.add(identity)
-                self._transition(*identity, (row['state'],), 'uncertain', detail='conflicting MAX history requires review')
+                self._record_history_conflict(row)
         return conflicts
 
     def _reconcile_mids(self):
@@ -276,6 +294,8 @@ class TaskNotifier:
 
     def _reconcile(self, *, task_id: str, bucket: str, key: str, created_ms: int) -> tuple[bool,str|None,bool]:
         row = self._row(bucket, task_id)
+        if self._history_conflicted(bucket, task_id):
+            return True, None, True
         try:
             if self._bot_id is None:
                 status, me = self._get_json('me')
@@ -287,6 +307,8 @@ class TaskNotifier:
                 self._apply_history(self._history_cache)
             self._reconcile_mids()
             row = self._row(bucket, task_id)
+            if self._history_conflicted(bucket, task_id):
+                return True, None, True
             if row['state'] == 'delivered':
                 return True, row['message_id'], False
             if row['message_id'] or self.retries.remaining(self._check_scope(row)):
@@ -318,6 +340,8 @@ class TaskNotifier:
                 self._history_cache, self._history_at = history, time.time()
                 self.api_retries.success(self.api_scope)
             row = self._row(bucket, task_id)
+            if self._history_conflicted(bucket, task_id):
+                return True, None, True
             if row['state'] == 'delivered':
                 return True, row['message_id'], False
             if not complete or row['state'] in ('sending', 'uncertain'):
@@ -326,6 +350,8 @@ class TaskNotifier:
         except MaxRetryLater:
             # Earlier pages have already committed all their positive matches.
             row = self._row(bucket, task_id)
+            if self._history_conflicted(bucket, task_id):
+                return True, None, True
             if row['state'] == 'delivered':
                 return True, row['message_id'], False
             return False, None, False

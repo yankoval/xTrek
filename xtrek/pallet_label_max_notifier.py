@@ -13,7 +13,7 @@ import re
 from contextlib import contextmanager
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -64,6 +64,35 @@ class DeliveryLedger:
                 report_id TEXT, sscc TEXT, chat_id TEXT, bot_id TEXT NOT NULL, caption TEXT NOT NULL,
                 PRIMARY KEY(report_id,sscc,chat_id))''')
 
+            db.execute('''CREATE TABLE IF NOT EXISTS pallet_history_conflicts (
+                report_id TEXT, sscc TEXT, chat_id TEXT, message_ids TEXT NOT NULL,
+                PRIMARY KEY(report_id,sscc,chat_id))''')
+
+    def check_history_conflict(self, report_id, sscc, chat_id):
+        with sqlite3.connect(self.path) as db:
+            if db.execute('SELECT 1 FROM pallet_history_conflicts WHERE report_id=? AND sscc=? AND chat_id=?',
+                          (report_id, sscc, chat_id)).fetchone():
+                raise DeliveryUncertain('Multiple GET matches require manual reconciliation')
+
+    def saved_caption(self, item, chat_id):
+        with sqlite3.connect(self.path) as db:
+            row = db.execute('SELECT caption FROM pallet_delivery_proofs WHERE report_id=? AND sscc=? AND chat_id=?',
+                             (item.report_id, item.sscc, chat_id)).fetchone()
+            return row[0] if row else item.text
+
+    def record_history_conflict(self, row, mids):
+        with sqlite3.connect(self.path) as db:
+            db.execute('BEGIN IMMEDIATE')
+            key = (row['report_id'], row['sscc'], row['chat_id'])
+            old = db.execute('SELECT message_ids FROM pallet_history_conflicts WHERE report_id=? AND sscc=? AND chat_id=?', key).fetchone()
+            all_mids = set(mids) | (set(json.loads(old[0])) if old else set())
+            db.execute('INSERT OR REPLACE INTO pallet_history_conflicts VALUES (?,?,?,?)',
+                       (*key, json.dumps(sorted(all_mids))))
+            # Positive delivery evidence is retained in message_id, but a newly
+            # discovered conflict must override the normal CONFIRMED fast path.
+            db.execute("UPDATE deliveries SET state='POST_UNCERTAIN',updated_at=? WHERE report_id=? AND sscc=? AND chat_id=?",
+                       (time.time(), *key))
+
     @contextmanager
     def delivery_lock(self):
         import fcntl  # Delivery runs on the VPS; keep label rendering importable on Windows.
@@ -76,6 +105,7 @@ class DeliveryLedger:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def remember(self, item, chat_id, bot_id):
+        self.check_history_conflict(item.report_id, item.sscc, chat_id)
         row = self.reserve(item, chat_id)
         if (row['source_hash'] not in (item.source_hash, 'legacy-uncertain')
                 or row['file_name'] != item.file_name):
@@ -89,18 +119,18 @@ class DeliveryLedger:
             # Do not replace it with a caption from a newer renderer.
             if not proof and row['state'] in {'POST_STARTED', 'POST_UNCERTAIN', 'POSTED_UNCONFIRMED'}:
                 return row
-            # Preserve the caption actually used by the first attempt.
+            # Freeze the reserved caption; any later pre-POST retry sends this text.
             db.execute('INSERT OR IGNORE INTO pallet_delivery_proofs VALUES (?,?,?,?,?)',
                        (item.report_id, item.sscc, chat_id, bot_id, item.text))
         return row
 
-    def pending(self, chat_id, bot_id):
+    def pending(self, chat_id, bot_id, *, include_confirmed=False):
         with sqlite3.connect(self.path) as db:
             db.row_factory = sqlite3.Row
             return [dict(row) for row in db.execute('''SELECT d.*,p.caption,p.bot_id FROM deliveries d
                 LEFT JOIN pallet_delivery_proofs p USING(report_id,sscc,chat_id)
-                WHERE d.chat_id=? AND d.state!='CONFIRMED' AND (p.bot_id=? OR p.bot_id IS NULL)''',
-                (chat_id, bot_id))]
+                WHERE d.chat_id=? AND (? OR d.state!='CONFIRMED') AND (p.bot_id=? OR p.bot_id IS NULL)''',
+                (chat_id, include_confirmed, bot_id))]
 
     def confirm(self, row, mid):
         if not mid:
@@ -108,7 +138,9 @@ class DeliveryLedger:
         with sqlite3.connect(self.path) as db:
             cur = db.execute('''UPDATE deliveries SET state='CONFIRMED',message_id=?,updated_at=?
                 WHERE report_id=? AND sscc=? AND chat_id=? AND state=? AND source_hash=?
-                AND file_sha256=? AND (message_id IS NULL OR message_id='' OR message_id=?)''',
+                AND file_sha256=? AND (message_id IS NULL OR message_id='' OR message_id=?)
+                AND NOT EXISTS (SELECT 1 FROM pallet_history_conflicts c WHERE c.report_id=deliveries.report_id
+                    AND c.sscc=deliveries.sscc AND c.chat_id=deliveries.chat_id)''',
                 (mid, time.time(), row['report_id'], row['sscc'], row['chat_id'], row['state'],
                  row['source_hash'], row['file_sha256'], mid))
             return cur.rowcount == 1
@@ -187,7 +219,9 @@ class DeliveryLedger:
     def set_state(self, message: LabelMessage, chat_id: str, state: str, message_id: str | None = None) -> None:
         with sqlite3.connect(self.path) as db:
             db.execute('UPDATE deliveries SET state=?, message_id=COALESCE(?,message_id), updated_at=? '
-                       "WHERE report_id=? AND sscc=? AND chat_id=? AND state!='CONFIRMED'",
+                       "WHERE report_id=? AND sscc=? AND chat_id=? AND state!='CONFIRMED' "
+                       "AND NOT EXISTS (SELECT 1 FROM pallet_history_conflicts c WHERE c.report_id=deliveries.report_id "
+                       "AND c.sscc=deliveries.sscc AND c.chat_id=deliveries.chat_id)",
                        (state, message_id, time.time(), message.report_id, message.sscc, chat_id))
             db.commit()
 
@@ -247,9 +281,13 @@ class MaxPalletLabelNotifier:
     def reconcile_history(self, messages):
         """Every successful page is evidence for ALL pending deliveries, even if a later GET fails."""
         confirmed = []
-        for row in self.ledger.pending(self.chat_id, self.expected_bot_user_id):
+        by_sscc = {}
+        for message in messages:
+            for sscc in set(re.findall(r'(?<!\d)\d{18}(?!\d)', str((message.get('body') or {}).get('text') or ''))):
+                by_sscc.setdefault(sscc, []).append(message)
+        for row in self.ledger.pending(self.chat_id, self.expected_bot_user_id, include_confirmed=True):
             matches = {}
-            for message in messages:
+            for message in by_sscc.get(row['sscc'], []):
                 body = message.get('body') or {}
                 mid = body.get('mid')
                 text = str(body.get('text') or '')
@@ -266,8 +304,6 @@ class MaxPalletLabelNotifier:
                 file = any(a.get('type') == 'file' for a in attachments)
                 if row['state'] == 'POSTED_UNCONFIRMED' and not image:
                     continue
-                if row['message_id'] and mid != row['message_id']:
-                    continue
                 filename = row['file_name'] in self._attachment_names(message) or row['file_name'] in text
                 caption = row.get('caption') and text == row['caption']
                 # Legacy rows have no saved caption. A stored POST MID plus exact
@@ -275,7 +311,12 @@ class MaxPalletLabelNotifier:
                 known_mid = row['message_id'] == mid and image and not row.get('caption')
                 if (image or file) and (filename or (image and caption) or known_mid):
                     matches[mid] = message
-            if len(matches) == 1:
+            mids = set(matches)
+            if row['message_id']:
+                mids.add(row['message_id'])
+            if len(mids) > 1:
+                self.ledger.record_history_conflict(row, mids)
+            elif len(matches) == 1 and row['state'] != 'CONFIRMED':
                 mid = next(iter(matches))
                 if self.ledger.confirm(row, mid):
                     self.retries.clear(self._check_scope(row))
@@ -381,12 +422,14 @@ class MaxPalletLabelNotifier:
         if not item.png_bytes or not item.report_id or not item.sscc or not item.file_name.endswith('.png'):
             raise ValueError('Validated report ID, SSCC, filename, and PNG bytes are required')
         row = self.ledger.remember(item, self.chat_id, self.expected_bot_user_id)
+        item = replace(item, text=self.ledger.saved_caption(item, self.chat_id))
         if row['state'] == 'CONFIRMED':
             return {'state': 'ALREADY_CONFIRMED_BY_LEDGER', 'message_id': row.get('message_id')}
         # Positive evidence does not expire with the preflight cache and must
         # be usable even while this row or the API is waiting for its deadline.
         evidence = list(self.history_seed) + list(self._history_cache or [])
         self.reconcile_history(evidence)
+        self.ledger.check_history_conflict(item.report_id, item.sscc, self.chat_id)
         row = self.ledger.get(item.report_id, item.sscc, self.chat_id)
         if row['state'] == 'CONFIRMED':
             match = self._exact_message(evidence, item)
@@ -396,6 +439,7 @@ class MaxPalletLabelNotifier:
                     'message_id': row.get('message_id')}
         self._verify_bot()
         self.reconcile_pending_mids()
+        self.ledger.check_history_conflict(item.report_id, item.sscc, self.chat_id)
         row = self.ledger.get(item.report_id, item.sscc, self.chat_id)
         if row['state'] == 'CONFIRMED':
             return {'state': 'ALREADY_CONFIRMED_BY_GET', 'message_id': row.get('message_id')}
@@ -403,6 +447,7 @@ class MaxPalletLabelNotifier:
             raise DeliveryRecheck(self.retries.remaining(self._check_scope(row)) or 5,
                                   'Prior message POST is ambiguous; GET only, never auto-repeat')
         history = self._history()
+        self.ledger.check_history_conflict(item.report_id, item.sscc, self.chat_id)
         existing_message = self._exact_message(history, item, image_only=row['state'] == 'POSTED_UNCONFIRMED')
         if existing_message:
             self.ledger.reserve(item, self.chat_id)
@@ -513,12 +558,14 @@ class MaxPalletLabelNotifier:
             raise DeliveryRecheck(5, 'Message POST outcome is ambiguous; reconcile by GET') from exc
 
         # Known MIDs never require a full history walk after POST.
+        self.ledger.check_history_conflict(item.report_id, item.sscc, self.chat_id)
         row = self.ledger.get(item.report_id, item.sscc, self.chat_id)
         if row['message_id']:
             self.reconcile_pending_mids()
         else:
             self._history_cache = None
             self._history()
+        self.ledger.check_history_conflict(item.report_id, item.sscc, self.chat_id)
         row = self.ledger.get(item.report_id, item.sscc, self.chat_id)
         if row['state'] != 'CONFIRMED':
             raise DeliveryRecheck(self.retries.remaining(self._check_scope(row)) or self.retries.fail(self._check_scope(row)),

@@ -158,7 +158,9 @@ def test_batch_confirmation_requires_matching_identity_and_evidence(tmp_path, ch
     notifier, ledger = make_notifier(tmp_path, FakeSession())
     remember(notifier, label, 'POSTED_UNCONFIRMED', 'expected-mid')
     assert notifier.reconcile_history([msg]) == []
-    assert ledger.get(label.report_id, label.sscc, CHAT)['state'] == 'POSTED_UNCONFIRMED'
+    row = ledger.get(label.report_id, label.sscc, CHAT)
+    assert row['state'] == ('POST_UNCERTAIN' if change == 'mid' else 'POSTED_UNCONFIRMED')
+    assert row['message_id'] == 'expected-mid'
 
 
 def test_multiple_matches_are_held_and_not_resent(tmp_path):
@@ -482,3 +484,121 @@ def test_malformed_task_history_never_authorizes_post(tmp_path, monkeypatch, pay
     def no_post(*args, **kwargs): raise AssertionError('Malformed history must not authorize POST')
     monkeypatch.setattr('xtrek.task_notifier.requests.post', no_post)
     assert notifier.process_object(bucket_id=TASK_BUCKET, object_key=KEY).state == 'deferred'
+
+
+def reopen_pallet_notifier(ledger, session):
+    return MaxPalletLabelNotifier(token='fake-token', chat_id=CHAT, expected_bot_user_id=BOT,
+        ledger=DeliveryLedger(ledger.path), session=session, history_start_ms=NOW_MS - 100000,
+        sleep=lambda _: None)
+
+
+def test_different_mids_on_separate_pages_remain_blocked_after_restart(tmp_path):
+    label = make_item()
+    class Pages(FakeSession):
+        def get(self, url, params=None, **kw):
+            if url.endswith('/me'):
+                return super().get(url, params=params, **kw)
+            if 'from' not in params:
+                return Response(value={'messages': [message(label, 'first-mid')] +
+                    [{'timestamp': NOW_MS - i, 'body': {}} for i in range(1, 100)]})
+            return Response(value={'messages': [dict(message(label, 'second-mid'), timestamp=NOW_MS - 101)]})
+    session = Pages()
+    notifier, ledger = make_notifier(tmp_path, session)
+    with pytest.raises(DeliveryUncertain, match='Multiple GET matches'):
+        notifier.deliver(label)
+    assert ledger.get(label.report_id, label.sscc, CHAT)['state'] == 'POST_UNCERTAIN'
+    assert ledger.get(label.report_id, label.sscc, CHAT)['message_id'] == 'first-mid'
+    other = reopen_pallet_notifier(ledger, session)
+    # Neither a later exact match nor a direct transition may erase the conflict.
+    other.reconcile_history([message(label, 'first-mid')])
+    ledger.set_state(label, CHAT, 'CONFIRMED', 'first-mid')
+    with pytest.raises(DeliveryUncertain, match='Multiple GET matches'):
+        other.deliver(label)
+    assert ledger.get(label.report_id, label.sscc, CHAT)['state'] == 'POST_UNCERTAIN'
+    assert not session.posts
+
+
+def test_conflict_discovered_after_page_confirmation_and_restart(tmp_path):
+    label, unrelated = item(1), item(2)
+    notifier, ledger = make_notifier(tmp_path, FakeSession())
+    remember(notifier, label)
+    remember(notifier, unrelated)
+    assert notifier.reconcile_history([message(label, 'first')]) == ['first']
+    other = reopen_pallet_notifier(ledger, FakeSession())
+    assert other.reconcile_history([message(label, 'second'), message(unrelated, 'unrelated')]) == ['unrelated']
+    with pytest.raises(DeliveryUncertain, match='Multiple GET matches'):
+        other.deliver(label)
+    assert ledger.get(unrelated.report_id, unrelated.sscc, CHAT)['state'] == 'CONFIRMED'
+
+
+def test_overlapping_pages_with_same_mid_do_not_create_conflict(tmp_path):
+    notifier, ledger = make_notifier(tmp_path, FakeSession())
+    label = make_item()
+    remember(notifier, label)
+    notifier.reconcile_history([message(label, 'same-mid')])
+    other = reopen_pallet_notifier(ledger, FakeSession())
+    other.reconcile_history([message(label, 'same-mid')])
+    assert other.deliver(label)['state'] == 'ALREADY_CONFIRMED_BY_LEDGER'
+
+
+def test_caption_is_frozen_across_prepost_failure_and_restart(tmp_path):
+    label = make_item()
+    class Session(FakeSession):
+        fail = True
+        def get(self, url, **kw):
+            return Response(429) if self.fail else super().get(url, **kw)
+    session = Session()
+    notifier, ledger = make_notifier(tmp_path, session)
+    with pytest.raises(MaxRetryLater):
+        notifier.deliver(label)
+    assert not session.posts
+    assert ledger.get(label.report_id, label.sscc, CHAT)['state'] == 'UPLOAD_PENDING'
+    session.fail = False
+    notifier.api_retries.clear(notifier.api_scope)
+    other = reopen_pallet_notifier(ledger, session)
+    changed = replace(label, text=label.text + '\nNew caption format')
+    assert other.deliver(changed)['state'] == 'CONFIRMED'
+    assert session.posts[-1][1]['json']['text'] == label.text
+    assert ledger.saved_caption(changed, CHAT) == label.text
+    assert session.message_number == 1
+    assert other.deliver(changed)['state'] == 'ALREADY_CONFIRMED_BY_LEDGER'
+    assert session.message_number == 1
+
+
+def test_frozen_caption_is_not_changed_by_post_uncertain_retry(tmp_path):
+    session = FakeSession(timeout_after_message=True)
+    notifier, ledger = make_notifier(tmp_path, session)
+    label = make_item()
+    with pytest.raises(DeliveryUncertain):
+        notifier.deliver(label)
+    other = reopen_pallet_notifier(ledger, session)
+    changed = replace(label, text=label.text + '\nNew caption format')
+    assert other.deliver(changed)['state'] == 'ALREADY_CONFIRMED_BY_GET'
+    assert ledger.saved_caption(changed, CHAT) == label.text
+    assert session.message_number == 1
+
+
+@pytest.mark.parametrize('first_wrong_link', [False, True])
+def test_task_conflict_across_pages_survives_restart(tmp_path, monkeypatch, first_wrong_link):
+    from xtrek.task_notifier import TASK_BUCKET
+    from test_task_notifier import Response as TaskResponse
+    notifier = make_task_notifier(tmp_path)
+    task_rows(notifier)
+    task_id, key, exact = task_message(1)
+    first = dict(exact, body=dict(exact['body'], mid='first-mid'))
+    if first_wrong_link:
+        first['body']['text'] = task_id + ' https://example.org/wrong-task'
+    def get(url, **kw):
+        if url.endswith('/me'): return TaskResponse(data={'user_id': 'bot-1'})
+        if 'from' not in kw['params']:
+            return TaskResponse(data={'messages': [first] +
+                [{'timestamp': NOW_MS - i, 'body': {}} for i in range(1, 100)]})
+        return TaskResponse(data={'messages': [dict(exact, timestamp=NOW_MS - 101)]})
+    monkeypatch.setattr('xtrek.task_notifier.requests.get', get)
+    assert notifier._reconcile(task_id=task_id, bucket=TASK_BUCKET, key=key, created_ms=1) == (True, None, True)
+    assert notifier._row(TASK_BUCKET, task_id)['state'] == 'uncertain'
+    other = make_task_notifier(tmp_path)
+    other._bot_id = 'bot-1'
+    other._apply_history([exact])
+    assert other._reconcile(task_id=task_id, bucket=TASK_BUCKET, key=key, created_ms=1) == (True, None, True)
+    assert other._row(TASK_BUCKET, task_id)['state'] == 'uncertain'
