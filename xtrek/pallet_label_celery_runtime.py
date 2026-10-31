@@ -116,10 +116,8 @@ def deliver_pallet_report(*, report_key, runtime_config, delivery_config_path=No
         expected_bot_user_id=str(settings['bot_user_id']), ledger=ledger,
         session=session, history_start_ms=settings['history_start_ms'],
         history_seed=history_seed, max_history_pages=settings.get('history_max_pages', 100),
-        allow_truncated_history=settings.get('allow_truncated_history') is True)
-    notifier._verify_bot()
-    # Old exact attachments must be visible before any new message POST.
-    history = notifier._history()
+        allow_truncated_history=settings.get('allow_truncated_history') is True,
+        retry_state_path=settings.get('max_retry_state_path'))
     results = []
     for label in labels:
         output = Path(settings['png_root']) / label.report_id / label.file_name

@@ -471,3 +471,37 @@ def test_persistence_retry_can_exceed_business_limit_using_real_celery(router, m
         assert publish.call_args.args[1]['terminal_failure'] == 'invalid_report'
     finally:
         task.pop_request()
+
+
+def test_terminal_transport_fetches_fresh_history_after_post_without_pallet_ledger(ledger, settings):
+    row = ready(ledger, settings)
+    session = MagicMock()
+    posted = []
+    history_reads = []
+
+    def get(url, **kwargs):
+        response = MagicMock(status_code=200)
+        if url.endswith('/me'):
+            response.json.return_value = {'user_id': 'bot'}
+        else:
+            assert url.endswith('/messages')
+            history_reads.append(kwargs['params'])
+            response.json.return_value = {'messages': list(posted)}
+        return response
+
+    def post(url, **kwargs):
+        assert url.endswith('/messages')
+        posted.append({'timestamp': int(row['created_at'] * 1000),
+                       'sender': {'user_id': 'bot'}, 'recipient': {'chat_id': 'chat-a'},
+                       'body': {'mid': 'terminal-mid', 'text': kwargs['json']['text']}})
+        return MagicMock(status_code=200)
+
+    session.get.side_effect = get
+    session.post.side_effect = post
+    transport = MaxTerminalTransport(session=session, token='fixture',
+                                     route=settings['routes']['line-a'], created_at=row['created_at'])
+    assert deliver(ledger, row, transport) == 'CONFIRMED'
+    assert len(history_reads) == 2
+    session.post.assert_called_once()
+    assert deliver(ledger, row, transport) == 'CONFIRMED'
+    session.post.assert_called_once()
