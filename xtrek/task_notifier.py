@@ -28,7 +28,7 @@ except ImportError:  # Keep offline tests importable; runtime owner installs req
             raise RuntimeError("requests package is required by the notifier runtime")
     requests = _RequestsUnavailable()
 
-from .max_retry import MaxRetryLater, RetrySchedule, api_scope, observe_response
+from .max_retry import MAX_MID_BATCH_SIZE, MaxRetryLater, RetrySchedule, api_scope, observe_response
 
 TASK_BUCKET = "1bf11148-3595-4a07-a089-d460153b7c7a"
 TASK_PREFIX = "equipment-tasks/T-"
@@ -121,6 +121,10 @@ class TaskNotifier:
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, first_seen_ms INTEGER NOT NULL,
                 etag TEXT, version_id TEXT, message_id TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
                 detail TEXT, PRIMARY KEY(bucket_id,task_id,recipient,mode))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS task_manual_deliveries (
+                bucket_id TEXT, task_id TEXT, recipient TEXT, message_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL, content_sha256 TEXT NOT NULL, verified_at TEXT NOT NULL,
+                PRIMARY KEY(bucket_id,task_id,recipient))""")
             db.execute("""CREATE TABLE IF NOT EXISTS task_history_conflicts (
                 bucket_id TEXT, task_id TEXT, recipient TEXT,
                 PRIMARY KEY(bucket_id,task_id,recipient))""")
@@ -236,33 +240,45 @@ class TaskNotifier:
 
     def _pending(self, *, include_confirmed=False):
         with self._db() as db:
-            return list(db.execute("SELECT * FROM logical_deliveries WHERE recipient=? AND mode='json-link' AND (? OR state!='delivered')",
-                                   (str(self.settings.max_chat_id), include_confirmed)))
+            return list(db.execute("""SELECT d.* FROM logical_deliveries d
+                WHERE recipient=? AND mode='json-link' AND (? OR state!='delivered')
+                AND NOT EXISTS (SELECT 1 FROM task_manual_deliveries m
+                    WHERE m.bucket_id=d.bucket_id AND m.task_id=d.task_id AND m.recipient=d.recipient)
+                AND (? OR NOT EXISTS (SELECT 1 FROM task_history_conflicts c
+                    WHERE c.bucket_id=d.bucket_id AND c.task_id=d.task_id AND c.recipient=d.recipient))""",
+                (str(self.settings.max_chat_id), include_confirmed, include_confirmed)))
 
     def _apply_history(self, messages):
-        """Commit all exact matches on each page, not just the current task."""
+        """Commit exact task-link evidence; unrelated report notices are not conflicts."""
+        candidates = []
+        for message in messages:
+            sender = message.get('sender') or {}
+            recipient = message.get('recipient') or {}
+            if (not sender.get('is_bot') or str(sender.get('user_id')) != str(self._bot_id)
+                    or str(recipient.get('chat_id')) != str(self.settings.max_chat_id)):
+                continue
+            body = message.get('body') or {}
+            values = list(self._strings(body))
+            content = '\n'.join(unquote(v) for v in values)
+            # The same task ID also appears in terminal notices, operator replies,
+            # and pallet captions. Only task links/files compete with task delivery.
+            if not (str(body.get('text') or '').startswith('Задание:')
+                    or (str(body.get('text') or '').startswith('T-') and 'https://' in content)
+                    or 'equipment-tasks/' in content
+                    or any(a.get('type') == 'file' and str(a.get('filename') or '').endswith('.json')
+                           for a in body.get('attachments') or [])):
+                continue
+            candidates.append((body.get('mid'), values, content))
+        if not candidates:
+            return set()
         conflicts = set()
         for row in self._pending(include_confirmed=True):
             matches = set()
             conflict = False
-            for message in messages:
-                sender = message.get('sender') or {}
-                recipient = message.get('recipient') or {}
-                if (not sender.get('is_bot') or str(sender.get('user_id')) != str(self._bot_id)
-                        or str(recipient.get('chat_id')) != str(self.settings.max_chat_id)):
+            for mid, values, content in candidates:
+                if row['task_id'] not in content or not re.search(
+                        r'(?<![\w-])' + re.escape(row['task_id']) + r'(?![\w-])', content):
                     continue
-                body = message.get('body') or {}
-                values = list(self._strings(body))
-                content = '\n'.join(unquote(v) for v in values)
-                if not re.search(r'(?<![\w-])' + re.escape(row['task_id']) + r'(?![\w-])', content):
-                    continue
-                # Pallet PNG captions legitimately contain the same report ID.
-                # They are not competing equipment-task link notifications.
-                if (str(body.get('text') or '').startswith('Ярлык паллета ')
-                        and any(a.get('type') == 'image' for a in body.get('attachments') or [])
-                        and not self._exact_object_link(values, row['bucket_id'], row['object_key'])):
-                    continue
-                mid = body.get('mid')
                 if (isinstance(mid, str) and mid and self._exact_object_link(values, row['bucket_id'], row['object_key'])
                         and (not row['message_id'] or row['message_id'] == mid)):
                     matches.add(mid)
@@ -270,9 +286,10 @@ class TaskNotifier:
                     conflict = True
             identity = (row['bucket_id'], row['task_id'])
             if len(matches) == 1 and not conflict:
-                self._transition(*identity, (row['state'],), 'delivered', message_id=next(iter(matches)),
-                                 detail='reconciled by shared MAX GET')
-                self.retries.clear(self._check_scope(row))
+                if row['state'] != 'delivered':
+                    self._transition(*identity, (row['state'],), 'delivered', message_id=next(iter(matches)),
+                                     detail='reconciled by shared MAX GET')
+                    self.retries.clear(self._check_scope(row))
             elif conflict or len(matches) > 1:
                 conflicts.add(identity)
                 self._record_history_conflict(row)
@@ -281,8 +298,8 @@ class TaskNotifier:
     def _reconcile_mids(self):
         rows = [r for r in self._pending() if r['message_id'] and not self.retries.remaining(self._check_scope(r))]
         mids = list(dict.fromkeys(r['message_id'] for r in rows))
-        for offset in range(0, len(mids), 100):
-            batch = mids[offset:offset + 100]
+        for offset in range(0, len(mids), MAX_MID_BATCH_SIZE):
+            batch = mids[offset:offset + MAX_MID_BATCH_SIZE]
             status, result = self._get_json('messages', {'message_ids': ','.join(batch)})
             if status != 200:
                 raise MaxRetryLater(self.api_retries.fail(self.api_scope))
