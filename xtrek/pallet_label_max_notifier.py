@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 
-from .max_retry import MaxRetryLater, RetrySchedule, api_scope, observe_response
+from .max_retry import MAX_MID_BATCH_SIZE, MaxRetryLater, RetrySchedule, api_scope, observe_response
 
 
 MAX_API = 'https://platform-api2.max.ru'
@@ -328,8 +328,8 @@ class MaxPalletLabelNotifier:
                 if row['message_id'] and not self.retries.remaining(self._check_scope(row))]
         mids = list(dict.fromkeys(row['message_id'] for row in rows))
         confirmed = []
-        for offset in range(0, len(mids), 100):
-            batch = mids[offset:offset + 100]
+        for offset in range(0, len(mids), MAX_MID_BATCH_SIZE):
+            batch = mids[offset:offset + MAX_MID_BATCH_SIZE]
             payload = self._get('/messages', {'message_ids': ','.join(batch)})
             confirmed.extend(self.reconcile_history(payload.get('messages', [])))
             self.api_retries.success(self.api_scope)

@@ -23,3 +23,32 @@ Celery task lifecycle hooks record `started`, `retry_scheduled`, `succeeded`, an
 The `xtrek-max-task-notifier.service` owns `equipment-tasks/T-*.json` and its own SQLite delivery ledger. It scans only objects at or after `XTREK_MAX_TASK_CUTOFF_UTC`, unless an exact key is in the optional line-based allowlist. Before POST it requires complete MAX history through `XTREK_MAX_HISTORY_CUTOFF_UTC`, verifies the exact S3 object and its 48-hour signed GET link, and reserves a SQLite CAS attempt. After an ambiguous POST it performs GET reconciliation only; it never automatically posts again. `printer-tasks/` CSV/VDF artifacts are a separate contract and are not sent by this notifier.
 
 Install `xtrek-s3-poller.service`, `xtrek-s3-publisher.service` and `xtrek-max-task-notifier.service` from `deploy/systemd/`; all run as `xtrek`, load `/etc/xtrek/local-s3-mode.env`, and keep writable state under `/var/lib/xtrek`. This change requires an explicit UTC cutoff. Before production activation, verify RabbitMQ persistence and publisher confirms, static credential access to S3, all systemd units, and safe warm-drain of the old consumer. A worker-crash recovery probe is a known release limitation if it cannot be performed without risking live work. External operation guards in `operation_state.py` must not be bypassed or reset during migration.
+
+
+### MAX reconciliation and verified manual deliveries
+
+Both MAX senders request at most 20 MIDs per GET. A production request containing
+100 real MIDs returned HTTP 400 with an empty body; the equivalent 20-MID request
+succeeded. History page size remains 100 messages.
+
+Task reconciliation distinguishes task links/files from terminal report notices
+and pallet captions. Mentioning the same task ID in a report status is not a
+competing task delivery. Real conflicting task links remain blocked across
+restarts and are excluded from routine MID batches so they cannot stall new tasks.
+
+Manual JSON deliveries are accounted for only after an operator-authorized audit
+verifies the sender, recipient, message MID, filename and JSON content against the
+S3 object. Store that evidence in `task_manual_deliveries` (including canonical
+content SHA256 and verification time) and mark the logical delivery delivered in
+the same transaction. The notifier does not automatically trust arbitrary human
+messages or filenames. Preserve manual proofs and current delivery rows during
+rollback; never restore an older ledger that would forget those deliveries.
+
+Existing conflict flags are not cleared automatically by a code update. Repair
+false flags only after a complete history audit confirms the original MID and
+exact task link and finds no competing task delivery. Back up the ledger first.
+
+When an operator reports a manual delivery but exact evidence is still missing,
+use `manual_review` with an explicit reason rather than marking it delivered.
+That state survives restarts, is excluded from routine history/MID batches, and
+cannot authorize a POST; release it only after the operator's review.

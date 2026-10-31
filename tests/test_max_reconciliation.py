@@ -400,7 +400,7 @@ def test_mid_batches_are_bounded(tmp_path):
     for i in range(1, 102):
         remember(notifier, item(i), 'POSTED_UNCONFIRMED', f'mid-{i}')
     notifier.reconcile_pending_mids()
-    assert [len(batch) for batch in calls] == [100, 1]
+    assert [len(batch) for batch in calls] == [20, 20, 20, 20, 20, 1]
 
 
 def test_confirmed_state_cannot_be_downgraded(tmp_path):
@@ -602,3 +602,107 @@ def test_task_conflict_across_pages_survives_restart(tmp_path, monkeypatch, firs
     other._apply_history([exact])
     assert other._reconcile(task_id=task_id, bucket=TASK_BUCKET, key=key, created_ms=1) == (True, None, True)
     assert other._row(TASK_BUCKET, task_id)['state'] == 'uncertain'
+
+@pytest.mark.parametrize('text', [
+    'xTrek • Артикул: 123\nОтчёт пуст или содержит неполные данные сканирования.\nОтчёт: {task}',
+    'Заявка abc по отчёту оборудования {task} обработана',
+    'Проверьте заявку:\n• отчёт оборудования: {task}',
+])
+def test_terminal_report_notices_do_not_downgrade_task_delivery(tmp_path, text):
+    from xtrek.task_notifier import TASK_BUCKET
+    notifier = make_task_notifier(tmp_path)
+    task_rows(notifier)
+    notifier._bot_id = 'bot-1'
+    task_id, key, link = task_message(1)
+    notifier._apply_history([link])
+    notice = task_message(1)[2]
+    notice['body'] = {'mid': 'terminal-mid', 'text': text.format(task=task_id)}
+    assert notifier._apply_history([notice]) == set()
+    assert notifier._row(TASK_BUCKET, task_id)['state'] == 'delivered'
+    assert not notifier._history_conflicted(TASK_BUCKET, task_id)
+
+
+def test_conflicted_mids_do_not_block_other_task_checks(tmp_path, monkeypatch):
+    from xtrek.task_notifier import TASK_BUCKET
+    notifier = make_task_notifier(tmp_path)
+    task_rows(notifier, known_mids=True)
+    notifier._bot_id = 'bot-1'
+    for i in (1, 2):
+        notifier._record_history_conflict(notifier._row(TASK_BUCKET, task_message(i)[0]))
+    calls = []
+    def get(path, params):
+        calls.append(params)
+        return 200, {'messages': [task_message(3)[2]]}
+    monkeypatch.setattr(notifier, '_get_json', get)
+    notifier._reconcile_mids()
+    assert calls == [{'message_ids': 'task-mid-3'}]
+    assert notifier._row(TASK_BUCKET, task_message(3)[0])['state'] == 'delivered'
+    assert notifier._row(TASK_BUCKET, task_message(1)[0])['state'] == 'uncertain'
+
+
+def test_verified_manual_delivery_is_not_replayed_or_downgraded(tmp_path, monkeypatch):
+    from xtrek.task_notifier import TASK_BUCKET, TaskNotifier
+    notifier = make_task_notifier(tmp_path)
+    task_rows(notifier)
+    task_id, key, bot_link = task_message(1)
+    with notifier._db() as db:
+        db.execute('INSERT INTO task_manual_deliveries VALUES (?,?,?,?,?,?,?)',
+                   (TASK_BUCKET, task_id, CHAT, 'human-mid', 'verified-operator', 'a'*64, '2026-10-31'))
+    notifier._transition(TASK_BUCKET, task_id, ('uncertain',), 'delivered', message_id='human-mid')
+    notifier = TaskNotifier(s3=notifier.s3, settings=notifier.settings)
+    notifier._bot_id = 'bot-1'
+    assert notifier._apply_history([bot_link]) == set()
+    monkeypatch.setattr(notifier, '_get_json', lambda *a, **k: pytest.fail('No MAX GET needed'))
+    monkeypatch.setattr('xtrek.task_notifier.requests.post', lambda *a, **k: pytest.fail('Manual task must not resend'))
+    result = notifier.process_object(bucket_id=TASK_BUCKET, object_key=key)
+    assert result.state == 'delivered' and result.message_id == 'human-mid'
+
+
+def test_other_json_task_link_still_conflicts(tmp_path):
+    from xtrek.task_notifier import TASK_BUCKET
+    notifier = make_task_notifier(tmp_path)
+    task_rows(notifier)
+    notifier._bot_id = 'bot-1'
+    task_id, _, msg = task_message(1)
+    msg['body']['text'] = f'Задание: {task_id} https://storage.yandexcloud.net/{TASK_BUCKET}/equipment-tasks/other.json'
+    assert notifier._apply_history([msg]) == {(TASK_BUCKET, task_id)}
+    assert notifier._history_conflicted(TASK_BUCKET, task_id)
+
+
+def test_task_batches_real_mids_below_gateway_limit(tmp_path, monkeypatch):
+    from xtrek.task_notifier import TASK_BUCKET
+    notifier = make_task_notifier(tmp_path)
+    notifier._bot_id = 'bot-1'
+    evidence = {}
+    for i in range(45):
+        task_id, key, msg = task_message(i)
+        mid = 'mid.' + f'{i:032x}'
+        msg['body']['mid'] = mid
+        evidence[mid] = msg
+        notifier._ensure_row(TASK_BUCKET, key, 'etag', None, 1)
+        notifier._transition(TASK_BUCKET, task_id, ('discovered',), 'sending', message_id=mid)
+    batches = []
+    def get(path, params):
+        mids = params['message_ids'].split(',')
+        batches.append(len(mids))
+        assert len(mids) <= 20
+        return 200, {'messages': [evidence[mid] for mid in mids]}
+    monkeypatch.setattr(notifier, '_get_json', get)
+    notifier._reconcile_mids()
+    assert batches == [20, 20, 5]
+    assert not notifier._pending()
+
+
+def test_operator_hold_survives_restart_and_never_checks_or_posts(tmp_path, monkeypatch):
+    from xtrek.task_notifier import TASK_BUCKET, TaskNotifier
+    notifier = make_task_notifier(tmp_path)
+    task_id, key, link = task_message(1)
+    notifier._ensure_row(TASK_BUCKET, key, 'etag', None, 1)
+    notifier._transition(TASK_BUCKET, task_id, ('discovered',), 'manual_review', detail='operator reports manual delivery; exact proof pending')
+    notifier = TaskNotifier(s3=notifier.s3, settings=notifier.settings)
+    notifier._bot_id = 'bot-1'
+    notifier._apply_history([link])
+    monkeypatch.setattr(notifier, '_get_json', lambda *a, **k: pytest.fail('Held task must not block other checks'))
+    monkeypatch.setattr('xtrek.task_notifier.requests.post', lambda *a, **k: pytest.fail('Held task must not send'))
+    assert not notifier._pending()
+    assert notifier.process_object(bucket_id=TASK_BUCKET, object_key=key).state == 'manual_review'

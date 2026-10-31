@@ -8,6 +8,10 @@ import time
 from email.utils import parsedate_to_datetime
 
 
+# Bound MID queries: production rejects 100 real MIDs with HTTP 400.
+MAX_MID_BATCH_SIZE = 20
+
+
 class MaxRetryLater(RuntimeError):
     def __init__(self, retry_after, message='MAX check deferred; retry GET later'):
         self.retry_after = max(1.0, float(retry_after))
