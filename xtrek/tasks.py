@@ -1289,8 +1289,14 @@ def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
 
 
 @app.task(name='tasks.deliver_pallet_report', bind=True, acks_late=True,
-          reject_on_worker_lost=True)
+          reject_on_worker_lost=True, max_retries=None)
 def deliver_pallet_report(self, report_key):
     """Local RabbitMQ task: validated PNG attachment delivery on the VPS worker."""
     from xtrek.pallet_label_celery_runtime import deliver_pallet_report as deliver
-    return deliver(report_key=report_key, runtime_config=load_config('suz_worker_config'))
+    from xtrek.max_retry import MaxRetryLater
+    try:
+        return deliver(report_key=report_key, runtime_config=load_config('suz_worker_config'))
+    except MaxRetryLater as exc:
+        # The notifier's durable state decides whether this is pre-POST work
+        # or GET-only reconciliation; never retry an unguarded message POST.
+        raise self.retry(exc=exc, countdown=exc.retry_after, max_retries=None)

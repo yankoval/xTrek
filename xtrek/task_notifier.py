@@ -28,6 +28,8 @@ except ImportError:  # Keep offline tests importable; runtime owner installs req
             raise RuntimeError("requests package is required by the notifier runtime")
     requests = _RequestsUnavailable()
 
+from .max_retry import MaxRetryLater, RetrySchedule, api_scope, observe_response
+
 TASK_BUCKET = "1bf11148-3595-4a07-a089-d460153b7c7a"
 TASK_PREFIX = "equipment-tasks/T-"
 MAX_API = "https://platform-api2.max.ru"
@@ -43,6 +45,7 @@ class NotifierSettings:
     ledger_path: Path = Path("/var/lib/xtrek/max-task-delivery.sqlite3")
     max_history_pages: int = 50
     history_cutoff_ms: int = 0
+    retry_state_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,13 @@ class TaskNotifier:
     def __init__(self, *, s3: Any, settings: NotifierSettings):
         self.s3, self.settings = s3, settings
         self._initialize_ledger()
+        self.retries = RetrySchedule(settings.ledger_path)
+        self.api_retries = RetrySchedule(settings.retry_state_path or settings.ledger_path)
+        self.api_scope = api_scope(settings.max_bot_token, settings.max_chat_id)
+        self._bot_id = None
+        self._history_cache = None
+        self._history_at = 0
+
 
     @staticmethod
     def _now() -> str:
@@ -168,10 +178,19 @@ class TaskNotifier:
             return cur.rowcount == 1
 
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> tuple[int,dict[str,Any]]:
-        response=requests.get(f"{MAX_API}/{path}",params=params,
-            headers={"Authorization":self.settings.max_bot_token},timeout=15,verify=self.settings.ca_file)
+        self.api_retries.check(self.api_scope)
+        try:
+            response=requests.get(f"{MAX_API}/{path}",params=params,
+                headers={"Authorization":self.settings.max_bot_token},timeout=15,verify=self.settings.ca_file)
+        except OSError as exc:
+            raise MaxRetryLater(self.api_retries.fail(self.api_scope)) from exc
+        observe_response(self.api_retries, self.api_scope, response)
         try: body=response.json()
         except ValueError: body={}
+        if (response.status_code == 200 and path == 'messages'
+                and (not isinstance(body, dict) or not isinstance(body.get('messages'), list)
+                     or any(not isinstance(m, dict) for m in body['messages']))):
+            raise MaxRetryLater(self.api_retries.fail(self.api_scope), 'Invalid MAX history; retry GET later')
         return response.status_code, body if isinstance(body,dict) else {}
 
     @staticmethod
@@ -193,36 +212,123 @@ class TaskNotifier:
                     return True
         return False
 
-    def _reconcile(self, *, task_id: str, bucket: str, key: str, created_ms: int) -> tuple[bool,str|None,bool]:
-        """Scan all available history; fail closed if the configured page cap is hit."""
-        status,me=self._get_json("me"); user_id=me.get("user_id")
-        if status!=200 or user_id is None: return False,None,False
-        cursor=None; previous_oldest=None
-        for _ in range(self.settings.max_history_pages):
-            params={"chat_id":self.settings.max_chat_id,"count":100}
-            if cursor is not None: params["from"]=cursor
-            status,result=self._get_json("messages",params)
-            if status!=200: return False,None,False
-            messages=result.get("messages",[])
+    @staticmethod
+    def _check_scope(row):
+        return 'task-check:' + json.dumps([row['bucket_id'], row['task_id'], row['recipient']])
+
+    def _pending(self):
+        with self._db() as db:
+            return list(db.execute("SELECT * FROM logical_deliveries WHERE recipient=? AND mode='json-link' AND state!='delivered'",
+                                   (str(self.settings.max_chat_id),)))
+
+    def _apply_history(self, messages):
+        """Commit all exact matches on each page, not just the current task."""
+        conflicts = set()
+        for row in self._pending():
+            matches = set()
+            conflict = False
             for message in messages:
-                stamp=int(message.get("timestamp",0)); body=message.get("body",{})
-                values=list(self._strings(body)); content="\n".join(unquote(v) for v in values)
-                if task_id not in content: continue
-                sender=message.get("sender",{}); recipient=message.get("recipient",{})
-                if not (sender.get("is_bot") and str(sender.get("user_id"))==str(user_id)
-                        and str(recipient.get("chat_id"))==str(self.settings.max_chat_id)):
+                sender = message.get('sender') or {}
+                recipient = message.get('recipient') or {}
+                if (not sender.get('is_bot') or str(sender.get('user_id')) != str(self._bot_id)
+                        or str(recipient.get('chat_id')) != str(self.settings.max_chat_id)):
                     continue
-                mid=body.get("mid")
-                if self._exact_object_link(values,bucket,key): return True,str(mid) if mid else None,not bool(mid)
-                return True,None,True
-            stamps=[int(m.get("timestamp",0)) for m in messages if m.get("timestamp") is not None]
-            if len(messages)<100 or (stamps and min(stamps)<=self.settings.history_cutoff_ms):
-                return True,None,False
-            if not stamps: return False,None,False
-            oldest=min(stamps)
-            if oldest==previous_oldest: return False,None,False
-            previous_oldest=oldest; cursor=oldest-1
-        return False,None,False
+                body = message.get('body') or {}
+                values = list(self._strings(body))
+                content = '\n'.join(unquote(v) for v in values)
+                if not re.search(r'(?<![\w-])' + re.escape(row['task_id']) + r'(?![\w-])', content):
+                    continue
+                # Pallet PNG captions legitimately contain the same report ID.
+                # They are not competing equipment-task link notifications.
+                if (str(body.get('text') or '').startswith('Ярлык паллета ')
+                        and any(a.get('type') == 'image' for a in body.get('attachments') or [])
+                        and not self._exact_object_link(values, row['bucket_id'], row['object_key'])):
+                    continue
+                mid = body.get('mid')
+                if (isinstance(mid, str) and mid and self._exact_object_link(values, row['bucket_id'], row['object_key'])
+                        and (not row['message_id'] or row['message_id'] == mid)):
+                    matches.add(mid)
+                else:
+                    conflict = True
+            identity = (row['bucket_id'], row['task_id'])
+            if len(matches) == 1 and not conflict:
+                self._transition(*identity, (row['state'],), 'delivered', message_id=next(iter(matches)),
+                                 detail='reconciled by shared MAX GET')
+                self.retries.clear(self._check_scope(row))
+            elif conflict or len(matches) > 1:
+                conflicts.add(identity)
+                self._transition(*identity, (row['state'],), 'uncertain', detail='conflicting MAX history requires review')
+        return conflicts
+
+    def _reconcile_mids(self):
+        rows = [r for r in self._pending() if r['message_id'] and not self.retries.remaining(self._check_scope(r))]
+        mids = list(dict.fromkeys(r['message_id'] for r in rows))
+        for offset in range(0, len(mids), 100):
+            batch = mids[offset:offset + 100]
+            status, result = self._get_json('messages', {'message_ids': ','.join(batch)})
+            if status != 200:
+                raise MaxRetryLater(self.api_retries.fail(self.api_scope))
+            self._apply_history(result.get('messages', []))
+            self.api_retries.success(self.api_scope)
+            for row in rows:
+                if row['message_id'] in batch and self._row(row['bucket_id'], row['task_id'])['state'] != 'delivered':
+                    self.retries.fail(self._check_scope(row))
+
+    def _reconcile(self, *, task_id: str, bucket: str, key: str, created_ms: int) -> tuple[bool,str|None,bool]:
+        row = self._row(bucket, task_id)
+        try:
+            if self._bot_id is None:
+                status, me = self._get_json('me')
+                if status != 200 or me.get('user_id') is None:
+                    return False, None, False
+                self._bot_id = str(me['user_id'])
+            # Positive cached evidence is useful even while a row is backed off.
+            if self._history_cache is not None:
+                self._apply_history(self._history_cache)
+            self._reconcile_mids()
+            row = self._row(bucket, task_id)
+            if row['state'] == 'delivered':
+                return True, row['message_id'], False
+            if row['message_id'] or self.retries.remaining(self._check_scope(row)):
+                return False, None, False
+            if self._history_cache is not None and time.time() - self._history_at < 30:
+                return True, None, row['state'] == 'uncertain'
+            cursor = None
+            history = []
+            conflicts = set()
+            complete = False
+            for _ in range(self.settings.max_history_pages):
+                params = {'chat_id': self.settings.max_chat_id, 'count': 100}
+                if cursor is not None:
+                    params['from'] = cursor - 1
+                status, result = self._get_json('messages', params)
+                if status != 200:
+                    break
+                messages = result.get('messages', [])
+                history.extend(messages)
+                conflicts.update(self._apply_history(messages))
+                stamps = [int(m.get('timestamp') or 0) for m in messages]
+                if len(messages) < 100 or (stamps and min(stamps) <= self.settings.history_cutoff_ms):
+                    complete = True
+                    break
+                if not stamps or min(stamps) == cursor:
+                    break
+                cursor = min(stamps)
+            if complete:
+                self._history_cache, self._history_at = history, time.time()
+                self.api_retries.success(self.api_scope)
+            row = self._row(bucket, task_id)
+            if row['state'] == 'delivered':
+                return True, row['message_id'], False
+            if not complete or row['state'] in ('sending', 'uncertain'):
+                self.retries.fail(self._check_scope(row))
+            return complete, None, (bucket, task_id) in conflicts
+        except MaxRetryLater:
+            # Earlier pages have already committed all their positive matches.
+            row = self._row(bucket, task_id)
+            if row['state'] == 'delivered':
+                return True, row['message_id'], False
+            return False, None, False
 
     def _verify_link(self, url: str) -> bool:
         # Never log or return the signed URL. A one-byte range proves the URL
@@ -293,12 +399,17 @@ class TaskNotifier:
             except Exception as exc:
                 self._transition(bucket_id,task_id,("discovered","deferred","failed_before_send"),"failed_before_send",detail=type(exc).__name__)
                 return DeliveryResult("failed_before_send",object_key,detail=type(exc).__name__)
+            try:
+                self.api_retries.check(self.api_scope)
+            except MaxRetryLater:
+                return DeliveryResult('deferred', object_key, detail='MAX cooldown')
             # Atomic CAS is the authorization to POST. Any losing invocation
             # sees `sending` and performs GET reconciliation only.
             if not self._transition(bucket_id,task_id,("discovered","deferred","failed_before_send"),"sending",
                                     etag=etag,version_id=version_id,detail="POST started",attempted=True):
                 current=self._row(bucket_id,task_id)
                 return DeliveryResult(current["state"] if current else "uncertain",object_key,detail="CAS denied POST")
+            mid = None
             try:
                 response=requests.post(f"{MAX_API}/messages",params={"chat_id":self.settings.max_chat_id,"disable_link_preview":"true"},
                     headers={"Authorization":self.settings.max_bot_token},json={"text":text,"notify":True,"format":"html"},
@@ -307,10 +418,16 @@ class TaskNotifier:
                 except ValueError: result={}
                 message=result.get("message",{}) if isinstance(result,dict) else {}; body=message.get("body",{}) if isinstance(message,dict) else {}
                 mid=body.get("mid") if isinstance(body,dict) else None
+                # Persist the MID BEFORE any confirming GET or possible crash.
+                self._transition(bucket_id, task_id, ('sending',), 'sending',
+                                 message_id=mid if isinstance(mid, str) else None)
+                observe_response(self.api_retries, self.api_scope, response)
             except Exception as exc:
                 detail=f"POST outcome unknown ({type(exc).__name__}); GET reconciliation required"
             else:
                 detail=f"MAX response HTTP {response.status_code}; GET reconciliation required"
+            if not mid:
+                self._history_cache = None
             # A 200/message id is not proof of a usable link: confirm exact
             # sender, chat, task ID and object path through MAX GET history.
             complete,matched_mid,conflict=self._reconcile(task_id=task_id,bucket=bucket_id,key=object_key,created_ms=row["first_seen_ms"])
@@ -391,7 +508,8 @@ def main():
     ledger=Path(os.environ.get("XTREK_MAX_TASK_DELIVERY_LEDGER","/var/lib/xtrek/task-notifier/max-task-delivery.sqlite3"))
     settings=NotifierSettings(token,chat,ca,ledger,
         max_history_pages=max(1,int(os.environ.get("XTREK_MAX_HISTORY_PAGES","50"))),
-        history_cutoff_ms=int(history_cutoff.timestamp()*1000))
+        history_cutoff_ms=int(history_cutoff.timestamp()*1000),
+        retry_state_path=Path(os.environ['XTREK_MAX_RETRY_STATE_PATH']) if os.environ.get('XTREK_MAX_RETRY_STATE_PATH') else None)
     allowlist_path=os.environ.get("XTREK_MAX_TASK_ALLOWLIST")
     allowlist=frozenset()
     if allowlist_path:
