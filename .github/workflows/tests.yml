@@ -26,8 +26,23 @@ jobs:
         if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
         pip install -e ".[reports]"
 
+    - name: S3 cost budgets (idle and history x10)
+      env:
+        PYTHONPATH: .
+        AWS_EC2_METADATA_DISABLED: 'true'
+      run: python -m pytest tests/cost -q --junitxml=s3-cost-results.xml -o junit_family=legacy
+
+    - name: Upload S3 cost results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: s3-cost-results
+        path: s3-cost-results.xml
+        if-no-files-found: error
+
     - name: Run tests
+      if: ${{ !cancelled() }}
       env:
         PYTHONPATH: .
       run: |
-        pytest tests/
+        pytest tests/ --ignore=tests/cost
