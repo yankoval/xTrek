@@ -14,7 +14,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from .meter import MeteredS3, NOW, assert_growth_budget, assert_idle_budget
+from .meter import MeteredS3, NetworkAccessForbidden, NOW, assert_growth_budget, assert_idle_budget
 
 HISTORIES = (1000, 10000)
 INTERNAL = '20ab2a0c-2726-4ba1-9c7c-7deae82941ff'
@@ -206,7 +206,7 @@ def measured(request, tmp_path_factory):
             # Module fixture runs before function-scoped autouse fixtures.
             import socket
             def forbidden(*args, **kwargs):
-                raise AssertionError('Cost measurement attempted a real network connection')
+                raise NetworkAccessForbidden('Cost measurement attempted a real network connection')
             patch.setattr(socket.socket, 'connect', forbidden)
             patch.setattr(socket.socket, 'connect_ex', forbidden)
             patch.setattr(socket, 'create_connection', forbidden)

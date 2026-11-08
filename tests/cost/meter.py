@@ -10,6 +10,10 @@ from botocore.exceptions import ClientError
 NOW = datetime(2026, 11, 1, tzinfo=timezone.utc)
 
 
+class NetworkAccessForbidden(BaseException):
+    """Escape application retry/except Exception handlers on any real I/O attempt."""
+
+
 class MeteredS3:
     def __init__(self):
         self.objects = {}
