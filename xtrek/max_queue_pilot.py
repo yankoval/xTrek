@@ -19,6 +19,9 @@ HOST = "storage.yandexcloud.net"
 TTL = 48 * 3600
 MAX_ATTEMPTS = 5
 REQUEUE_DELAY = 60
+# JSON dates come from producer clocks; S3 HEAD also loses subsecond precision.
+# This tolerance applies only to their ordering, never to the admission cutoff.
+MAX_CREATION_CLOCK_SKEW = timedelta(seconds=5)
 
 
 def retry_pause(seconds):
@@ -103,6 +106,11 @@ def identity(key):
     return hashlib.sha256(f"max-pilot-v1\0{BUCKET}\0{key}\0{CHAT}".encode()).hexdigest()
 
 
+def new_task_times(cutoff, created, ready):
+    return (cutoff is not None and created >= cutoff and ready >= cutoff
+            and created <= ready + MAX_CREATION_CLOCK_SKEW)
+
+
 def validate(event, now):
     if not isinstance(event, dict) or set(event) != {"event_id", "key", "created_at", "ready_at", "url"}:
         raise PilotInvalid("invalid_event")
@@ -110,7 +118,8 @@ def validate(event, now):
     policy = cohort()
     cutoff = policy.not_before
     created, ready = utc(event["created_at"]), utc(event["ready_at"])
-    if not policy.admits_key(key) or not cutoff <= created <= ready <= now or event["event_id"] != identity(key):
+    if (not policy.admits_key(key) or not new_task_times(cutoff, created, ready)
+            or ready > now or event["event_id"] != identity(key)):
         raise PilotInvalid("outside_cohort")
     if not isinstance(event["url"], str) or len(event["url"]) > 2048 or any(
         ord(c) < 33 or ord(c) == 127 for c in event["url"]
@@ -173,7 +182,7 @@ def prepare(storage, key):
             raise PilotInvalid("object_id_mismatch")
         created = utc(payload.get("date"))
         ready = head["LastModified"].astimezone(timezone.utc)
-        if not cutoff <= created <= ready:
+        if not new_task_times(cutoff, created, ready):
             raise PilotInvalid("not_a_new_task")
         args.pop("IfMatch")
         args["ResponseContentDisposition"] = "attachment"
