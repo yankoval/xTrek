@@ -42,7 +42,10 @@ def rig(tmp_path, monkeypatch, request):
     key = 'equipment-tasks/T-isolated-' + tmp_path.name + '.json'
     now = datetime.now(timezone.utc) - timedelta(seconds=2)
     cohort = tmp_path / 'cohort.json'
-    cohort.write_text(json.dumps({'not_before': (now-timedelta(seconds=10)).isoformat(), 'keys': [key]}))
+    policy = {'not_before': (now-timedelta(seconds=10)).isoformat(), 'keys': [key]}
+    if getattr(request, 'param', '') == 'automatic':
+        policy = {'not_before': policy['not_before'], 'mode': 'new_after_cutoff', 'excluded_keys': []}
+    cohort.write_text(json.dumps(policy))
     monkeypatch.setenv('XTREK_MAX_QUEUE_PILOT_COHORT', str(cohort))
     monkeypatch.setenv('XTREK_MAX_QUEUE_PILOT_ENABLED', '1')
     monkeypatch.setenv('XTREK_LOCAL_S3_POLLING', '1')
@@ -57,6 +60,11 @@ def rig(tmp_path, monkeypatch, request):
         assert address[0] in ('127.0.0.1', '::1'), 'non-loopback network forbidden'
         return original_connect(sock, address)
     monkeypatch.setattr(socket.socket, 'connect', connect)
+    original_task = Celery.task
+    def isolated_task(app, *args, **kwargs):
+        kwargs['shared'] = False
+        return original_task(app, *args, **kwargs)
+    monkeypatch.setattr(Celery, 'task', isolated_task)
     tasks = import_tasks(monkeypatch, 'xtrek.tasks', Celery)
     tasks.config['s3_config'] = {}
     monkeypatch.setattr(tasks, '_record_local_event_state', Mock())
@@ -125,11 +133,15 @@ def rig(tmp_path, monkeypatch, request):
     if getattr(request, 'param', 'solo') == 'prefork':
         billiard.set_start_method('fork', force=True)
     try:
-        with start_worker(tasks.app, pool=getattr(request, 'param', 'solo'), concurrency=1, perform_ping_check=False) as worker:
+        with start_worker(tasks.app, pool='prefork' if getattr(request, 'param', '') == 'prefork' else 'solo', concurrency=1, perform_ping_check=False) as worker:
             behavior['worker'] = worker
             yield tasks, key, behavior, calls, events, release, business
     finally:
         release.set(); server.shutdown(); server.server_close()
+        from celery.signals import task_prerun, task_postrun, worker_ready
+        task_prerun.disconnect(tasks._start_token_snapshot)
+        task_postrun.disconnect(tasks._finish_token_snapshot)
+        worker_ready.disconnect(tasks._check_local_signing)
         tasks.app.close()
         billiard.set_start_method(previous_method, force=True)
         RESULTS.append({'case': tmp_path.name, 'events': events, 'posts': len(calls),
@@ -142,6 +154,7 @@ def publish(rig):
     tasks.process_s3_event.apply_async(args=[{'bucket': pilot.BUCKET, 'key': key}])
 
 
+@pytest.mark.parametrize('rig', ['explicit', 'automatic'], indirect=True)
 def test_ack_waits_for_mid(rig):
     tasks, key, behavior, calls, events, release, business = rig
     behavior['mode'] = 'hold'; publish(rig)
@@ -184,6 +197,7 @@ def test_retry_never_publishes_replacement(rig, monkeypatch):
     assert not any(x.called for x in business.values())
 
 
+@pytest.mark.parametrize('rig', ['explicit', 'automatic'], indirect=True)
 def test_exhaustion_preserves_notification(rig, monkeypatch):
     """Acceptance check: a temporary outage must not silently drop the task."""
     from xtrek import max_queue_pilot as pilot

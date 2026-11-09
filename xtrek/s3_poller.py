@@ -46,10 +46,10 @@ def configured_routes(input_bucket, internal_bucket, prefix=''):
     for bucket, prefixes in ((input_bucket, ('Задания/',)),
                              (internal_bucket, ROUTED_PREFIXES[INTERNAL_BUCKET])):
         routes.setdefault(bucket, []).extend(prefix + p for p in prefixes)
-    from .max_queue_pilot import BUCKET as pilot_bucket, cohort
-    _, pilot_keys = cohort()
-    if pilot_keys:
-        routes.setdefault(pilot_bucket, []).extend(sorted(pilot_keys))
+    from .max_queue_pilot import BUCKET as pilot_bucket, PREFIX as pilot_prefix, cohort
+    policy = cohort()
+    if policy.enabled:
+        routes.setdefault(pilot_bucket, []).extend([pilot_prefix] if policy.automatic else sorted(policy.keys))
     return {bucket: tuple(dict.fromkeys(prefixes)) for bucket, prefixes in routes.items()}
 
 
@@ -444,6 +444,8 @@ class S3EventPoller:
             return self._scan(max_pages)
 
     def _scan(self, max_pages):
+        from .max_queue_pilot import BUCKET as pilot_bucket, PREFIX as pilot_prefix, cohort
+        pilot_cohort = cohort()
         started = time.monotonic()
         self.deadline = started + self.cycle_seconds
         self.metrics = dict.fromkeys(('list_calls', 'get_calls', 'records', 'known_skips', 'new_events',
@@ -504,6 +506,9 @@ class S3EventPoller:
                 self.metrics['records'] += len(records)
                 for obj in records:
                     key = obj['Key']
+                    if bucket == pilot_bucket and prefix == pilot_prefix:
+                        if not pilot_cohort.admits_object(key, obj.get('LastModified')):
+                            continue
                     # S3 Prefix is not an equality filter for the exact pilot keys.
                     if prefix.startswith('equipment-tasks/T-') and prefix.endswith('.json') and key != prefix:
                         continue

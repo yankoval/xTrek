@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from html import escape
 from pathlib import Path
@@ -53,14 +54,49 @@ def task_key(key):
     return key
 
 
+@dataclass(frozen=True)
+class Cohort:
+    not_before: datetime | None = None
+    keys: frozenset = frozenset()
+    excluded_keys: frozenset = frozenset()
+    automatic: bool = False
+
+    @property
+    def enabled(self):
+        return self.automatic or bool(self.keys)
+
+    def admits_key(self, key):
+        try:
+            task_key(key)
+        except PilotInvalid:
+            return False
+        return key not in self.excluded_keys and (self.automatic or key in self.keys)
+
+    def admits_object(self, key, modified):
+        if not self.admits_key(key):
+            return False
+        if not self.automatic:
+            return True
+        if isinstance(modified, str):
+            modified = utc(modified)
+        if not isinstance(modified, datetime) or modified.tzinfo is None:
+            raise PilotInvalid("invalid_object_timestamp")
+        return modified.astimezone(timezone.utc) >= self.not_before
+
+
 def cohort():
     path = os.environ.get("XTREK_MAX_QUEUE_PILOT_COHORT")
     if not path:
-        return None, frozenset()
+        return Cohort()
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or set(raw) != {"not_before", "keys"} or not isinstance(raw["keys"], list):
+    if not isinstance(raw, dict):
         raise PilotInvalid("invalid_cohort")
-    return utc(raw["not_before"]), frozenset(task_key(k) for k in raw["keys"])
+    if set(raw) == {"not_before", "keys"} and isinstance(raw["keys"], list):
+        return Cohort(utc(raw["not_before"]), frozenset(task_key(k) for k in raw["keys"]))
+    if (set(raw) == {"not_before", "mode", "excluded_keys"}
+            and raw["mode"] == "new_after_cutoff" and isinstance(raw["excluded_keys"], list)):
+        return Cohort(utc(raw["not_before"]), excluded_keys=frozenset(task_key(k) for k in raw["excluded_keys"]), automatic=True)
+    raise PilotInvalid("invalid_cohort")
 
 
 def identity(key):
@@ -71,9 +107,10 @@ def validate(event, now):
     if not isinstance(event, dict) or set(event) != {"event_id", "key", "created_at", "ready_at", "url"}:
         raise PilotInvalid("invalid_event")
     key = task_key(event["key"])
-    cutoff, keys = cohort()
+    policy = cohort()
+    cutoff = policy.not_before
     created, ready = utc(event["created_at"]), utc(event["ready_at"])
-    if key not in keys or not cutoff <= created <= ready <= now or event["event_id"] != identity(key):
+    if not policy.admits_key(key) or not cutoff <= created <= ready <= now or event["event_id"] != identity(key):
         raise PilotInvalid("outside_cohort")
     if not isinstance(event["url"], str) or len(event["url"]) > 2048 or any(
         ord(c) < 33 or ord(c) == 127 for c in event["url"]
@@ -116,8 +153,9 @@ def publisher_storage(config):
 def prepare(storage, key):
     """Validate the existing immutable task and issue its download URL."""
     key = task_key(key)
-    cutoff, keys = cohort()
-    if key not in keys:
+    policy = cohort()
+    cutoff = policy.not_before
+    if not policy.admits_key(key):
         raise PilotInvalid("outside_cohort")
     try:
         head = storage.head_object(Bucket=BUCKET, Key=key)
