@@ -46,6 +46,10 @@ def configured_routes(input_bucket, internal_bucket, prefix=''):
     for bucket, prefixes in ((input_bucket, ('Задания/',)),
                              (internal_bucket, ROUTED_PREFIXES[INTERNAL_BUCKET])):
         routes.setdefault(bucket, []).extend(prefix + p for p in prefixes)
+    from .max_queue_pilot import BUCKET as pilot_bucket, cohort
+    _, pilot_keys = cohort()
+    if pilot_keys:
+        routes.setdefault(pilot_bucket, []).extend(sorted(pilot_keys))
     return {bucket: tuple(dict.fromkeys(prefixes)) for bucket, prefixes in routes.items()}
 
 
@@ -500,6 +504,9 @@ class S3EventPoller:
                 self.metrics['records'] += len(records)
                 for obj in records:
                     key = obj['Key']
+                    # S3 Prefix is not an equality filter for the exact pilot keys.
+                    if prefix.startswith('equipment-tasks/T-') and prefix.endswith('.json') and key != prefix:
+                        continue
                     if key.endswith('/') or not key.startswith(prefix):
                         continue
                     if not eligible_object(bucket, key, obj, self.cutoff_utc, self.allowlist):

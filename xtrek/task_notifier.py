@@ -497,6 +497,8 @@ def _utc_setting(name: str) -> datetime:
 def scan_and_deliver(notifier: TaskNotifier, *, s3: Any, cutoff_utc: datetime,
                      allowlist: frozenset[str]=frozenset(), max_pages: int=100) -> int:
     """Reconcile only fresh or explicitly allowlisted equipment-task JSONs."""
+    from .max_queue_pilot import cohort
+    _, pilot_keys = cohort()
     token=None; processed=0; already_delivered=0; states: dict[str,int]={}
     for _ in range(max_pages):
         request={"Bucket":TASK_BUCKET,"Prefix":TASK_PREFIX,"MaxKeys":1000}
@@ -505,6 +507,8 @@ def scan_and_deliver(notifier: TaskNotifier, *, s3: Any, cutoff_utc: datetime,
         for obj in page.get("Contents",[]):
             key=obj.get("Key","")
             if not key.startswith(TASK_PREFIX) or key.endswith("/") or "/" in key[len(TASK_PREFIX):]:
+                continue
+            if key in pilot_keys:
                 continue
             modified=obj.get("LastModified")
             if isinstance(modified,str): modified=datetime.fromisoformat(modified.replace("Z","+00:00"))

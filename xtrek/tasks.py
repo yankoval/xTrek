@@ -1,4 +1,5 @@
 import os
+import logging
 import json
 import re
 from functools import partial
@@ -6,6 +7,7 @@ from celery import Celery
 from celery.exceptions import Reject, Retry
 from celery.signals import task_postrun, task_prerun, worker_ready
 from kombu import Queue
+from xtrek import max_queue_pilot as max_pilot
 from urllib.parse import quote, urlparse
 
 # 1. Импорт вашей бизнес-логики
@@ -187,6 +189,12 @@ _broker_options = ({'confirm_publish': True} if LOCAL_POLLING else {
     'region': 'ru-central1',
     'predefined_queues': {REAL_QUEUE_NAME: {'url': QUEUE_URL}},
 })
+
+_max_pilot_keys = max_pilot.cohort()[1]
+_max_pilot_enabled = os.environ.get("XTREK_MAX_QUEUE_PILOT_ENABLED") == "1"
+if _max_pilot_enabled and (not LOCAL_POLLING or not _max_pilot_keys):
+    raise RuntimeError("MAX pilot requires the existing AMQP queue and an exact cohort")
+
 
 app.conf.update(
     broker_transport_options=_broker_options,
@@ -1147,6 +1155,14 @@ def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
     if not bucket or not key:
         return "Error: Missing bucket or key"
 
+    if (bucket == max_pilot.BUCKET and isinstance(key, str)
+            and key.startswith(max_pilot.PREFIX) and key in _max_pilot_keys):
+        if not _max_pilot_enabled:
+            max_pilot.retry_pause(max_pilot.REQUEUE_DELAY)
+            raise Reject("MAX pilot route disabled", requeue=True)
+        # This is the ready JSON event, never the production-order source event.
+        return _send_ready_task_to_max(self, data, key)
+
     full_key = f"{bucket}/{key}"
     event_prefix = config.get("event_key_prefix", "")
     if event_prefix:
@@ -1300,3 +1316,37 @@ def deliver_pallet_report(self, report_key):
         # The notifier's durable state decides whether this is pre-POST work
         # or GET-only reconciliation; never retry an unguarded message POST.
         raise self.retry(exc=exc, countdown=exc.retry_after, max_retries=None)
+
+
+def _send_ready_task_to_max(task, data, key):
+    """Only a MID may complete this delivery. Never publish a Celery retry.
+
+    A finite in-process burst limits MAX traffic. After a cooldown, nack the
+    original delivery for another worker; errors never discard the event.
+    This deliberately occupies one pool slot during backoff.
+    """
+    import requests
+
+    log = logging.getLogger(__name__)
+    for attempt in range(1, max_pilot.MAX_ATTEMPTS + 1):
+        try:
+            token = os.environ.get("XTREK_MAX_PILOT_BOT_TOKEN")
+            ca = os.environ.get("XTREK_MAX_PILOT_CA_FILE")
+            if not token or not ca:
+                raise max_pilot.PilotInvalid("missing_max_configuration")
+            event = max_pilot.prepare(max_pilot.publisher_storage(config["s3_config"]), key)
+            max_pilot.send(event, requests.post, token, ca, attempt)
+            return "MAX pilot accepted"
+        except max_pilot.PilotInvalid as exc:
+            # Invalid configuration or input also stays available for repair.
+            log.error("max_pilot held task=%s attempt=%d reason=%s", key, attempt, exc)
+            break
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, max_pilot.PilotRetry) else "processing_error"
+            log.warning("max_pilot retry task=%s attempt=%d reason=%s", key, attempt, reason)
+            if attempt < max_pilot.MAX_ATTEMPTS:
+                max_pilot.retry_pause(min(30, 5 * 2 ** (attempt - 1)))
+    log.error("max_pilot requeue task=%s attempts=%d cooldown=%d",
+              key, attempt, max_pilot.REQUEUE_DELAY)
+    max_pilot.retry_pause(max_pilot.REQUEUE_DELAY)
+    raise Reject("MAX pilot delivery retained", requeue=True)
