@@ -43,7 +43,7 @@ def rig(tmp_path, monkeypatch, request):
     now = datetime.now(timezone.utc) - timedelta(seconds=2)
     cohort = tmp_path / 'cohort.json'
     policy = {'not_before': (now-timedelta(seconds=10)).isoformat(), 'keys': [key]}
-    if getattr(request, 'param', '') == 'automatic':
+    if str(getattr(request, 'param', '')).startswith('automatic'):
         policy = {'not_before': policy['not_before'], 'mode': 'new_after_cutoff', 'excluded_keys': []}
     cohort.write_text(json.dumps(policy))
     monkeypatch.setenv('XTREK_MAX_QUEUE_PILOT_COHORT', str(cohort))
@@ -108,7 +108,8 @@ def rig(tmp_path, monkeypatch, request):
             session.trust_env = False
             return session.post(f'http://127.0.0.1:{server.server_port}/messages', **kw)
     monkeypatch.setattr(requests, 'post', post)
-    body = json.dumps({'id': Path(key).stem, 'date': now.isoformat()}).encode()
+    created = now + timedelta(seconds=1) if getattr(request, 'param', '') == 'automatic_clock_skew' else now
+    body = json.dumps({'id': Path(key).stem, 'date': created.isoformat()}).encode()
     class Storage:
         def head_object(self, **kw):
             return {'ETag': 'fixture', 'ContentLength': len(body), 'LastModified': now}
@@ -154,7 +155,7 @@ def publish(rig):
     tasks.process_s3_event.apply_async(args=[{'bucket': pilot.BUCKET, 'key': key}])
 
 
-@pytest.mark.parametrize('rig', ['explicit', 'automatic'], indirect=True)
+@pytest.mark.parametrize('rig', ['explicit', 'automatic', 'automatic_clock_skew'], indirect=True)
 def test_ack_waits_for_mid(rig):
     tasks, key, behavior, calls, events, release, business = rig
     behavior['mode'] = 'hold'; publish(rig)

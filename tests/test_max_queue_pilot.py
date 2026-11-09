@@ -165,3 +165,69 @@ def test_automatic_requires_explicit_exclusion_snapshot_and_utc(bad,tmp_path,mon
     p=tmp_path/'bad.json';p.write_text(json.dumps(bad))
     monkeypatch.setenv('XTREK_MAX_QUEUE_PILOT_COHORT',str(p))
     with pytest.raises(pilot.PilotInvalid):pilot.cohort()
+
+
+def skew_storage(event):
+    content = json.dumps({'id': Path(KEY).stem, 'date': event['created_at']}).encode()
+    storage = Mock(spec=['head_object', 'get_object', 'generate_presigned_url'])
+    storage.head_object.return_value = {
+        'ContentLength': len(content), 'ETag': 'fixed-etag', 'VersionId': 'fixed-version',
+        'LastModified': pilot.utc(event['ready_at']),
+    }
+    storage.get_object.return_value = {'Body': io.BytesIO(content)}
+    storage.generate_presigned_url.return_value = event['url']
+    return storage
+
+
+@pytest.mark.parametrize('mode', ['explicit', 'automatic'])
+@pytest.mark.parametrize('seconds', [1, 5])
+def test_producer_clock_ahead_of_s3_can_deliver(event, tmp_path, monkeypatch, mode, seconds):
+    # Production failure: JSON 05:10:07Z, HEAD 05:10:06Z, both after cutoff.
+    if mode == 'automatic':
+        automatic(event, tmp_path, monkeypatch)
+    event['created_at'] = (pilot.utc(event['ready_at']) + timedelta(seconds=seconds)).isoformat()
+    original = dict(event)
+    storage = skew_storage(event)
+    prepared = pilot.prepare(storage, KEY)
+    assert prepared == original  # Preserve the real timestamps, including their ordering.
+    post = Mock(return_value=Mock(status_code=200, json=lambda: {'message': {'body': {'mid': 'mid.skew'}}}))
+    assert pilot.send(prepared, post, 'synthetic', 'synthetic-ca', 1) == 'mid.skew'
+    post.assert_called_once()
+    storage.get_object.assert_called_once_with(
+        Bucket=pilot.BUCKET, Key=KEY, IfMatch='fixed-etag', VersionId='fixed-version')
+
+
+@pytest.mark.parametrize('mode', ['explicit', 'automatic'])
+@pytest.mark.parametrize('case', ['created_before_cutoff', 'ready_before_cutoff', 'excessive_skew', 'future_object'])
+def test_clock_tolerance_keeps_admission_boundaries(event, tmp_path, monkeypatch, mode, case):
+    if mode == 'automatic':
+        automatic(event, tmp_path, monkeypatch)
+    cutoff = pilot.cohort().not_before
+    if case == 'created_before_cutoff':
+        event['created_at'] = (cutoff-timedelta(microseconds=1)).isoformat()
+    elif case == 'ready_before_cutoff':
+        event['created_at'] = (cutoff+timedelta(seconds=1)).isoformat()
+        event['ready_at'] = (cutoff-timedelta(microseconds=1)).isoformat()
+    elif case == 'excessive_skew':
+        event['created_at'] = (pilot.utc(event['ready_at'])+timedelta(seconds=5, microseconds=1)).isoformat()
+    else:
+        event['ready_at'] = (datetime.now(timezone.utc)+timedelta(minutes=1)).isoformat()
+    post = Mock()
+    with pytest.raises(pilot.PilotInvalid):
+        pilot.send(event, post, 'synthetic', 'synthetic-ca', 1)
+    post.assert_not_called()
+    with pytest.raises(pilot.PilotInvalid):
+        pilot.prepare(skew_storage(event), KEY)
+
+
+def test_clock_tolerance_never_admits_excluded_uncertain(event, tmp_path, monkeypatch):
+    automatic(event, tmp_path, monkeypatch, excluded=[KEY])
+    event['created_at'] = (pilot.utc(event['ready_at'])+timedelta(seconds=1)).isoformat()
+    storage = skew_storage(event)
+    with pytest.raises(pilot.PilotInvalid, match='outside_cohort'):
+        pilot.prepare(storage, KEY)
+    storage.head_object.assert_not_called()
+    post = Mock()
+    with pytest.raises(pilot.PilotInvalid, match='outside_cohort'):
+        pilot.send(event, post, 'synthetic', 'synthetic-ca', 1)
+    post.assert_not_called()
