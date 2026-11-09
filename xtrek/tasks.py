@@ -190,10 +190,10 @@ _broker_options = ({'confirm_publish': True} if LOCAL_POLLING else {
     'predefined_queues': {REAL_QUEUE_NAME: {'url': QUEUE_URL}},
 })
 
-_max_pilot_keys = max_pilot.cohort()[1]
+_max_pilot_cohort = max_pilot.cohort()
 _max_pilot_enabled = os.environ.get("XTREK_MAX_QUEUE_PILOT_ENABLED") == "1"
-if _max_pilot_enabled and (not LOCAL_POLLING or not _max_pilot_keys):
-    raise RuntimeError("MAX pilot requires the existing AMQP queue and an exact cohort")
+if _max_pilot_enabled and (not LOCAL_POLLING or not _max_pilot_cohort.enabled):
+    raise RuntimeError("MAX pilot requires the existing AMQP queue and a configured cohort")
 
 
 app.conf.update(
@@ -1156,7 +1156,7 @@ def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
         return "Error: Missing bucket or key"
 
     if (bucket == max_pilot.BUCKET and isinstance(key, str)
-            and key.startswith(max_pilot.PREFIX) and key in _max_pilot_keys):
+            and key.startswith(max_pilot.PREFIX) and _max_pilot_cohort.admits_key(key)):
         if not _max_pilot_enabled:
             max_pilot.retry_pause(max_pilot.REQUEUE_DELAY)
             raise Reject("MAX pilot route disabled", requeue=True)

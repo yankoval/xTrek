@@ -85,3 +85,83 @@ def test_poller_adds_only_exact_cohort_key(event):
     routes = configured_routes(pilot.BUCKET, 'isolated-internal')
     keys = [p for p in routes[pilot.BUCKET] if p.startswith(pilot.PREFIX)]
     assert keys == [KEY]
+
+
+def automatic(event, tmp_path, monkeypatch, excluded=()):
+    cutoff = pilot.utc(event['created_at']) - timedelta(seconds=1)
+    p = tmp_path / 'automatic.json'
+    p.write_text(json.dumps({'mode': 'new_after_cutoff', 'not_before': cutoff.isoformat(), 'excluded_keys': list(excluded)}))
+    monkeypatch.setenv('XTREK_MAX_QUEUE_PILOT_COHORT', str(p))
+    return pilot.cohort()
+
+
+def test_automatic_admits_future_key_without_registration(event, tmp_path, monkeypatch):
+    policy = automatic(event, tmp_path, monkeypatch)
+    assert policy.enabled and not policy.keys
+    assert policy.admits_object(KEY, pilot.utc(event['ready_at']))
+    assert not policy.admits_object(KEY, policy.not_before - timedelta(seconds=1))
+    assert pilot.validate(event, datetime.now(timezone.utc))[0] == KEY
+
+
+def test_historical_uncertain_key_stays_excluded_even_if_recreated(event, tmp_path, monkeypatch):
+    policy = automatic(event, tmp_path, monkeypatch, excluded=[KEY])
+    assert not policy.admits_key(KEY)
+    assert not policy.admits_object(KEY, datetime.now(timezone.utc))
+    post = Mock()
+    with pytest.raises(pilot.PilotInvalid, match='outside_cohort'):
+        pilot.send(event, post, 'token', 'ca', 1)
+    post.assert_not_called()
+
+
+def test_automatic_checks_original_json_date_not_only_lastmodified(event, tmp_path, monkeypatch):
+    automatic(event, tmp_path, monkeypatch)
+    event['created_at'] = '2000-01-01T00:00:00Z'
+    post = Mock()
+    with pytest.raises(pilot.PilotInvalid, match='outside_cohort'):
+        pilot.send(event, post, 'token', 'ca', 1)
+    post.assert_not_called()
+
+
+def test_automatic_poller_enqueues_only_new_nonexcluded_objects(event, tmp_path, monkeypatch):
+    from xtrek.s3_poller import EventLedger, S3EventPoller, configured_routes
+    from test_s3_poller import FakeS3
+    old = 'equipment-tasks/T-old-uncertain.json'
+    policy = automatic(event, tmp_path, monkeypatch, [old])
+    assert configured_routes(pilot.BUCKET, 'isolated')[pilot.BUCKET] == ('Задания/', pilot.PREFIX)
+    objects = [{'Key': k, 'LastModified': modified, 'ETag': 'fixture', 'Size': 1} for k,modified in [
+        (KEY, pilot.utc(event['ready_at'])), (old, pilot.utc(event['ready_at'])),
+        ('equipment-tasks/T-before-cutoff.json', policy.not_before-timedelta(seconds=1))]]
+    ledger = EventLedger(str(tmp_path / 'outbox.sqlite3'))
+    try:
+        poller = S3EventPoller(FakeS3([{'Contents': objects}]), ledger,
+            datetime(2000,1,1,tzinfo=timezone.utc), routed_prefixes={pilot.BUCKET: (pilot.PREFIX,)})
+        assert poller.scan(max_pages=1) == 1
+        assert ledger.db.execute('select object_key from s3_outbox').fetchall() == [(KEY,)]
+        assert poller.scan(max_pages=1) == 0
+    finally:
+        ledger.close()
+
+
+def test_automatic_old_notifier_hands_off_only_new_nonexcluded_objects(event, tmp_path, monkeypatch):
+    from xtrek.task_notifier import scan_and_deliver, DeliveryResult
+    old = 'equipment-tasks/T-old-uncertain.json'
+    policy = automatic(event, tmp_path, monkeypatch, [old])
+    older = 'equipment-tasks/T-before-cutoff.json'
+    s3 = Mock(); s3.list_objects_v2.return_value = {'Contents': [
+        {'Key': KEY, 'LastModified': pilot.utc(event['ready_at'])},
+        {'Key': old, 'LastModified': pilot.utc(event['ready_at'])},
+        {'Key': older, 'LastModified': policy.not_before-timedelta(seconds=1)}]}
+    notifier = Mock(); notifier.process_object.return_value = DeliveryResult('uncertain', old)
+    scan_and_deliver(notifier,s3=s3,cutoff_utc=datetime(2000,1,1,tzinfo=timezone.utc))
+    assert [x.kwargs['object_key'] for x in notifier.process_object.call_args_list] == [old,older]
+
+
+@pytest.mark.parametrize('bad', [
+    {'mode':'new_after_cutoff', 'not_before':'2026-11-09T00:00:00Z'},
+    {'mode':'all', 'not_before':'2026-11-09T00:00:00Z','excluded_keys':[]},
+    {'mode':'new_after_cutoff', 'not_before':'2026-11-09','excluded_keys':[]},
+])
+def test_automatic_requires_explicit_exclusion_snapshot_and_utc(bad,tmp_path,monkeypatch):
+    p=tmp_path/'bad.json';p.write_text(json.dumps(bad))
+    monkeypatch.setenv('XTREK_MAX_QUEUE_PILOT_COHORT',str(p))
+    with pytest.raises(pilot.PilotInvalid):pilot.cohort()
