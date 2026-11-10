@@ -108,7 +108,7 @@ def rig(tmp_path, monkeypatch, request):
             session.trust_env = False
             return session.post(f'http://127.0.0.1:{server.server_port}/messages', **kw)
     monkeypatch.setattr(requests, 'post', post)
-    created = now + timedelta(seconds=1) if getattr(request, 'param', '') == 'automatic_clock_skew' else now
+    created = now + timedelta(seconds=17) if getattr(request, 'param', '') == 'automatic_clock_skew' else now
     body = json.dumps({'id': Path(key).stem, 'date': created.isoformat()}).encode()
     class Storage:
         def head_object(self, **kw):

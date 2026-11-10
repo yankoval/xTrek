@@ -21,7 +21,6 @@ MAX_ATTEMPTS = 5
 REQUEUE_DELAY = 60
 # JSON dates come from producer clocks; S3 HEAD also loses subsecond precision.
 # This tolerance applies only to their ordering, never to the admission cutoff.
-MAX_CREATION_CLOCK_SKEW = timedelta(seconds=5)
 
 
 def retry_pause(seconds):
@@ -107,8 +106,8 @@ def identity(key):
 
 
 def new_task_times(cutoff, created, ready):
-    return (cutoff is not None and created >= cutoff and ready >= cutoff
-            and created <= ready + MAX_CREATION_CLOCK_SKEW)
+    # The producer and S3 use separate clocks. Only S3 records readiness.
+    return cutoff is not None and created >= cutoff and ready >= cutoff
 
 
 def validate(event, now):
