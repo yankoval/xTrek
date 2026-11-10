@@ -1,11 +1,18 @@
 {
   "platform": "8.3.27.2214",
-  "version": "ui-v6",
-  "date": "2026-10-16",
+  "version": "ui-v7",
+  "date": "2026-10-22",
   "files": {
-    "ВыгрузкаЭмиссии/Forms/Форма/Ext/Form/Module.bsl": "c0010fd9c6ca15b1d014b7230d2de24c0faa1ae4972d621cf31510ef8e865500",
+    "ВыгрузкаЭмиссии/Forms/Форма/Ext/Form/Module.bsl": "d1df1689c4dea9e1d1366ecbae4b1335da1794aef7aadbd3e4881dd9357e6213",
     "ВыгрузкаЭмиссии/Ext/ObjectModule.bsl": "42e6adb6a2a39c1cce37e0b1ade07ab08f434330e2cd3016884e8bfa58ca87cd",
-    "ВыгрузкаЭмиссии.epf": "9142c3717c52fe30f2ded59ea93d34e6fa1aecaebbd407d83d447dda64da08fe"
+    "ВыгрузкаЭмиссии.epf": "def615e11692356cf0d0553eb5825a4d7732ca946c84c23c9e80b66bfd50bf66"
   },
-  "interactive_test": "PASS: client AWS write/read/identical repeat/content conflict; independently verified S3 2026-10-16"
+  "native_launch_test": {
+    "hidden_window_style": 0,
+    "wait_ms": 626,
+    "nonzero_exit": 37,
+    "aws_version_exit": 0
+  },
+  "interactive_test": "PASS 2026-10-22: 1C client write/read/identical repeat/conflicting content rejected; user confirmed no CMD windows; S3 GET verified",
+  "interactive_test_object": "direct-mode-synthetic-20261016-aacd4c1b5b/real-unit-set-20261016/.preflight/client-20c1a0f7-61b4-419d-a118-e0fe2db8e5ee.txt"
 }

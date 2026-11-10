@@ -1,0 +1,31 @@
+{
+  "version": "ui-v7",
+  "verified_at_utc": "2026-10-22T14:48:56.4828626Z",
+  "platform": "8.3.27.2214",
+  "epf_sha256": "def615e11692356cf0d0553eb5825a4d7732ca946c84c23c9e80b66bfd50bf66",
+  "build_exit": 0,
+  "native_launch_test": {
+    "hidden_window_style": 0,
+    "wait_ms": 626,
+    "nonzero_exit": 37,
+    "aws_version_exit": 0
+  },
+  "interactive_1c": {
+    "result": "PASS",
+    "log_filename": "xtrek-aws-client-ui-v7.txt",
+    "log_text": "AWS CLIENT PASS: запись, чтение, повтор и конфликт проверены. Файл: client-20c1a0f7-61b4-419d-a118-e0fe2db8e5ee.txt",
+    "cmd_windows": "absent, confirmed by user"
+  },
+  "s3_readback": {
+    "result": "PASS",
+    "aws_exit": 0,
+    "bucket": "cloud-ediagg-test",
+    "key": "direct-mode-synthetic-20261016-aacd4c1b5b/real-unit-set-20261016/.preflight/client-20c1a0f7-61b4-419d-a118-e0fe2db8e5ee.txt",
+    "body": "XTREK CLIENT TRANSPORT CHECK ONLY",
+    "body_matches": true,
+    "content_length": 33,
+    "etag": "\"ff7d59cd5807c5440f879589599b296e\"",
+    "last_modified_utc": "2026-10-22T14:48:53+00:00"
+  },
+  "business_documents_sent": false
+}
