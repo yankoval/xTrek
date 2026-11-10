@@ -180,9 +180,8 @@ def skew_storage(event):
 
 
 @pytest.mark.parametrize('mode', ['explicit', 'automatic'])
-@pytest.mark.parametrize('seconds', [1, 5])
+@pytest.mark.parametrize('seconds', [1, 17, 3600])
 def test_producer_clock_ahead_of_s3_can_deliver(event, tmp_path, monkeypatch, mode, seconds):
-    # Production failure: JSON 05:10:07Z, HEAD 05:10:06Z, both after cutoff.
     if mode == 'automatic':
         automatic(event, tmp_path, monkeypatch)
     event['created_at'] = (pilot.utc(event['ready_at']) + timedelta(seconds=seconds)).isoformat()
@@ -198,8 +197,8 @@ def test_producer_clock_ahead_of_s3_can_deliver(event, tmp_path, monkeypatch, mo
 
 
 @pytest.mark.parametrize('mode', ['explicit', 'automatic'])
-@pytest.mark.parametrize('case', ['created_before_cutoff', 'ready_before_cutoff', 'excessive_skew', 'future_object'])
-def test_clock_tolerance_keeps_admission_boundaries(event, tmp_path, monkeypatch, mode, case):
+@pytest.mark.parametrize('case', ['created_before_cutoff', 'ready_before_cutoff', 'future_object'])
+def test_independent_clocks_keeps_admission_boundaries(event, tmp_path, monkeypatch, mode, case):
     if mode == 'automatic':
         automatic(event, tmp_path, monkeypatch)
     cutoff = pilot.cohort().not_before
@@ -208,8 +207,6 @@ def test_clock_tolerance_keeps_admission_boundaries(event, tmp_path, monkeypatch
     elif case == 'ready_before_cutoff':
         event['created_at'] = (cutoff+timedelta(seconds=1)).isoformat()
         event['ready_at'] = (cutoff-timedelta(microseconds=1)).isoformat()
-    elif case == 'excessive_skew':
-        event['created_at'] = (pilot.utc(event['ready_at'])+timedelta(seconds=5, microseconds=1)).isoformat()
     else:
         event['ready_at'] = (datetime.now(timezone.utc)+timedelta(minutes=1)).isoformat()
     post = Mock()
@@ -220,7 +217,7 @@ def test_clock_tolerance_keeps_admission_boundaries(event, tmp_path, monkeypatch
         pilot.prepare(skew_storage(event), KEY)
 
 
-def test_clock_tolerance_never_admits_excluded_uncertain(event, tmp_path, monkeypatch):
+def test_independent_clocks_never_admits_excluded_uncertain(event, tmp_path, monkeypatch):
     automatic(event, tmp_path, monkeypatch, excluded=[KEY])
     event['created_at'] = (pilot.utc(event['ready_at'])+timedelta(seconds=1)).isoformat()
     storage = skew_storage(event)
