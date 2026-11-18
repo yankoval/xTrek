@@ -85,25 +85,49 @@ def issue_text(issue, *, limit=None):
     return result
 
 
+def operator_issues(facts):
+    """Show problems, keeping the complete evidence in the frozen facts."""
+    issues = [issue for issue in facts['issues'] if issue['kind'] != 'readybox']
+    if facts['scan_case'] not in {'full_repeat', 'partial_repeat'}:
+        return issues
+    repeated = [item for issue in issues if issue['kind'] in {'repeatedbox', 'repeatedpallet'}
+                for item in issue['items']]
+    identities = {(item['kind'], item['id']) for item in repeated if item['id']}
+    introduced = sum(item.get('contents', {}).get('INTRODUCED', 0) for item in repeated)
+    # A proven repeat already explains both the used SSCC and its INTRODUCED
+    # contents. Do not present those supporting checks as additional problems.
+    def redundant(issue):
+        if not issue['items'] or len(issue['items']) != issue['count']:
+            return False
+        if issue['kind'] == 'alreadyregistered':
+            return all((item['kind'], item['id']) in identities for item in issue['items'])
+        return (issue['kind'] == 'waitingstatus' and issue['count'] == introduced
+                and all(item.get('state') == 'INTRODUCED' for item in issue['items']))
+    return [issue for issue in issues if not redundant(issue)]
+
+
 def compact_message(row):
     context = json.loads(row.get('context_json') or '{}')
     report_id = context.get('report_id', row['production_order_id'])
     reason, action = TEMPLATES[row['category']]
     facts = _facts(row)
     if facts:
-        issues = facts['issues']
-        reason = ' / '.join(issue_text(issue, limit=2) for issue in issues[:2])
+        issues = operator_issues(facts)
+        if issues:
+            reason = ' / '.join(issue_text(issue, limit=2) for issue in issues[:2])
         if len(issues) > 2:
             reason += f" / Ещё видов ошибок: {len(issues) - 2} — в деталях"
-        only_boxes = all(issue['items'] and len(issue['items']) == issue['count']
+        only_boxes = bool(issues) and all(issue['items'] and len(issue['items']) == issue['count']
                          and all(item['kind'] == 'box' and item['id'] for item in issue['items'])
                          for issue in issues)
         if facts['products_ok'] and only_boxes and {i['kind'] for i in issues} <= {'alreadyregistered', 'duplicateaggregation'}:
-            reason += f". Во всём отчёте ещё не в обороте: {facts['products_checked']} из {facts['products_total']} кодов (эмитированы)."
             action = RESCAN_BOX
         elif facts['scan_case'] == 'full_repeat' and row['category'] == 'report_repeat_scan':
             reason = 'Повторное сканирование по ошибке. ' + reason
         elif facts['scan_case'] == 'partial_repeat' and row['category'] == 'report_partial_repeat':
+            if (len(issues) == 1 and issues[0]['kind'] == 'repeatedbox'
+                    and issues[0]['count'] == len(issues[0]['items']) == 1):
+                reason = 'Проблемный ' + _item(issues[0]['items'][0]) + '. Состав совпадает.'
             reason = 'Частичное повторное сканирование. ' + reason
         else:
             action = VERIFY_CONTENTS
@@ -133,7 +157,7 @@ def details_text(row):
     if facts:
         lines.extend([f"SHA256 отчёта: {facts['source_sha256']}",
                       f"Вложений: {facts['products_total']}; статусов получено: {facts['products_checked']}"])
-        for issue in facts['issues']:
+        for issue in operator_issues(facts):
             lines.append(f"{ISSUES.get(issue['kind'], 'Дополнительная ошибка проверки')} — {issue['count']}")
             lines.extend(_item(item) for item in issue['items'])
             missing = issue['count'] - len(issue['items'])
