@@ -242,7 +242,7 @@ def test_status_logic(analyzer, tmp_path):
         results = []
         for c in codes:
             if "BOX_NEW" in c:
-                results.append({"cisInfo": {}}) # Not found
+                results.append({"cisInfo": {"cis": c, "status": "NOT_FOUND"}})
             elif "BOX_EXISTING" in c:
                 results.append({"cisInfo": {"cis": c, "status": "EMITTED"}}) # Found -> Error
             elif "SET_OK" in c:
@@ -311,7 +311,7 @@ def test_tag_setting(mock_get_storage, analyzer, tmp_path):
     mock_storage.read_text.return_value = json.dumps(data)
 
     analyzer.min_sscc = 0
-    analyzer.check_statuses = MagicMock(return_value=[])
+    analyzer.check_statuses = MagicMock(return_value=[{"cisInfo": {"cis": "DUPE", "status": "NOT_FOUND"}}])
 
     analyzer.check_report(str(file1))
 

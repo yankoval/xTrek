@@ -75,7 +75,7 @@ def test_never_replace_passport_when_contents_not_proven(tmp_path, kwargs):
     (('INTRODUCED','RETIRED'), ('INTRODUCED','NOT_FOUND'), {}, 'mixed', 'report_scan_conflict', 'сверки кодов'),
     (('INTRODUCED',), ('NOT_FOUND',), {}, 'mixed', 'report_scan_conflict', 'сверки кодов'),
     (('INTRODUCED',), ('INTRODUCED',), {'wrong_composition':True}, 'mixed', 'report_scan_conflict', 'сверки кодов'),
-    (('INTRODUCED',), ('INTRODUCED',), {'missing_composition':True}, 'pending', 'report_scan_conflict', 'сверки кодов'),
+    (('INTRODUCED',), ('INTRODUCED',), {'missing_composition':True}, 'mixed', 'report_scan_conflict', 'сверки кодов'),
     (('INTRODUCED',), ('INTRODUCED',), {'duplicates':True}, 'mixed', 'report_scan_conflict', 'сверки кодов'),
 ])
 def test_repeat_scan_matrix(tmp_path, states, box_states, options, case, category, action):
@@ -148,10 +148,15 @@ def test_new_scan_router_records_once_without_business_posts(tmp_path, router, s
 
 def test_report_own_completion_is_not_repeat_scan(tmp_path, router, monkeypatch):
     tasks, _, _ = router
-    result, _, _ = analyze(tmp_path, states=('INTRODUCED',))
-    monkeypatch.setattr(tasks, 'check_aggregation_reports', lambda *args: {'path':result})
-    monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', lambda *args: True)
+    _, api, path = analyze(tmp_path, states=('INTRODUCED',))
+    progress = MagicMock(return_value=True)
+    monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', progress)
+    nk = MagicMock()
+    nk.product_info.return_value = {'isSet': True}
+    checked = AggregationAnalyzer(api, nk).check_report(str(path), strict_prerequisites=True)
+    monkeypatch.setattr(tasks, 'check_aggregation_reports', lambda *args: {'path': checked})
     assert tasks.logic_start_equipment_reports('bucket/equipment-reports/T.json') == 'Equipment report already finished'
+    progress.assert_called_once()
 
 
 def test_safe_facts_survive_persistence_only_retry(tmp_path, router, settings, monkeypatch):
@@ -216,15 +221,15 @@ def test_progress_absence_must_be_proven(monkeypatch, failure):
     store.set_tags.assert_not_called(); store.write_lock_object.assert_not_called()
 
 
-def test_missing_composition_waits_without_terminal_event(tmp_path, router, settings, monkeypatch):
+def test_missing_composition_does_not_hide_introduced_codes(tmp_path, router, settings, monkeypatch):
     tasks, task, _ = router
     enable(tasks, settings, tmp_path)
     result, _, _ = analyze(tmp_path, states=('INTRODUCED',), missing_composition=True)
     monkeypatch.setattr(tasks, 'check_aggregation_reports', lambda *a: {'path':result})
     monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', lambda *a: False)
     monkeypatch.setattr(task, 'retry', MagicMock(side_effect=Retry()))
-    assert task.apply(args=[{'bucket':'internal-bucket','key':'equipment-reports/T.json'}]).state == 'RETRY'
-    assert not feedback.TerminalLedger(settings['ledger_path']).pending()
+    assert isinstance(task.apply(args=[{'bucket':'internal-bucket','key':'equipment-reports/T.json'}]).result, feedback.TerminalRecorded)
+    assert feedback.TerminalLedger(settings['ledger_path']).pending()[0]['category'] == 'report_scan_conflict'
 
 
 def test_pallet_composition_must_match_for_full_repeat():
@@ -294,7 +299,7 @@ def test_missing_composition_does_not_hide_rejected_codes(tmp_path, router, sett
     enable(tasks, settings, tmp_path)
     result, _, _ = analyze(tmp_path, states=('INTRODUCED','RETIRED'),
                            box_states=('INTRODUCED','NOT_FOUND'), missing_composition=True)
-    assert result.feedback_facts['scan_case'] == 'pending'
+    assert result.feedback_facts['scan_case'] == 'mixed'
     monkeypatch.setattr(tasks, 'check_aggregation_reports', lambda *a: {'path':result})
     monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', lambda *a: False)
     assert isinstance(task.apply(args=[{'bucket':'internal-bucket','key':'equipment-reports/T.json'}]).result,
@@ -303,7 +308,7 @@ def test_missing_composition_does_not_hide_rejected_codes(tmp_path, router, sett
 
 def test_conflicting_status_responses_never_prove_repeat(tmp_path):
     result, api, _ = analyze(tmp_path, states=('INTRODUCED',), conflicting_status=True)
-    assert result.feedback_facts['scan_case'] == 'pending'
+    assert result.feedback_facts['scan_case'] == 'mixed'
     api.get_aggregated_cis_list.assert_not_called()
 
 
@@ -363,7 +368,7 @@ def test_invalid_contents_counts_are_rejected(tmp_path, counts):
 
 @pytest.mark.parametrize('box_state', ['missing', None, '', 'UNKNOWN', 'NEW_STATUS'])
 @pytest.mark.parametrize('contents_state', ['INTRODUCED', 'EMITTED'])
-def test_unknown_box_status_waits_for_evidence(tmp_path, monkeypatch, box_state, contents_state):
+def test_unknown_box_status_does_not_hide_other_confirmed_repeat(tmp_path, monkeypatch, box_state, contents_state):
     # The first box is a verified repeat; the second lacks a usable SSCC status.
     _, api, path = analyze(tmp_path, states=('INTRODUCED', contents_state),
                            box_states=('INTRODUCED', 'NOT_FOUND'))
@@ -380,13 +385,14 @@ def test_unknown_box_status_waits_for_evidence(tmp_path, monkeypatch, box_state,
     nk = MagicMock()
     nk.product_info.return_value = {'isSet': True}
     checked = AggregationAnalyzer(api, nk).check_report(str(path), strict_prerequisites=True)
-    assert checked.feedback_facts['scan_case'] == 'pending'
+    assert checked.feedback_facts['scan_case'] == 'mixed'
+    assert validated_facts(checked.feedback_facts) == checked.feedback_facts
     unknown = next(i for i in checked.feedback_facts['issues'] if i['kind'] == 'unconfirmedbox')
     assert unknown['items'][0]['position'] == 2
     store.set_tags.assert_not_called()
 
 
-def test_missing_sscc_retries_then_uses_restored_evidence(tmp_path, router, settings, monkeypatch):
+def test_missing_sscc_cannot_delay_stop_for_introduced_contents(tmp_path, router, settings, monkeypatch):
     tasks, task, _ = router
     enable(tasks, settings, tmp_path)
     _, api, path = analyze(tmp_path, states=('INTRODUCED',))
@@ -403,12 +409,12 @@ def test_missing_sscc_retries_then_uses_restored_evidence(tmp_path, router, sett
     monkeypatch.setattr(tasks, 'sign_and_send_utilisation', post)
     data = {'bucket': 'internal-bucket', 'key': 'equipment-reports/T.json'}
     ledger = feedback.TerminalLedger(settings['ledger_path'])
-    assert task.apply(args=[data]).state == 'RETRY'
-    assert not ledger.pending()
+    assert isinstance(task.apply(args=[data]).result, feedback.TerminalRecorded)
+    assert ledger.pending()[0]['category'] == 'report_scan_conflict'
     api.get_list_cis_info.return_value = complete_responses
     assert isinstance(task.apply(args=[data]).result, feedback.TerminalRecorded)
-    assert check.call_count == 2
-    assert ledger.pending()[0]['category'] == 'report_repeat_scan'
+    assert check.call_count == 1
+    assert ledger.pending()[0]['category'] == 'report_scan_conflict'
     post.assert_not_called()
 
 
