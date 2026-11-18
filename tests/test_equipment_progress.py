@@ -108,9 +108,16 @@ def test_waiting_route_retries_beyond_limit_then_resumes_without_utilisation_pos
     monkeypatch.setattr(tasks, 'applied_checkpoint', MagicMock(return_value='SET'))
     components = MagicMock(return_value=True)
     monkeypatch.setattr(tasks, 'create_virtual_tasks_from_equipment_report', components)
-    monkeypatch.setattr(tasks, 'set_ready_check', MagicMock(side_effect=[None, 'setReady']))
-    for name in ('create_equipment_set_report_from_report', 'create_aggregation_set_report', 'sign_and_send_aggregation_set'):
+    monkeypatch.setattr(tasks, 'set_ready_check', MagicMock(side_effect=[None, 'setReady', 'setReady']))
+    for name in ('create_equipment_set_report_from_report', 'create_aggregation_set_report'):
         monkeypatch.setattr(tasks, name, MagicMock(return_value=True))
+    post = MagicMock(return_value=True)
+
+    @operation_state.guarded('send-aggregation-set', config_loader=lambda name: tasks.config)
+    def guarded_send(report_id, group, signing_dir, timeout):
+        return post()
+
+    monkeypatch.setattr(tasks, 'sign_and_send_aggregation_set', guarded_send)
     send = MagicMock(side_effect=AssertionError('No repeated utilisation POST'))
     monkeypatch.setattr(tasks, 'sign_and_send_utilisation', send)
     monkeypatch.setattr(tasks, 'create_utilisation_task_from_report', send)
@@ -123,7 +130,10 @@ def test_waiting_route_retries_beyond_limit_then_resumes_without_utilisation_pos
     assert task.apply(args=[data], retries=251).successful()
     assert json.loads(store.lock_object[0])['phase'] == 'complete'
     assert task.apply(args=[data], retries=252).successful()
-    tasks.sign_and_send_aggregation_set.assert_called_once()
+    # The initial route is revalidated, but the external send stays idempotent.
+    tasks.check_aggregation_reports.assert_called_with(['report'])
+    assert tasks.check_aggregation_reports.call_count == 3
+    post.assert_called_once()
     send.assert_not_called()
     assert not ledger.pending()
 

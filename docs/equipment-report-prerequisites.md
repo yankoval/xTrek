@@ -1,5 +1,26 @@
 # Equipment report prerequisites
 
+Before entering the initial-validation route, an equipment-report event checks
+saved final aggregation evidence. `aggs/<id>.json` must identify a single
+`AGGREGATION_DOCUMENT` with `CHECKED_OK`, match `agg-receipts/<id>.json` by document
+and production-order IDs, and have a completed `prepare-aggregation` guard bound
+to the current source fingerprint and preparation parameters. Both automatic INN
+selection (`inn_override=None`) and an explicit INN matching the successful
+document's `senderInn` are checked; the fingerprint is mandatory in either case.
+The probe reads the event's exact source object on every replay and does not cache
+a new initial-route result. An unchanged completed report therefore skips current
+CIS-status validation, business sends, check-tag writes and terminal notification,
+even if some goods have subsequently been retired. Missing/unmatched evidence
+retains ordinary validation; unreadable evidence retries without notification.
+Existing terminal records are not cleared or bypassed by this check.
+
+Without verified final completion, the initial report route revalidates even if
+its legacy guard says `complete`. That route is reacquired with CAS using its
+existing identity, so concurrent workers still cannot own it together. There is
+no guard-key/hash migration or new route namespace. Downstream operations keep
+their own unchanged guards: revalidating the route does not repeat an external
+send. Only `route-logic_start_equipment_reports` enables `recheck_complete`.
+
 The initial equipment-report route validates its source before selecting a token
 or constructing True API/NK clients. For schema v1 or v2 it requires physical
 boxes and nonempty arrays of full marking codes in every box. Empty pallets,
@@ -19,9 +40,9 @@ Existing valid-report analysis and downstream flow remain in place, including
 the existing handling of explicit True API HTTP errors and business status checks.
 
 The change does not add a new PO/INN resolver, change token policy, refresh tokens,
-rewrite source data, replace SSCCs, reset guards, republish events or print labels.
-Already completed route guards remain authoritative; this change does not recover
-historical successful-skip results automatically.
+rewrite source data, replace SSCCs, republish events or print labels. Completed
+initial-route guards alone are not proof of final report completion; guards for
+all other routes and external operations retain their cached-success semantics.
 
 ## Release and historical reports
 

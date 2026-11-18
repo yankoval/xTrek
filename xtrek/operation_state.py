@@ -93,7 +93,7 @@ class OperationState:
                 pass
             raise
 
-    def acquire(self, *, retry_idempotent_external=False):
+    def acquire(self, *, retry_idempotent_external=False, recheck_complete=False):
         stored = self.storage.read_lock_object(self.path)
         previous, etag = (json.loads(stored[0]), stored[1]) if stored else (None, None)
         if previous:
@@ -107,7 +107,7 @@ class OperationState:
                 # Validate the checkpoint before replaying its typed terminal outcome.
                 # Input identity was checked above; changed input remains a conflict.
                 raise SuzUtilisationRejected(previous.get('last_error'))
-            if phase == 'complete':
+            if phase == 'complete' and not recheck_complete:
                 self.value, self.etag, self.cached = previous, etag, True
                 return decode_result(previous['result'])
             if phase in {'external', 'uncertain', 'accepted'}:
@@ -129,6 +129,7 @@ class OperationState:
                 if not can_retry:
                     raise ReconciliationRequired('External outcome requires reconciliation: ' + self.path)
             if (phase not in {'ready', 'held'}
+                    and not (phase == 'complete' and recheck_complete)
                     and not (retry_idempotent_external
                              and previous.get('retry_mode') == 'local-sscc-v1'
                              and phase in {'external', 'uncertain'})):
@@ -236,11 +237,13 @@ def stable_request_id():
 
 
 def guarded(operation, *, input_path=None, resume=None, cache_none=False, config_loader=None,
-            success=None, retry_idempotent_external=False):
+            success=None, retry_idempotent_external=False, recheck_complete=False):
     """Guard a function by its first business argument; optional safe result replay.
 
     resume receives a confirmed saved result, never sends it to the external API.
     Settings must be identical on every worker; rollout never mixes old/new code.
+    recheck_complete reacquires a completed orchestration route with CAS. Use it
+    only when downstream mutations have their own durable guards, never on sends.
     """
     def decorate(function):
         @wraps(function)
@@ -273,7 +276,8 @@ def guarded(operation, *, input_path=None, resume=None, cache_none=False, config
             guard = OperationState(get_storage(root, config.get('s3_config')), root,
                                    operation, business_key, input_hash,
                                    retry_mode='local-sscc-v1' if safe_local_retry else None)
-            result = guard.acquire(retry_idempotent_external=safe_local_retry)
+            result = guard.acquire(retry_idempotent_external=safe_local_retry,
+                                   recheck_complete=recheck_complete)
             if guard.cached:
                 if resume and guard.value['phase'] == 'accepted':
                     result = resume(config, business_key, result)
