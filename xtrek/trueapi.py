@@ -107,8 +107,16 @@ class HonestSignAPI:
             logger.debug(f"RAW POST | Status: {response.status_code} | Body: {response.text}")
 
             if response.status_code == 404:
-                # Если ни один код не найден, API может вернуть 404
-                return []
+                # A batch of missing codes can return HTTP 404 with per-code
+                # evidence. Preserve it for identity validation by the caller;
+                # an empty/malformed HTTP error proves nothing about the codes.
+                try:
+                    missing = response.json()
+                except ValueError:
+                    return []
+                return [item for item in missing
+                        if isinstance(item, dict) and isinstance(item.get('cisInfo'), dict)
+                        and str(item.get('errorCode')) == '404'] if isinstance(missing, list) else []
 
             response.raise_for_status()
             return response.json()

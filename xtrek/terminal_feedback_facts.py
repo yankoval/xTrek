@@ -17,6 +17,7 @@ ISSUES = {
     'wrongsetstatus': 'Недопустимое состояние кода набора',
     'wrongunitstatus': 'Недопустимое состояние кода товара',
     'waitingstatus': 'Состояние вложения ещё не подтверждено',
+    'waitingaggregatestatus': 'Состояние SSCC ещё не подтверждено',
     'gtinnotfound': 'Не определён вид продукции',
     'invalidreport': 'Неверная структура отчёта',
     'minssccinaggrep': 'Недостаточно коробов в отчёте',
@@ -102,10 +103,13 @@ def report_facts(errors, boxes, pallets, statuses, children, aggregates, content
     issues = []
     for key, values in sorted(errors.items()):
         if key == 'alreadyregistered':
-            codes = [c for c in aggregates if statuses.get(c, {}).get('status') not in (None, '', 'NOT_FOUND')]
+            codes = [c for c in aggregates if statuses.get(c, {}).get('status') in STATE_LABELS
+                     and statuses[c]['status'] != 'NOT_FOUND']
             refs = [ref(c, 'aggregate') for c in sorted(codes)]
         elif key == 'duplicateaggregation':
             refs = [ref(c, 'aggregate') for c in sorted(aggregates) if aggregates[c] > 1]
+        elif key == 'waitingaggregatestatus':
+            refs = [ref(c, 'aggregate') for c in sorted(aggregates) if c in values]
         elif key == 'duplicateattachment':
             refs = [ref(c, 'product') for c in sorted(children) if children[c] > 1]
         elif key in {'wrongsetstatus', 'wrongunitstatus', 'waitingstatus'}:

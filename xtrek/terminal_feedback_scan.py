@@ -10,13 +10,29 @@ def normal(code):
 
 
 def diagnose_scan(boxes, pallets, statuses, structural_errors, api, *, statuses_consistent=True):
-    if not any(statuses.get(normal(c), {}).get('status') == 'INTRODUCED'
-               for box in boxes for c in box.get('productNumbersFull', [])):
-        return None
     if not statuses_consistent:
         items = [{'kind': 'box', 'id': safe_identifier(normal(box.get('boxNumber')), 'box'), 'position': i}
                  for i, box in enumerate(boxes, 1)]
         return {'case': 'pending', 'issues': [{'kind': 'unconfirmedbox', 'count': len(items), 'items': items}]}
+    # One independently confirmed violation is sufficient. Missing information
+    # elsewhere may prevent a precise repeat classification, not a terminal stop.
+    # APPLIED contents alone still use the durable own-progress continuation.
+    aggregates = [normal(b.get('boxNumber')) for b in boxes] + [normal(p.get('palletNumber')) for p in pallets]
+    children = [normal(c) for b in boxes for c in b.get('productNumbersFull', [])]
+    if children and all(statuses.get(c, {}).get('status') == 'EMITTED'
+                        and not statuses.get(c, {}).get('parent') for c in children):
+        # Keep the existing SSCC-only validation/message when every content code
+        # is ready; there is no repeat/progress ambiguity to resolve.
+        return None
+    violation = any(safe_identifier(c, 'aggregate') and statuses.get(c, {}).get('status')
+                    in set(STATE_LABELS) - {'NOT_FOUND'} for c in aggregates)
+    violation = violation or any(
+        safe_identifier(c, 'product') and (
+            statuses.get(c, {}).get('status') in {'INTRODUCED', 'WRITTEN_OFF', 'RETIRED', 'DISAGGREGATED', 'NOT_FOUND'}
+            or (statuses.get(c, {}).get('status') == 'EMITTED' and statuses.get(c, {}).get('parent')))
+        for c in children)
+    if not violation:
+        return None
     expected = {}
     for box in boxes:
         if box.get('boxNumber'):
@@ -24,7 +40,8 @@ def diagnose_scan(boxes, pallets, statuses, structural_errors, api, *, statuses_
     for pallet in pallets:
         if pallet.get('palletNumber'):
             expected[normal(pallet['palletNumber'])] = {normal(b['boxNumber']) for b in pallet.get('readyBox', []) if b.get('boxNumber')}
-    candidates = [c for c in expected if statuses.get(c, {}).get('status') == 'INTRODUCED']
+    candidates = [c for c in expected if statuses.get(c, {}).get('status') == 'INTRODUCED'
+                  and all(statuses.get(child, {}).get('status') == 'INTRODUCED' for child in expected[c])]
     composition = {}
     for offset in range(0, len(candidates), 1000):
         try:
@@ -93,10 +110,7 @@ def diagnose_scan(boxes, pallets, statuses, structural_errors, api, *, statuses_
         case = 'full_repeat'
     elif structurally_ok and repeated and ready and repeated + ready == len(boxes) and pallets_absent:
         case = 'partial_repeat'
-    if 'unconfirmedbox' in groups or any(
-            statuses.get(normal(c), {}).get('status') not in {'EMITTED', 'INTRODUCED', 'WRITTEN_OFF', 'RETIRED', 'DISAGGREGATED'}
-            for box in boxes for c in box.get('productNumbersFull', [])):
-        case = 'pending'
     # No INTRODUCED proof is ever treated as APPLIED continuation here.
-    issues = [{'kind': kind, 'count': len(items), 'items': items} for kind, items in groups.items()]
+    issues = [{'kind': kind, 'count': len(items), 'items': items}
+              for kind, items in sorted(groups.items(), key=lambda pair: pair[0] == 'unconfirmedbox')]
     return {'case': case, 'issues': issues}

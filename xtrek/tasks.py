@@ -744,8 +744,9 @@ def logic_start_equipment_reports(full_key):
 
     error = next(iter(result.values()))
     facts = getattr(error, 'feedback_facts', None)
-    from .equipment_progress import has_report_progress
-    if facts and facts.get('scan_case') and not has_report_progress(report_id, config):
+    # The strict precheck has already distinguished own progress from a new
+    # scan. Rechecking here could postpone an independently confirmed rejection.
+    if facts and facts.get('scan_case'):
         if facts['scan_case'] == 'pending':
             # Missing composition must not hide an independently proven input
             # error or rejected code; let the existing classifier handle it.
@@ -760,7 +761,10 @@ def logic_start_equipment_reports(full_key):
             raise failure
     if isinstance(error, dict) and set(error) == {'finished'}:
         return 'Equipment report already finished'
-    if isinstance(error, dict) and 'waitingstatus' in error and set(error) <= {'waitingstatus', 'alreadyregistered'}:
+    if isinstance(error, dict) and 'waitingstatus' in error and set(error) <= {
+            'waitingstatus', 'waitingaggregatestatus', 'alreadyregistered'}:
+        if 'waitingaggregatestatus' in error:
+            raise WorkflowPending('Waiting for verified aggregate status')
         # An APPLIED code is progress, not a rejection. Resume only from the
         # exact durable accepted request; this path never calls utilisation POST.
         kind = applied_checkpoint(report_id, config)
@@ -785,11 +789,6 @@ def logic_start_equipment_reports(full_key):
             if status_codes & set(
                 _EQUIPMENT_REPORT_STOP_TRUE_API_HTTP_ERRORS
             ):
-                report_path = next(iter(result))
-                _set_equipment_report_check_tag(
-                    report_path,
-                    "true-api-403-forbidden",
-                )
                 failure = TerminalBusinessError('Report access denied')
                 failure.category = 'report_access_denied'
                 raise failure
@@ -797,7 +796,7 @@ def logic_start_equipment_reports(full_key):
                 f"equipment report precheck True API failure for "
                 f"{production_order_id}: {api_error}"
             )
-        if isinstance(error, dict) and set(error) <= {'gtinnotfound', 'waitingstatus'}:
+        if isinstance(error, dict) and set(error) <= {'gtinnotfound', 'waitingstatus', 'waitingaggregatestatus'}:
             raise WorkflowPending('Waiting for verified product information')
         failure = TerminalBusinessError('Report business validation requires reconciliation')
         failure.feedback_facts = getattr(error, 'feedback_facts', None)
@@ -1136,6 +1135,15 @@ def _retry_terminal_persistence(task, data, category, facts=None):
         raise Reject('Terminal persistence retry was not published', requeue=True) from None
 
 
+def _write_report_stop_check(bucket, key, stage, category):
+    if stage == 'report-validation':
+        # Use the event's exact object key (including its namespace), never the
+        # local resolved path. Failure must retain the stop intent for retry.
+        tag = 'true-api-403-forbidden' if category == 'report_access_denied' else category
+        path = f's3://{bucket}/{key}'
+        get_storage(path, config.get('s3_config')).set_tags(path, {'check': tag})
+
+
 @app.task(
     name='tasks.process_s3_event',
     bind=True,
@@ -1179,6 +1187,8 @@ def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
                 raise RuntimeError('Terminal persistence requires enabled configuration')
             feedback_ledger.record(bucket, data['key'], source_stage(key), terminal_failure, facts=terminal_facts)
         recorded = feedback_ledger and feedback_ledger.get(event_identity(bucket, data['key']))
+        if recorded:
+            _write_report_stop_check(bucket, data['key'], recorded['stage'], recorded['category'])
     except Exception:
         # Celery preserves this intent in the durable retry message. No business
         # route is entered while the ledger cannot be read/written.
@@ -1295,11 +1305,14 @@ def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
                             retry_limit=200)
         if category and feedback_ledger:
             try:
-                feedback_ledger.record(bucket, data['key'], source_stage(key), category,
-                                       facts=getattr(e, 'feedback_facts', None))
+                recorded = feedback_ledger.record(bucket, data['key'], source_stage(key), category,
+                                                  facts=getattr(e, 'feedback_facts', None))
+                _write_report_stop_check(bucket, data['key'], recorded['stage'], recorded['category'])
             except Exception:
                 return _retry_terminal_persistence(self, data, category, getattr(e, 'feedback_facts', None))
             raise TerminalRecorded('Equipment processing requires reconciliation') from None
+        if category:
+            _write_report_stop_check(bucket, data['key'], source_stage(key), category)
         print(f"[ERROR] Processing failed: {type(e).__name__}")
         raise
 

@@ -135,6 +135,8 @@ def router(monkeypatch):
 
     monkeypatch.setattr(helpers._FakeCelery, "task", capture_options)
     tasks = helpers.import_tasks(monkeypatch)
+    # Terminal check tags are external writes; every router test stays offline.
+    monkeypatch.setattr(tasks, 'get_storage', MagicMock(return_value=MagicMock()))
     monkeypatch.setitem(sys.modules, "celery", real_module)
     monkeypatch.setitem(sys.modules, "celery.signals", real_signals)
     app = celery.Celery("equipment-prerequisite-tests", broker="memory://", fixups=[])

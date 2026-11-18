@@ -12,7 +12,7 @@ from .nkapi import NK
 from .tokens import TokenProcessor
 from .gs1_processor import get_inn_by_gtin
 from .config_loader import load_config
-from .terminal_feedback_facts import ReportValidationResult, report_facts
+from .terminal_feedback_facts import ReportValidationResult, report_facts, STATE_LABELS
 from .operation_state import ReconciliationRequired
 from .aggregation_builder import (
     AggregationBuildError,
@@ -183,8 +183,14 @@ class AggregationAnalyzer:
         for code, count in child_counter.items():
             if count > 1: errors['duplicateattachment'].append(code)
 
+        if strict_prerequisites and errors:
+            # A proven source defect needs no external status/composition check.
+            return ReportValidationResult(dict(errors), report_facts(
+                errors, ready_boxes, ready_pallets, {}, child_counter, aggregate_counter, content))
+
         # 3. Запрос статусов в ГИС МТ
-        all_codes = list(set(aggregate_codes + child_codes))
+        queried_codes = set(aggregate_codes + child_codes)
+        all_codes = list(queried_codes)
         status_map = {}
         inconsistent_statuses = set()
 
@@ -196,23 +202,55 @@ class AggregationAnalyzer:
 
             for res in status_results:
                 cis_info = res.get('cisInfo', {})
-                code = cis_info.get('cis') or res.get('requestedCis')
+                code = cis_info.get('cis') or res.get('requestedCis') or cis_info.get('requestedCis')
                 if code:
-                    requested = res.get('requestedCis') or cis_info.get('requestedCis')
-                    if ((requested and requested != code) or
+                    requested = [value for value in (res.get('requestedCis'), cis_info.get('requestedCis')) if value]
+                    identity_mismatch = any(value != code for value in requested)
+                    if str(res.get('errorCode')) == '404':
+                        # True API reports a missing code as an item-level 404,
+                        # without status. Normalize only a matching queried identity;
+                        # conflicting status/identity remains unknown.
+                        if (code in queried_codes and requested and not identity_mismatch
+                                and cis_info.get('status') in (None, '', 'NOT_FOUND')):
+                            cis_info = dict(cis_info, status='NOT_FOUND')
+                        else:
+                            inconsistent_statuses.add(code)
+                    if (identity_mismatch or
                             (code in status_map and status_map[code] != cis_info)):
                         inconsistent_statuses.add(code)
+                        inconsistent_statuses.update(requested)
                     status_map[code] = cis_info
+
+        # Discard only the contradictory identities. Other codes' confirmed
+        # violations must not disappear because one response is unreliable.
+        for code in inconsistent_statuses:
+            status_map.pop(code, None)
 
         from .terminal_feedback_scan import diagnose_scan
         own_progress = False
-        if strict_prerequisites and any(status_map.get(c, {}).get('status') == 'INTRODUCED' for c in child_codes):
+        # These states cannot be explained by this report's own progress.
+        # Do not let an unavailable progress source delay their terminal stop.
+        rejected = any(status_map.get(c, {}).get('status') in {'WRITTEN_OFF', 'RETIRED', 'DISAGGREGATED'}
+                       for c in all_codes)
+        rejected = rejected or any(
+            status_map.get(c, {}).get('status') == 'NOT_FOUND'
+            or (status_map.get(c, {}).get('status') == 'EMITTED' and status_map[c].get('parent'))
+            for c in child_codes)
+        rejected = rejected or any(status_map.get(c, {}).get('status') == 'EMITTED' for c in aggregate_codes)
+        contents_ready = bool(child_codes) and all(
+            status_map.get(c, {}).get('status') == 'EMITTED' and not status_map[c].get('parent')
+            for c in child_codes)
+        # Ready contents cannot be this report's APPLIED/INTRODUCED progress.
+        # A used SSCC alone must stop without consulting progress storage.
+        if strict_prerequisites and not rejected and not contents_ready and any(
+                status_map.get(c, {}).get('status') in {'INTRODUCED', 'APPLIED'}
+                for c in child_codes + aggregate_codes):
             from .equipment_progress import has_report_progress
             report_id = path.rsplit('/', 1)[-1].removesuffix('.json')
             own_progress = has_report_progress(report_id, self.config)
         scan = None if own_progress else diagnose_scan(
             ready_boxes, ready_pallets,
-            status_map, errors, self.api, statuses_consistent=not inconsistent_statuses)
+            status_map, errors, self.api)
 
         # 4. Проверка на финальное состояние (все товары INTRODUCED)
         # Мы проверяем только товары (child_codes), так как SSCC не всегда переходят в INTRODUCED
@@ -227,7 +265,7 @@ class AggregationAnalyzer:
 
         if all_introduced:
             result = ReportValidationResult({'finished': ['All codes are INTRODUCED']},
-                report_facts(errors, ready_boxes, ready_pallets, status_map, child_counter, aggregate_counter, content, scan, not inconsistent_statuses)
+                report_facts(errors, ready_boxes, ready_pallets, status_map, child_counter, aggregate_counter, content, scan)
             )
         else:
             # 5. Проверка начального состояния (эквивалентно готовности к агрегации)
@@ -235,8 +273,11 @@ class AggregationAnalyzer:
             # Проверка кодов агрегации (SSCC должны отсутствовать в системе)
             for aggregate_code in set(aggregate_codes):
                 info = status_map.get(aggregate_code)
-                # Если info пустой или в нем нет статуса - это значит "не найден" (ОК)
-                if info and info.get('status') and info.get('status') != 'NOT_FOUND':
+                status = info.get('status') if info else None
+                # Only an explicit NOT_FOUND confirms that the SSCC is unused.
+                if status not in STATE_LABELS:
+                    errors['waitingaggregatestatus'].append(aggregate_code)
+                elif status != 'NOT_FOUND':
                     errors['alreadyregistered'].append(
                         f"{aggregate_code} (Статус: {info.get('status')})"
                     )
@@ -264,8 +305,8 @@ class AggregationAnalyzer:
                     errors[err_key].append(f"{child} (Статус: {status_desc})")
 
             result = ReportValidationResult(dict(errors), report_facts(
-                errors, ready_boxes, ready_pallets, status_map, child_counter, aggregate_counter, content, scan, not inconsistent_statuses
-            )) if errors else None
+                errors, ready_boxes, ready_pallets, status_map, child_counter, aggregate_counter, content, scan
+            )) if errors or scan else None
 
         # Repeat-scan evidence belongs to the terminal outbox, not a premature
         # finished tag. The router will persist it (or wait for complete facts).

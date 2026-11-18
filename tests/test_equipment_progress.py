@@ -85,7 +85,8 @@ def test_accepted_in_progress_waits(checkpoint, status):
 
 
 @pytest.mark.parametrize('status', ['APPLIED', 'IN_PROGRESS', None, 'NOT_FOUND', 'NEW_UNKNOWN_STATUS', 'WRITTEN_OFF'])
-def test_precheck_distinguishes_waiting_from_invalid_status(tmp_path, status):
+def test_precheck_distinguishes_waiting_from_invalid_status(tmp_path, status, monkeypatch):
+    monkeypatch.setattr('xtrek.equipment_progress.has_report_progress', lambda *args: False)
     code = '010461011763608321TEST'
     path = tmp_path / 'report.json'
     path.write_text(json.dumps({'readyBox': [{'productNumbersFull': [code]}]}))

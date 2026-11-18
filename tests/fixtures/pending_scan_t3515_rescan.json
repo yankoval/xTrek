@@ -1,0 +1,375 @@
+{
+  "observed_at_utc": "2026-11-18T08:18:27.433539+00:00",
+  "id": "T-3515-77-001-09.2028-С-01-24-ff6bc2a0-2eb7-400e-8482-4ac54ba27249",
+  "case": "pending",
+  "requested": 343,
+  "responses": 343,
+  "inconsistent_count": 0,
+  "status_counts": {
+    "EMITTED": 276,
+    "MISSING": 46,
+    "INTRODUCED": 21
+  },
+  "pallets": [],
+  "issue_groups": [
+    {
+      "kind": "unconfirmedbox",
+      "count": 46,
+      "items": [
+        {
+          "id": "346070517903466355",
+          "position": 1,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466300",
+          "position": 2,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466324",
+          "position": 3,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466249",
+          "position": 4,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466294",
+          "position": 5,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466690",
+          "position": 6,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466232",
+          "position": 7,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466270",
+          "position": 8,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466287",
+          "position": 9,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466256",
+          "position": 10,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466317",
+          "position": 11,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466379",
+          "position": 13,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466386",
+          "position": 14,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466263",
+          "position": 17,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466614",
+          "position": 18,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466683",
+          "position": 19,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466362",
+          "position": 20,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466676",
+          "position": 21,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466652",
+          "position": 22,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466560",
+          "position": 23,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466669",
+          "position": 24,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466393",
+          "position": 25,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466607",
+          "position": 26,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466645",
+          "position": 27,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466485",
+          "position": 28,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466409",
+          "position": 29,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466621",
+          "position": 30,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466638",
+          "position": 31,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466539",
+          "position": 32,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466461",
+          "position": 33,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466577",
+          "position": 34,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466591",
+          "position": 35,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466553",
+          "position": 36,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466201",
+          "position": 37,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466584",
+          "position": 38,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466478",
+          "position": 39,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466515",
+          "position": 40,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466522",
+          "position": 41,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466546",
+          "position": 42,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466447",
+          "position": 43,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466423",
+          "position": 44,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466492",
+          "position": 45,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466416",
+          "position": 46,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466430",
+          "position": 47,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466508",
+          "position": 48,
+          "contents": {
+            "EMITTED": 6
+          }
+        },
+        {
+          "id": "346070517903466454",
+          "position": 49,
+          "contents": {
+            "EMITTED": 6
+          }
+        }
+      ]
+    },
+    {
+      "kind": "repeatedbox",
+      "count": 3,
+      "items": [
+        {
+          "id": "346070517903434507",
+          "position": 12,
+          "state": "INTRODUCED",
+          "contents": {
+            "INTRODUCED": 6
+          }
+        },
+        {
+          "id": "346070517903434491",
+          "position": 15,
+          "state": "INTRODUCED",
+          "contents": {
+            "INTRODUCED": 6
+          }
+        },
+        {
+          "id": "346070517903434774",
+          "position": 16,
+          "state": "INTRODUCED",
+          "contents": {
+            "INTRODUCED": 6
+          }
+        }
+      ]
+    }
+  ],
+  "fixture_note": "Observed safe box facts for the second report. Tests reorder the first synthetic report by these SSCC positions, preserving every synthetic box composition."
+}
