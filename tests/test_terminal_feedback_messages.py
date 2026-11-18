@@ -19,19 +19,22 @@ SSCC = '346070517900856326'
 
 
 def analyze(tmp_path, *, states=('EMITTED',), box_states=('INTRODUCED',), wrong_composition=False,
-            missing_composition=False, duplicates=False, missing_status=False, conflicting_status=False):
+            missing_composition=False, duplicates=False, missing_status=False, conflicting_status=False,
+            contents_per_box=1):
     boxes, status, composition = [], [], {}
     for index, state in enumerate(states):
         box = SSCC if index == 0 else f'{index:018d}'
-        code = f'010461011762137921{index:013d}'
-        codes = [code, code] if duplicates else [code]
+        codes = [f'010461011762137921{index * contents_per_box + i:013d}' for i in range(contents_per_box)]
+        if duplicates:
+            codes *= 2
         boxes.append({'boxNumber': box, 'productNumbersFull': [c + '\x1d93PRIVATE' for c in codes]})
         status.append({'cisInfo': {'cis': '00' + box, 'status': box_states[index]}})
         if not missing_status:
-            if conflicting_status:
-                status.append({'cisInfo': {'cis': code, 'status': 'RETIRED'}})
-            status.append({'cisInfo': {'cis': code, 'status': state}})
-        composition['00' + box] = ['different'] if wrong_composition else [code]
+            for code in dict.fromkeys(codes):
+                if conflicting_status:
+                    status.append({'cisInfo': {'cis': code, 'status': 'RETIRED'}})
+                status.append({'cisInfo': {'cis': code, 'status': state}})
+        composition['00' + box] = ['different'] if wrong_composition else list(dict.fromkeys(codes))
     path = tmp_path / 'report.json'
     path.write_text(json.dumps({'readyBox': boxes}))
     api, nk = MagicMock(), MagicMock()
@@ -196,8 +199,63 @@ def test_all_480_emitted_only_box_107_used(tmp_path):
     assert facts['products_total'] == facts['products_checked'] == 480
     body = compact_message(row_for(facts))
     assert 'короб №107: ' + SSCC in body
-    assert 'Во всём отчёте ещё не в обороте: 480 из 480 кодов (эмитированы)' in body
+    assert 'Во всём отчёте' not in body and '480 из 480' not in body
+    assert 'вложения из отчёта ещё не в обороте: 4 из 4 (эмитированы)' in body
     assert RESCAN_BOX in body
+
+
+def test_partial_repeat_focuses_on_one_problem_box_among_57_ready_boxes(tmp_path):
+    states = ['EMITTED'] * 58
+    box_states = ['NOT_FOUND'] * 58
+    states[22] = box_states[22] = 'INTRODUCED'
+    result, _, _ = analyze(tmp_path, states=states, box_states=box_states, contents_per_box=6)
+    facts = result.feedback_facts
+    assert facts['scan_case'] == 'partial_repeat'
+    assert {i['kind'] for i in facts['issues']} == {'readybox', 'repeatedbox', 'alreadyregistered', 'waitingstatus'}
+    row = row_for(facts, 'report_partial_repeat')
+    before = row['facts_json']
+    for text in [compact_message(row), details_text(row)]:
+        assert 'короб №23: ' + f'{22:018d}' in text
+        assert 'вложения из отчёта уже в обороте: 6 из 6' in text
+        assert SSCC not in text  # first, ready box
+        assert 'коды готовы' not in text and 'эмитированы' not in text
+        assert 'SSCC уже использован' not in text
+        assert 'Состояние вложения ещё не подтверждено' not in text
+        assert 'Ещё видов ошибок' not in text
+    assert RESCAN_REMAINDER in compact_message(row)
+    assert 'Проблемный короб №23' in compact_message(row)
+    assert compact_message(row).count('повторное сканирование') == 1
+    assert row['facts_json'] == before  # evidence is preserved
+
+
+def test_normal_boxes_do_not_hide_independent_errors_or_unknown_statuses(tmp_path):
+    result, _, _ = analyze(tmp_path, states=('EMITTED', 'RETIRED', 'INTRODUCED'),
+                           box_states=('NOT_FOUND', 'NOT_FOUND', 'INTRODUCED'))
+    row = row_for(result.feedback_facts, 'report_scan_conflict')
+    assert result.feedback_facts['scan_case'] == 'mixed'
+    text = compact_message(row)
+    assert SSCC not in text and 'коды готовы' not in text
+    assert 'короб №2' in text and 'выведены из оборота: 1' in text
+    assert 'короб №3' in text
+    assert RESCAN_REMAINDER not in text
+    # Unconfirmed information is retained alongside a proven violation.
+    result.feedback_facts['issues'].append({'kind': 'waitingaggregatestatus', 'count': 1,
+        'items': [{'kind': 'aggregate', 'id': f'{99:018d}'}]})
+    assert f'{99:018d}' in details_text(row_for(result.feedback_facts, 'report_scan_conflict'))
+
+
+@pytest.mark.parametrize('extra', [
+    {'kind': 'duplicateattachment', 'count': 1, 'items': [{'kind': 'product', 'id': '010461011762137921EXTRA'}]},
+    {'kind': 'alreadyregistered', 'count': 1, 'items': [{'kind': 'box', 'id': f'{99:018d}'}]},
+    {'kind': 'waitingstatus', 'count': 1, 'items': [{'kind': 'product', 'id': '010461011762137921EXTRA', 'state': 'APPLIED'}]},
+])
+def test_repeat_summary_keeps_unrelated_validation_details(tmp_path, extra):
+    result, _, _ = analyze(tmp_path, states=('INTRODUCED', 'EMITTED'), box_states=('INTRODUCED', 'NOT_FOUND'))
+    facts = result.feedback_facts
+    facts['issues'] = [i for i in facts['issues'] if i['kind'] != extra['kind']] + [extra]
+    row = row_for(facts, 'report_partial_repeat')
+    assert extra['items'][0]['id'] in compact_message(row)
+    assert extra['items'][0]['id'] in details_text(row)
 
 
 @pytest.mark.parametrize('failure', ['missing_config', 'storage_error', 'own_task', 'own_guard', 'none'])

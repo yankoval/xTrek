@@ -57,6 +57,23 @@ def test_count_physical_boxes_not_error_occurrences_or_ready_boxes():
     assert make_attachment(row)['box_count']==11
 
 
+def test_attachment_lists_problem_boxes_without_ready_boxes():
+    facts = facts_for(11)
+    facts['products_ok'] = False
+    facts['products_total'] = facts['products_checked'] = 72
+    facts['issues'].append({'kind': 'readybox', 'count': 1, 'items': [
+        {'kind': 'box', 'id': f'{99:018d}', 'position': 99, 'state': 'NOT_FOUND',
+         'contents': {'EMITTED': 6}}]})
+    row = preview(11)
+    row['facts_json'] = json.dumps(facts)
+    attachment = make_attachment(row)
+    assert attachment['box_count'] == 11
+    assert f'{99:018d}' not in attachment['text']
+    assert 'коды готовы' not in attachment['text']
+    for i in range(1, 12):
+        assert f'{i:018d}' in attachment['text']
+
+
 def prepared(tmp_path,settings,backend='sqlite'):
     ledger=(feedback.TerminalLedger(settings['ledger_path']) if backend=='sqlite'
             else S3TerminalLedger(Store(str(tmp_path/'s3.db')),'s3://bucket/events'))
