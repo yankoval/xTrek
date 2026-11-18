@@ -364,7 +364,7 @@ def test_guard_and_existing_event_outbox_are_unchanged_on_terminal_failure(
     assert len(ledger.pending()) == 1
 
 
-def test_complete_historical_guard_is_authoritative_with_feedback_enabled(
+def test_complete_initial_route_cannot_hide_invalid_source_with_feedback_enabled(
         router, monkeypatch, settings, ledger, tmp_path):
     from xtrek import operation_state
     from token_lock_store import MemoryLockStore
@@ -379,12 +379,15 @@ def test_complete_historical_guard_is_authoritative_with_feedback_enabled(
     guard.acquire()
     guard.finish('historical cached result')
     before = store.lock_object
-    business = MagicMock()
+    from xtrek.utils import EquipmentReportValidationError
+    business = MagicMock(side_effect=EquipmentReportValidationError('invalid source'))
     monkeypatch.setattr(tasks, 'check_aggregation_reports', business)
-    assert task.apply(args=[{'bucket': 'internal-bucket', 'key': 'equipment-reports/order.json'}]).successful()
-    assert store.lock_object == before
-    assert not ledger.pending()
-    business.assert_not_called()
+    data = {'bucket': 'internal-bucket', 'key': 'equipment-reports/order.json'}
+    assert isinstance(task.apply(args=[data]).result, feedback.TerminalRecorded)
+    assert store.lock_object != before
+    assert len(ledger.pending()) == 1
+    assert isinstance(task.apply(args=[data]).result, feedback.TerminalRecorded)
+    business.assert_called_once()
 
 
 @pytest.mark.parametrize('route,update', [('logic_update_disaggregation', 'update_disaggregation_status'),

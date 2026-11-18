@@ -9,6 +9,67 @@ from .storage import get_storage
 from .terminal_feedback import WorkflowPending, TerminalBusinessError
 
 
+def report_completed(report_id, source_path, config):
+    """Recognize the same completed scan from durable aggregation evidence.
+
+    Current CIS states are not completion evidence: goods can be retired after
+    successful aggregation. The preparation guard binds the saved result to the
+    exact source contents, so a replacement report cannot inherit completion.
+    This probe never writes a tag, guard or terminal event.
+    """
+    if not config.get('aggs'):
+        return False
+
+    def read(path):
+        stored = get_storage(path, config.get('s3_config')).read_lock_object(path)
+        return json.loads(stored[0]) if stored else None
+
+    def document(root):
+        return read(root.rstrip('/') + '/' + report_id + '.json') if root else None
+
+    try:
+        status = document(config['aggs'])
+        if isinstance(status, list) and len(status) == 1:
+            status = status[0]
+        if not isinstance(status, dict) or status.get('status') != 'CHECKED_OK':
+            return False
+        if (status.get('productionOrderId') != report_id
+                or status.get('type') != 'AGGREGATION_DOCUMENT'
+                or not status.get('number')):
+            return False
+        receipt = document(config.get('agg-receipts'))
+        if (not isinstance(receipt, dict)
+                or receipt.get('productionOrderId') != report_id
+                or receipt.get('document_id') != status['number']):
+            return False
+        root = config.get('operation_state_path')
+        if not root:
+            return False
+        guard = read(root.rstrip('/') + '/prepare-aggregation/'
+                     + hashlib.sha256(report_id.encode()).hexdigest() + '.json')
+        if (not isinstance(guard, dict) or guard.get('phase') != 'complete'
+                or guard.get('operation') != 'prepare-aggregation'
+                or guard.get('business_key') != report_id):
+            return False
+        source = get_storage(source_path, config.get('s3_config')).read_text(source_path)
+        # Preparation supports both automatic INN selection and --inn. The
+        # successful document supplies the latter candidate; never ignore the
+        # parameter or the source fingerprint when matching the saved guard.
+        overrides = [None]
+        sender_inn = status.get('senderInn')
+        if (isinstance(sender_inn, str) and sender_inn.isascii()
+                and sender_inn.isdigit() and len(sender_inn) in {10, 12}):
+            overrides.append(sender_inn)
+        source_hash = fingerprint(source)
+        return any(guard.get('input_hash') == fingerprint(json.dumps({
+            'source': source_hash, 'parameters': {'inn_override': inn}}))
+                   for inn in overrides)
+    except Exception as exc:
+        # An unavailable completion source must not turn a historical success
+        # into a fresh status rejection. Retry without notifying the operator.
+        raise WorkflowPending('Waiting for verified report completion') from exc
+
+
 def applied_checkpoint(report_id, config):
     """Require the exact accepted request/receipt before continuing downstream.
 

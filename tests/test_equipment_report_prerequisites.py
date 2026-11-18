@@ -197,7 +197,7 @@ def test_new_route_guard_does_not_complete_on_prerequisite_failure(router, monke
     assert "result" not in guard
 
 
-def test_existing_complete_guard_is_not_reset_or_reprocessed(router, monkeypatch):
+def test_existing_complete_report_route_revalidates_without_final_evidence(router, monkeypatch):
     from token_lock_store import MemoryLockStore
     from xtrek import operation_state
 
@@ -211,14 +211,17 @@ def test_existing_complete_guard_is_not_reset_or_reprocessed(router, monkeypatch
     guard.acquire()
     guard.finish("historical cached result")
     before = store.lock_object
-    check, create, send = MagicMock(), MagicMock(), MagicMock()
+    check = MagicMock(return_value={'path': {'finished': ['All codes are INTRODUCED']}})
+    create, send = MagicMock(), MagicMock()
     monkeypatch.setattr(tasks, "check_aggregation_reports", check)
     monkeypatch.setattr(tasks, "create_utilisation_task_from_report", create)
     monkeypatch.setattr(tasks, "sign_and_send_utilisation", send)
     assert task.apply(args=[{"bucket": "internal-bucket",
                              "key": "equipment-reports/existing.json"}]).successful()
-    assert store.lock_object == before
-    check.assert_not_called()
+    assert store.lock_object != before
+    assert json.loads(store.lock_object[0])['phase'] == 'complete'
+    assert json.loads(store.lock_object[0])['input_hash'] is None
+    check.assert_called_once()
     create.assert_not_called()
     send.assert_not_called()
 

@@ -75,7 +75,7 @@ from .operation_state import guarded, OperationConflict, ReconciliationRequired
 from .terminal_feedback import (TerminalBusinessError, TerminalRecorded, WorkflowPending, classify,
                                 event_identity, source_stage)
 from .terminal_feedback_runtime import worker_ledger
-from .equipment_progress import applied_checkpoint
+from .equipment_progress import applied_checkpoint, report_completed
 
 # 2. Настройки доступа
 ACCESS_KEY = os.environ.get('YMQ_ACCESS_KEY')
@@ -1117,6 +1117,9 @@ def logic_update_agg(full_key):
 # mutations have separate durable guards, so a route may safely resume halfway.
 for _route_name in tuple(name for name in globals() if name.startswith('logic_')):
     globals()[_route_name] = guarded('route-' + _route_name, cache_none=True,
+                                     # Only final aggregation evidence can skip
+                                     # initial report validation on a replay.
+                                     recheck_complete=_route_name == 'logic_start_equipment_reports',
                                      config_loader=lambda name: config)(globals()[_route_name])
 
 def _retry_terminal_persistence(task, data, category, facts=None):
@@ -1245,7 +1248,13 @@ def process_s3_event(self, data, terminal_failure=None, terminal_facts=None):
             print(f"[OK] {result}")
         # Условие №20: Обработка отчета оборудования 
         elif bucket == INTERNAL_BUCKET and key.startswith("equipment-reports/"):
-            result = logic_start_equipment_reports(full_key)
+            # Probe before entering/caching the initial-validation route. Check
+            # the actual event object on each replay, including replacements.
+            report_id = key.rsplit('/', 1)[-1].removesuffix('.json')
+            if report_completed(report_id, f's3://{full_key}', config):
+                result = 'Equipment report already finished'
+            else:
+                result = logic_start_equipment_reports(full_key)
             print(f"[OK] {result}")
         # Условия №30-32: Расформирование агрегата
         elif (
