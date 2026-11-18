@@ -189,7 +189,8 @@ class AggregationAnalyzer:
                 errors, ready_boxes, ready_pallets, {}, child_counter, aggregate_counter, content))
 
         # 3. Запрос статусов в ГИС МТ
-        all_codes = list(set(aggregate_codes + child_codes))
+        queried_codes = set(aggregate_codes + child_codes)
+        all_codes = list(queried_codes)
         status_map = {}
         inconsistent_statuses = set()
 
@@ -201,14 +202,23 @@ class AggregationAnalyzer:
 
             for res in status_results:
                 cis_info = res.get('cisInfo', {})
-                code = cis_info.get('cis') or res.get('requestedCis')
+                code = cis_info.get('cis') or res.get('requestedCis') or cis_info.get('requestedCis')
                 if code:
-                    requested = res.get('requestedCis') or cis_info.get('requestedCis')
-                    if ((requested and requested != code) or
+                    requested = [value for value in (res.get('requestedCis'), cis_info.get('requestedCis')) if value]
+                    identity_mismatch = any(value != code for value in requested)
+                    if str(res.get('errorCode')) == '404':
+                        # True API reports a missing code as an item-level 404,
+                        # without status. Normalize only a matching queried identity;
+                        # conflicting status/identity remains unknown.
+                        if (code in queried_codes and requested and not identity_mismatch
+                                and cis_info.get('status') in (None, '', 'NOT_FOUND')):
+                            cis_info = dict(cis_info, status='NOT_FOUND')
+                        else:
+                            inconsistent_statuses.add(code)
+                    if (identity_mismatch or
                             (code in status_map and status_map[code] != cis_info)):
                         inconsistent_statuses.add(code)
-                        if requested:
-                            inconsistent_statuses.add(requested)
+                        inconsistent_statuses.update(requested)
                     status_map[code] = cis_info
 
         # Discard only the contradictory identities. Other codes' confirmed
@@ -227,7 +237,12 @@ class AggregationAnalyzer:
             or (status_map.get(c, {}).get('status') == 'EMITTED' and status_map[c].get('parent'))
             for c in child_codes)
         rejected = rejected or any(status_map.get(c, {}).get('status') == 'EMITTED' for c in aggregate_codes)
-        if strict_prerequisites and not rejected and any(
+        contents_ready = bool(child_codes) and all(
+            status_map.get(c, {}).get('status') == 'EMITTED' and not status_map[c].get('parent')
+            for c in child_codes)
+        # Ready contents cannot be this report's APPLIED/INTRODUCED progress.
+        # A used SSCC alone must stop without consulting progress storage.
+        if strict_prerequisites and not rejected and not contents_ready and any(
                 status_map.get(c, {}).get('status') in {'INTRODUCED', 'APPLIED'}
                 for c in child_codes + aggregate_codes):
             from .equipment_progress import has_report_progress
