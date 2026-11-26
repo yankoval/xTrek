@@ -41,7 +41,7 @@ class Adapter:
         return self.sources[key]
     def describe(self, source):
         return hashlib.sha256(json.dumps(source).encode()).hexdigest(),'7733154124',source['count']
-    def check_history(self, uid, source_hash, inn, deadline):
+    def check_history(self, uid, source_hash, source, deadline):
         if uid in self.allocations:raise ValueError('Prior allocation')
     def generate(self,key,uid,source_hash):
         self.generated.append(uid);self.allocations[uid]=self.allocations.get(uid,0)+1
@@ -229,3 +229,14 @@ def test_service_has_bounded_restart_and_fatal_prevention():
                   '-m xtrek.prnsrv_supervisor'):
         assert field in body
     assert '[Install]'not in body
+
+
+def test_history_detects_named_vdf_without_csv_or_marker():
+    from xtrek.prnsrv_supervisor import ProductionAdapter
+    adapter = ProductionAdapter.__new__(ProductionAdapter)
+    adapter.storage = Mock()
+    expected = f'printer-tasks/7733154124_OperaMa3_{UID}.vdf'
+    adapter.storage.head_optional.side_effect = lambda bucket, key: True if key == expected else None
+    source = {'PasportData': {'Manufacturer_inn': '7733154124', 'operator': 'Оператор маркетплейса #3'}}
+    with pytest.raises(ValueError, match='Existing artifacts'):
+        adapter.check_history(UID, 'a' * 64, source, float('inf'))

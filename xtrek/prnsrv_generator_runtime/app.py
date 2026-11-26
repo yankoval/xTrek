@@ -1,9 +1,8 @@
 """Local xTrek reuse of the existing PrnsrvFunction business adapter.
 
 Source: cf-aggregate-ingress-pr12/prnsrv-generator/app.py at
-50b8264cf107fe6b53f530338ce5e939527db3a2. Only local integration subclasses
-are added elsewhere; CSV/VDF, templates, mapping, and immutable S3 semantics
-remain owned by this upstream adapter and pinned prnsrv package.
+50b8264cf107fe6b53f530338ce5e939527db3a2. The xTrek adapter adds optional operator-prefixed VDF names.
+CSV/VDF content and template mapping use the pinned prnsrv package.
 """
 
 from __future__ import annotations
@@ -31,6 +30,7 @@ from prnsrv import (
     resolve_template_name,
 )
 
+from ..print_filename import operator_prefix
 from .config import Settings
 from .storage import (
     ImmutableObjectConflict,
@@ -115,11 +115,19 @@ class PrnsrvFunction:
     def _done_key(self, job_uuid: str) -> str:
         return f"{self.settings.done_prefix}{job_uuid}.done"
 
-    def _output_keys(self, job_uuid: str, route: str) -> tuple[str, str]:
-        return (
-            f"{self.settings.output_prefix}{job_uuid}.csv",
-            f"{self.settings.output_prefix}{route}_{job_uuid}.vdf",
-        )
+    def _output_keys(self, bucket: str, job_uuid: str, source: Mapping[str, Any]) -> tuple[str, str]:
+        route = resolve_route(source)
+        prefix = self.settings.output_prefix
+        named_route = operator_prefix(route, source.get("PasportData") or {})
+        legacy = f"{prefix}{route}_{job_uuid}.vdf"
+        named = f"{prefix}{named_route}_{job_uuid}.vdf"
+        preferred, alternate = (named, legacy) if self.settings.print_operator_filenames else (legacy, named)
+        # A VDF may already have reached the printer before the done marker was written.
+        if self.storage.head_optional(bucket, alternate) is not None:
+            if self.storage.head_optional(bucket, preferred) is not None:
+                raise ImmutableObjectConflict("Multiple VDF names exist for this print job")
+            preferred = alternate
+        return f"{prefix}{job_uuid}.csv", preferred
 
     def _read_source(self, bucket: str, key: str) -> dict[str, Any]:
         body = self.storage.get_bytes(bucket, key)
@@ -287,7 +295,7 @@ class PrnsrvFunction:
             )
             return {"uuid": job_uuid, "result": "NO_PRINT", "duplicate": False}
 
-        route = resolve_route(source)
+        csv_key, vdf_key = self._output_keys(bucket, job_uuid, source)
         template_name = resolve_template_name(source)
         template_bytes = self._load_template(bucket, template_name)
         mapping_items = self._load_mapping(bucket)
@@ -306,7 +314,6 @@ class PrnsrvFunction:
             count_decision.count,
             column_name=self.settings.column_name,
         )
-        csv_key, vdf_key = self._output_keys(job_uuid, route)
         windows_csv_path = (
             self.settings.windows_csv_dir.rstrip("\\/") + "\\" + f"{job_uuid}.csv"
         )
@@ -435,8 +442,7 @@ class PrnsrvFunction:
                     classification = "NO_PRINT_MARKER_MISSING"
                     level = logging.INFO
                 else:
-                    route = resolve_route(source)
-                    csv_key, vdf_key = self._output_keys(job_uuid, route)
+                    csv_key, vdf_key = self._output_keys(bucket, job_uuid, source)
                     csv_info = self.storage.head_optional(bucket, csv_key)
                     vdf_info = self.storage.head_optional(bucket, vdf_key)
                     if csv_info is not None and vdf_info is not None:

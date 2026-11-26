@@ -204,3 +204,25 @@ service was changed here.
   allocator watermark before generation; the earlier value of 56 is stale.
 - This patch has not allocated numbers, written S3, delivered to 94 staging,
   or printed. The generation hook remains disabled by default.
+
+## Operator names in print jobs
+
+Set the JSON boolean `print_operator_filenames` in the xTrek worker configuration
+to enable `<manufacturer INN>_<short operator>_<UUID>.vdf` for labels and marking
+codes. The default is false. The standalone copy of the PRNSRV adapter reads
+`PRINT_OPERATOR_FILENAMES=true`. The CSV and its VDF data-source reference
+retain the job UUID. Labels use the source UUID and codes use the SUZ order ID.
+
+The operator comes from `PasportData.operator` on the source task or its linked
+production order. A Russian surname/name/patronymic uses five surname letters
+and the two initials, transliterated after shortening. Other descriptions use
+five letters of the first word, two of subsequent words, short uppercase
+abbreviations and the original numbers. Missing operators use `NA`.
+The operator segment is capped at 201 ASCII characters to fit a 255-character
+filename with a UUID. Code jobs without a usable manufacturer INN retain the
+UUID-only filename.
+
+Before enabling this option, verify the external printer downloader and feedback
+consumer accept both names and extract the INN from the first field and UUID
+from the end. Enable the chosen format consistently across generators sharing
+an output directory once in-flight jobs have finished.

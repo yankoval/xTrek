@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from xtrek.prn_util import generate_prn_files
 
 
@@ -114,3 +116,34 @@ def test_generate_prn_files_releases_lock_when_print_was_already_done():
     assert tasks_storage.uploads == []
     assert tasks_storage.released_locks == ["s3://print/solmarkTasks/.locks/ORDER-1.lock"]
     assert kodes_storage.tags["print-status"] == "printed"
+
+
+@pytest.mark.parametrize(('inn', 'legacy_exists', 'vdf_name'), [
+    ('7701234567', False, '7701234567_SotruKRG_ORDER-1.vdf'),
+    ('7701234567', True, 'ORDER-1.vdf'),
+    (None, False, 'ORDER-1.vdf'),
+])
+def test_named_code_vdf_reuses_prefix_on_retry(monkeypatch, inn, legacy_exists, vdf_name):
+    config = dict(fake_config(), print_operator_filenames=True,
+                  production_orders_path='s3://internal/productionOrders')
+    codes = FakeStorage(tags={'print-status': 'not-printed', 'productionOrderId': 'test'})
+    tasks = FakeStorage()
+    templates = FakeStorage()
+    order = {'PasportData': {'Manufacturer_inn': inn, 'operator': 'Сотрудник КРГ'}}
+    monkeypatch.setattr(codes, 'read_text', lambda path: json.dumps(order), raising=False)
+    monkeypatch.setattr(tasks, 'exists', lambda path: legacy_exists and path.endswith('/ORDER-1.vdf'))
+    stores = {config['kodes']: codes, config['production_orders_path']: codes,
+              config['prn_tasks']: tasks, config['prn_templates']: templates}
+    monkeypatch.setattr('xtrek.prn_util.load_config', lambda _: config)
+    monkeypatch.setattr('xtrek.prn_util.get_storage', lambda path, _: stores[path])
+    monkeypatch.setattr('xtrek.prn_util.generate_amica_vdf',
+                        lambda **kw: Path(kw['output_vdf_path']).write_text('vdf'))
+    assert generate_prn_files('ORDER-1') == 'ORDER-1'
+    expected = ['s3://print/solmarkTasks/ORDER-1.csv',
+                f's3://print/solmarkTasks/{vdf_name}']
+    assert [remote for _, remote in tasks.uploads] == expected
+    codes.tags['print-status'] = 'not-printed'
+    config['print_operator_filenames'] = False
+    order['PasportData']['operator'] = 'Changed'
+    assert generate_prn_files('ORDER-1') == 'ORDER-1'
+    assert [remote for _, remote in tasks.uploads] == expected * 2
