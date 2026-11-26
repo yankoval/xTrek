@@ -40,10 +40,12 @@ class Settings:
     stale_after_hours: int = 1
     s3_endpoint: str = "https://storage.yandexcloud.net"
     region: str = "ru-central1"
+    print_operator_filenames: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
+            print_operator_filenames=os.getenv("PRINT_OPERATOR_FILENAMES", "").lower() == "true",
             bucket_id=os.getenv("BUCKET_ID") or os.getenv("BUCKET"),
             input_prefix=_prefix(os.getenv("INPUT_PREFIX", "Задания/")),
             output_prefix=_prefix(os.getenv("OUTPUT_PREFIX", "printer-tasks/")),

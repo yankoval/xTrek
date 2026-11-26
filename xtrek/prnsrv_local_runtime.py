@@ -132,6 +132,7 @@ def process_local_prnsrv_s3_event(*, bucket: str, key: str,
         raise RuntimeError('Configured S3 storage does not expose its existing boto3 client')
     settings = Settings(
         bucket_id=bucket,
+        print_operator_filenames=runtime_config.get("print_operator_filenames") is True,
         input_prefix=input_prefix,
         output_prefix=str(runtime_config.get('prnsrv_output_prefix', 'printer-tasks/')).strip('/') + '/',
         done_prefix=str(runtime_config.get('prnsrv_done_prefix', '_prnsrv/done/')).strip('/') + '/',

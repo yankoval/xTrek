@@ -20,6 +20,8 @@ from botocore.exceptions import (ClientError, EndpointConnectionError,
                                 ConnectionClosedError, ConnectTimeoutError,
                                 ReadTimeoutError)
 
+from .print_filename import operator_prefix
+
 BUCKET = '1bf11148-3595-4a07-a089-d460153b7c7a'
 PROTECTED = {'623c20fa-f90c-4478-aeae-9c6635cedc9f'}
 ALLOWED_INNS = {'7733154124', '9718180660', '9723161905'}
@@ -232,7 +234,7 @@ class Supervisor:
                 self.save()
                 self.evidence.event('SKIPPED', uuid=uid)
                 return
-            self.read(lambda deadline: self.adapter.check_history(uid, source_hash, inn, deadline),
+            self.read(lambda deadline: self.adapter.check_history(uid, source_hash, source, deadline),
                       'GET_HISTORY', uid)
         except ReadUnavailable:
             # Nothing admitted/allocated: leave the source untouched for a later scan.
@@ -369,11 +371,14 @@ class ProductionAdapter:
                 raise ValueError('Unconfigured manufacturer')
         return canonical_source_hash(source), inn, classify_count(source).count
 
-    def check_history(self, uid, source_hash, inn, deadline):
+    def check_history(self, uid, source_hash, source, deadline):
         from .prnsrv_local_allocator import LocalPrnsrvAllocator
         candidates = ['_prnsrv/done/'+uid+'.done','printer-tasks/'+uid+'.csv',
                       'printer-task-stage-receipts/'+uid+'.json']
         candidates += ['printer-tasks/'+i+'_'+uid+'.vdf' for i in ALLOWED_INNS]
+        passport = source.get('PasportData') or {}
+        route = str(source.get('Manufacturer_inn') or passport.get('Manufacturer_inn') or '')
+        candidates.append(f'printer-tasks/{operator_prefix(route, passport)}_{uid}.vdf')
         for key in candidates:
             if time.monotonic() >= deadline:
                 raise ReadTimeoutError(endpoint_url='object_storage')

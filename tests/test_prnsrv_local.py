@@ -268,12 +268,12 @@ def test_empty_count_reuses_existing_no_print_contract_without_allocation(monkey
     assert allocator.calls == []
 
 
-def stage_fixture(storage):
+def stage_fixture(storage, route="7733154124"):
     from xtrek.prnsrv_generator_runtime.storage import ObjectInfo
     job_uuid = UUID
     prefix = 'printer-tasks/'
     csv_key = f'{prefix}{job_uuid}.csv'
-    vdf_key = f'{prefix}7733154124_{job_uuid}.vdf'
+    vdf_key = f'{prefix}{route}_{job_uuid}.vdf'
     csv, vdf = b'C1\nSSCC', b'<Root/>'
     storage.objects[(BUCKET, csv_key)] = csv
     storage.objects[(BUCKET, vdf_key)] = vdf
@@ -289,9 +289,10 @@ def stage_fixture(storage):
     storage.objects[(BUCKET, f'_prnsrv/done/{job_uuid}.done')] = json.dumps(marker).encode()
 
 
-def test_bucket_scoped_receiver_matches_prnsrvfunction_marker_and_receipt_contract(tmp_path):
+@pytest.mark.parametrize('route', ['7733154124', '7733154124_TestoIP'])
+def test_bucket_scoped_receiver_matches_prnsrvfunction_marker_and_receipt_contract(tmp_path, route):
     storage = FakePrnsrvS3()
-    stage_fixture(storage)
+    stage_fixture(storage, route)
     receiver = PrnsrvStagingReceiver(
         storage=storage, bucket=BUCKET, output_root='', receipt_root='',
         staging_root=str(tmp_path / 'review-stage'), allowlisted_uuids=[UUID],
@@ -325,3 +326,22 @@ def test_bucket_scoped_receiver_requires_allowlist_hashes_and_safe_root(tmp_path
             storage=storage, bucket=BUCKET, output_root='', receipt_root='',
             staging_root='C:/tmp', allowlisted_uuids=[UUID],
         )
+
+
+@pytest.mark.parametrize('named_first', [False, True])
+def test_label_retry_reuses_vdf_name_across_setting_change(monkeypatch, named_first):
+    from dataclasses import replace
+    function, storage, _, key, source = make_local_function(monkeypatch)
+    source['PasportData']['operator'] = 'Тестов Иван Петрович'
+    storage.objects[BUCKET, key] = json.dumps(source).encode()
+    function.settings = replace(function.settings, print_operator_filenames=named_first)
+    function.process_object(bucket=BUCKET, key=key)
+    prefix = '7733154124_TestoIP' if named_first else '7733154124'
+    expected = f'printer-tasks/{prefix}_{UUID}.vdf'
+    assert (BUCKET, expected) in storage.objects
+    assert (UUID + '.csv').encode() in storage.objects[BUCKET, expected]
+    del storage.objects[BUCKET, f'_prnsrv/done/{UUID}.done']
+    function.settings = replace(function.settings, print_operator_filenames=not named_first)
+    function.process_object(bucket=BUCKET, key=key)
+    vdfs = [k for _, k in storage.objects if k.startswith('printer-tasks/') and k.endswith('.vdf')]
+    assert vdfs == [expected]

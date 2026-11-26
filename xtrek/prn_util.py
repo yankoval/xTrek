@@ -1,12 +1,14 @@
 import os
 import json
 import logging
+import re
 import argparse
 import tempfile
 from pathlib import Path
 import shutil
 from datetime import datetime, timezone
 
+from .print_filename import operator_prefix
 from .storage import get_storage
 from .operation_state import guarded, OperationBusy, OperationConflict, ReconciliationRequired
 from .config_loader import load_config
@@ -106,15 +108,20 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
         print_status = tags.get('print-status')
         production_order_id = tags.get('productionOrderId')
 
-        if not production_order_id:
-             production_order_id = _find_production_order_id_by_suz_order_id(key)
-
         if print_status == 'processing' and not coordinated:
             logger.info(f"[*] Файл {key} уже в обработке (print-status:processing). Пропуск.")
             return finish(None)
 
-        # Проверка на виртуальность
-        if not ignore_duplicate and production_order_id:
+        if not ignore_duplicate and print_status not in ({None, 'not-printed', 'processing'} if coordinated else {'not-printed'}):
+            logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
+            return finish(key)
+
+        if not production_order_id:
+            production_order_id = _find_production_order_id_by_suz_order_id(key)
+
+        named_vdf = config.get('print_operator_filenames') is True
+        prod_data = {}
+        if production_order_id and (not ignore_duplicate or named_vdf):
             try:
                 prod_orders_path = config.get('production_orders_path')
                 if prod_orders_path:
@@ -132,21 +139,33 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
                         prod_data = json.loads(storage_prod.read_text(prod_path))
                         is_virtual = prod_data.get('virtual')
                         # Обрабатываем и bool и строку
-                        if is_virtual is True or str(is_virtual).lower() == 'true':
+                        if not ignore_duplicate and str(is_virtual).lower() == 'true':
                             logger.info(f"Попытка напечатать коды созданные для виртуального заказа {production_order_id}")
                             return finish(key)
                     else:
                         logger.warning(f"[!] Файл производственного заказа не найден: {prod_path}")
             except Exception as e:
+                if named_vdf:
+                    raise
                 logger.warning(f"Ошибка при проверке виртуальности заказа {production_order_id}: {e}")
-
-        if not ignore_duplicate and print_status not in ({None, 'not-printed', 'processing'} if coordinated else {'not-printed'}):
-            logger.error(f"Попытка повторной печати. Задание {key} проигнорировано.")
-            return finish(key)
 
         # Устанавливаем статус processing
         logger.info(f"[*] Установка статуса print-status:processing для {key}")
-        storage_kodes.set_tags(json_s3_path, {'print-status': 'processing'})
+        processing_tags = {'print-status': 'processing'}
+        # Pin the prefix before publication so retries use the same key even if
+        # the source order or naming configuration has since changed.
+        vdf_prefix = tags.get('print-vdf-prefix', '')
+        if vdf_prefix and not re.fullmatch(r'[0-9]{10,12}_[A-Za-z0-9]{1,201}', vdf_prefix):
+            raise ValueError('Invalid saved print-vdf-prefix')
+        if named_vdf and not vdf_prefix:
+            passport = prod_data.get('PasportData') or {}
+            inn = str(prod_data.get('Manufacturer_inn') or passport.get('Manufacturer_inn') or '')
+            if re.fullmatch(r'[0-9]{10,12}', inn):
+                legacy_path = f"{prn_tasks_path.rstrip('/')}/{key}.vdf"
+                if not storage_tasks.exists(legacy_path):
+                    vdf_prefix = operator_prefix(inn, passport)
+                    processing_tags['print-vdf-prefix'] = vdf_prefix
+        storage_kodes.set_tags(json_s3_path, processing_tags)
 
         vdf_template_s3_path = f"{prn_templates_path.rstrip('/')}/{vdf_template_name}"
         amica_json_s3_path = f"{prn_templates_path.rstrip('/')}/amica.json"
@@ -220,7 +239,8 @@ def generate_prn_files(key: str, vdf_template_name: str = "32x32_20x20.VDF", ign
 
             # 5. Загружаем CSV и VDF в целевой бакет
             dest_csv_s3 = f"{prn_tasks_path.rstrip('/')}/{key}.csv"
-            dest_vdf_s3 = f"{prn_tasks_path.rstrip('/')}/{local_vdf.name}"
+            vdf_name = f"{vdf_prefix}_{key}.vdf" if vdf_prefix else local_vdf.name
+            dest_vdf_s3 = f"{prn_tasks_path.rstrip('/')}/{vdf_name}"
 
             logger.info(f"[*] Загрузка CSV в {dest_csv_s3}...")
             if coordinated:
